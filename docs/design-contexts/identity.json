@@ -1,0 +1,1538 @@
+{
+  "context": "Bounded Context: **Identity & Access (인증/권한)** for the Dibs (딥스) reservation platform.\n\nOwns: Google OAuth login, the account record, multi-role assignment (USER / PARTNER / ADMIN), the partner signup → admin approval workflow, account lifecycle states, JWT issuance/rotation/revocation, terms consent records, and the guard layer that every other context's controllers decorate themselves with.\n\nDoes NOT own (referenced only by id, and named consistently with the other contexts): Venue/Business catalog, Event, Application, Bid, DepositHold, Notification/Message. Those contexts import `@dibs/shared` enums (`UserRole`, `AccountStatus`, `PartnerApprovalStatus`) and the Nest guards/decorators exported from this context's `auth` module.\n\nPhysical layout: `apps/api/src/modules/auth`, `apps/api/src/modules/accounts`, `apps/api/src/modules/partners-onboarding`, `apps/api/src/modules/admin-accounts`; shared DTO/zod in `packages/shared/src/identity`. Single Prisma schema, Vercel Postgres (Neon). All timestamps stored as `timestamptz` in UTC; all business-day/dormancy math done in `Asia/Seoul`.\n\nKey stance: JWT is the fast path but is NEVER the final authority for authorization decisions that can be revoked (partner approval, suspension, role revocation). Those are re-checked against the DB on every mutating request, cheaply, via a single indexed read that is folded into the transaction the handler already opens.",
+  "summary": "Google-only OAuth (Passport google-oauth20) → stateless PKCE/state via signed short-lived cookie (no server session store, serverless-safe) → account resolved by immutable `googleSub`, never by email → first-time users land in a `PENDING_PROFILE` state and must complete signup (닉네임 + 약관동의 + 일반/파트너 선택) before any authed action.\n\nRoles are a multi-valued set (`roles UserRole[]`) so one human can be both 이용자 and 파트너 with one login and a UI mode switch; ADMIN is never self-assignable and only arrives via seed or `AdminInvite`. Partner accounts get `roles = [USER, PARTNER]` at signup but `PartnerProfile.approvalStatus = PENDING`; a `PartnerApprovedGuard` blocks all write operations in the Event/Venue contexts until an admin approves. Approval, rejection, revocation, suspension, and role grants are all conditional single-statement updates (`WHERE status = <expected>`) so concurrent admins can't double-apply, and every one writes an `AccountAuditLog` row in the same transaction.\n\nTokens: access JWT 15 min (10 min for PARTNER/ADMIN), refresh 30 days, rotating with reuse-detection by `familyId`; both in httpOnly Secure cookies on the apex domain (apps/web and apps/api are same-origin via Vercel rewrites, so no CORS/cookie pain). `tokenVersion` on User is bumped on suspend / role change / withdrawal / forced logout and checked server-side, which gives sub-second revocation without a distributed session store.\n\nPublic surface (browse/search/event detail/competition ratio) is `@Public()` with *optional* JWT parsing so the same endpoint can enrich the response with \"내 신청 내역\" when a token is present. Everything that mutates competitive state (apply, re-bid, cancel, deposit) requires ACTIVE status, and re-bid specifically requires an `Idempotency-Key` so a silent token-refresh retry can never double-raise a bid.",
+  "entities": [
+    {
+      "name": "User",
+      "description": "The single account record. One row per human, regardless of how many roles they hold. Created only by the Google OAuth callback or by admin seed/invite.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": "cuid, not autoincrement — ids appear in URLs and must not be enumerable."
+        },
+        {
+          "name": "email",
+          "type": "String @unique",
+          "notes": "Lowercased+trimmed at write time. Copied from Google at first login and refreshed on each login IF the same googleSub still owns it. NOT the identity key."
+        },
+        {
+          "name": "emailVerifiedAt",
+          "type": "DateTime?",
+          "notes": "Set only when Google returns email_verified=true. Null ⇒ login refused (see rule BR-04)."
+        },
+        {
+          "name": "displayName",
+          "type": "String @db.VarChar(20)",
+          "notes": "닉네임. Seeded from Google `name`, user-editable at signup completion. 2–20 chars, unique NOT enforced (display only)."
+        },
+        {
+          "name": "realName",
+          "type": "String? @db.VarChar(40)",
+          "notes": "실명. Null for consumers. Required for partners (matched against 사업자등록증 representative name at review)."
+        },
+        {
+          "name": "phone",
+          "type": "String?",
+          "notes": "E.164 (+8210…). Nullable in MVP. Reserved for the anti-multi-account gate (feature-flagged PHONE_VERIFICATION_REQUIRED)."
+        },
+        {
+          "name": "phoneVerifiedAt",
+          "type": "DateTime?",
+          "notes": "Set by a future SMS/PASS flow. Modeled now, unused in MVP."
+        },
+        {
+          "name": "avatarUrl",
+          "type": "String?",
+          "notes": "Vercel Blob URL. Google `picture` is copied into Blob once at signup rather than hot-linked (Google URLs rotate and leak referrer)."
+        },
+        {
+          "name": "roles",
+          "type": "UserRole[]",
+          "notes": "Postgres enum array. Denormalized read-model of UserRoleAssignment for cheap JWT minting. MUST be rewritten in the same transaction as any UserRoleAssignment change. Always contains USER."
+        },
+        {
+          "name": "status",
+          "type": "AccountStatus @default(PENDING_PROFILE)",
+          "notes": "See state machine. Indexed."
+        },
+        {
+          "name": "statusReason",
+          "type": "String?",
+          "notes": "Admin-entered reason for SUSPENDED/WITHDRAWN. Shown to the user verbatim on the blocked screen."
+        },
+        {
+          "name": "suspendedUntil",
+          "type": "DateTime?",
+          "notes": "Null = indefinite suspension. Lazily lifted on read (see rule BR-21) — no cron needed."
+        },
+        {
+          "name": "tokenVersion",
+          "type": "Int @default(0)",
+          "notes": "Bumped to invalidate every outstanding access token for this user. Embedded as `tv` claim and compared server-side."
+        },
+        {
+          "name": "lastLoginAt",
+          "type": "DateTime?",
+          "notes": "UTC. Drives dormancy (휴면) computation in KST."
+        },
+        {
+          "name": "loginCount",
+          "type": "Int @default(0)",
+          "notes": ""
+        },
+        {
+          "name": "locale",
+          "type": "String @default(\"ko-KR\")",
+          "notes": ""
+        },
+        {
+          "name": "timeZone",
+          "type": "String @default(\"Asia/Seoul\")",
+          "notes": "Used for email/쪽지 rendering of deadlines. Never used for storage."
+        },
+        {
+          "name": "notificationEmail",
+          "type": "String?",
+          "notes": "Optional override for Resend delivery; falls back to `email`."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())",
+          "notes": ""
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt",
+          "notes": ""
+        },
+        {
+          "name": "withdrawalRequestedAt",
+          "type": "DateTime?",
+          "notes": "탈퇴 신청 시각. 30-day grace before anonymization."
+        },
+        {
+          "name": "anonymizedAt",
+          "type": "DateTime?",
+          "notes": "When set, PII columns are overwritten with tombstones ('탈퇴한 사용자') but the row survives so Application/Bid FKs and ranking audit stay intact."
+        }
+      ],
+      "relations": [
+        "oauthIdentities OAuthIdentity[]",
+        "roleAssignments UserRoleAssignment[]",
+        "partnerProfile PartnerProfile?  (1:0..1)",
+        "sessions AuthSession[]",
+        "termsAgreements TermsAgreement[]",
+        "auditLogsAsActor AccountAuditLog[] @relation(\"actor\")",
+        "auditLogsAsTarget AccountAuditLog[] @relation(\"target\")",
+        "(cross-context, inverse only) applications Application[]  — owned by Application context",
+        "(cross-context) messages Message[] — owned by Notification context"
+      ]
+    },
+    {
+      "name": "OAuthIdentity",
+      "description": "One row per external provider identity. Google-only in MVP, but the table exists so Kakao/Naver can be added without touching User.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "userId",
+          "type": "String",
+          "notes": "FK → User.id, onDelete: Cascade"
+        },
+        {
+          "name": "provider",
+          "type": "OAuthProvider",
+          "notes": "GOOGLE"
+        },
+        {
+          "name": "providerAccountId",
+          "type": "String",
+          "notes": "Google `sub`. THE identity key. Immutable for the lifetime of a Google account."
+        },
+        {
+          "name": "providerEmail",
+          "type": "String",
+          "notes": "Email as seen at the provider at last login. Kept separately from User.email to detect provider-side email changes."
+        },
+        {
+          "name": "providerEmailVerified",
+          "type": "Boolean",
+          "notes": ""
+        },
+        {
+          "name": "rawProfile",
+          "type": "Json?",
+          "notes": "Last raw profile payload, for debugging. Purged on anonymization."
+        },
+        {
+          "name": "linkedAt",
+          "type": "DateTime @default(now())",
+          "notes": ""
+        },
+        {
+          "name": "lastUsedAt",
+          "type": "DateTime",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "user User @relation(fields:[userId])",
+        "@@unique([provider, providerAccountId])",
+        "@@index([provider, providerEmail])"
+      ]
+    },
+    {
+      "name": "UserRoleAssignment",
+      "description": "Append-only audit of who holds which role and who granted it. `User.roles` is the denormalized projection.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "userId",
+          "type": "String",
+          "notes": "FK → User"
+        },
+        {
+          "name": "role",
+          "type": "UserRole",
+          "notes": ""
+        },
+        {
+          "name": "grantedAt",
+          "type": "DateTime @default(now())",
+          "notes": ""
+        },
+        {
+          "name": "grantedByUserId",
+          "type": "String?",
+          "notes": "Null = system (self-signup for USER/PARTNER, or seed for the bootstrap ADMIN)."
+        },
+        {
+          "name": "revokedAt",
+          "type": "DateTime?",
+          "notes": "Soft revoke; row is never deleted."
+        },
+        {
+          "name": "revokedByUserId",
+          "type": "String?",
+          "notes": ""
+        },
+        {
+          "name": "reason",
+          "type": "String?",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "user User",
+        "@@unique([userId, role, revokedAt])  — partial-unique intent: at most one live grant per (user, role). Implement as a Postgres partial unique index WHERE revokedAt IS NULL."
+      ]
+    },
+    {
+      "name": "PartnerProfile",
+      "description": "The business-identity side of a partner account. The actual Venue/Business rows in the Catalog context point at PartnerProfile.id. Exactly one per partner User.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": "This is the `partnerId` other contexts store."
+        },
+        {
+          "name": "userId",
+          "type": "String @unique",
+          "notes": "FK → User. 1:1."
+        },
+        {
+          "name": "businessName",
+          "type": "String @db.VarChar(60)",
+          "notes": "상호명. Public-facing."
+        },
+        {
+          "name": "businessRegistrationNumber",
+          "type": "String @unique",
+          "notes": "사업자등록번호, 10 digits, stored digits-only. Unique — one BRN cannot be claimed by two accounts. Checksum-validated (국세청 알고리즘) before insert."
+        },
+        {
+          "name": "representativeName",
+          "type": "String @db.VarChar(40)",
+          "notes": "대표자명."
+        },
+        {
+          "name": "businessAddress",
+          "type": "String",
+          "notes": ""
+        },
+        {
+          "name": "regionCode",
+          "type": "String",
+          "notes": "Shared region taxonomy code (Catalog context owns the table). Default filter value for search."
+        },
+        {
+          "name": "contactPhone",
+          "type": "String",
+          "notes": "업체 대표 연락처. Distinct from User.phone."
+        },
+        {
+          "name": "contactEmail",
+          "type": "String",
+          "notes": "Where partner operational mail goes; may differ from the Google login email."
+        },
+        {
+          "name": "businessRegistrationFileUrl",
+          "type": "String",
+          "notes": "Vercel Blob URL of 사업자등록증 scan. Stored in a PRIVATE Blob store; served only via a short-lived signed URL to ADMIN and the owning partner."
+        },
+        {
+          "name": "approvalStatus",
+          "type": "PartnerApprovalStatus @default(PENDING)",
+          "notes": "Indexed. The single source of truth for PartnerApprovedGuard."
+        },
+        {
+          "name": "approvedAt",
+          "type": "DateTime?",
+          "notes": ""
+        },
+        {
+          "name": "approvedByUserId",
+          "type": "String?",
+          "notes": "Admin who approved."
+        },
+        {
+          "name": "rejectionCode",
+          "type": "PartnerRejectionCode?",
+          "notes": ""
+        },
+        {
+          "name": "rejectionNote",
+          "type": "String?",
+          "notes": "Free text shown to the partner verbatim."
+        },
+        {
+          "name": "suspendedAt",
+          "type": "DateTime?",
+          "notes": "Partner-level suspension (business misconduct) — distinct from account-level User.status = SUSPENDED."
+        },
+        {
+          "name": "revokedAt",
+          "type": "DateTime?",
+          "notes": "Permanent removal of partner privileges."
+        },
+        {
+          "name": "currentApplicationId",
+          "type": "String?",
+          "notes": "FK → PartnerApplication, the submission currently under review."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())",
+          "notes": ""
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "user User @relation(fields:[userId])",
+        "applications PartnerApplication[]",
+        "(cross-context) venues Venue[] — Catalog context, Venue.partnerId → PartnerProfile.id",
+        "(cross-context) events Event[] — Event context, Event.partnerId → PartnerProfile.id"
+      ]
+    },
+    {
+      "name": "PartnerApplication",
+      "description": "One row per submission attempt. Keeping submissions separate from PartnerProfile means a rejected-then-resubmitted partner has a full reviewable history, and an approved partner editing their BRN creates a NEW pending application without downgrading the live profile.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "partnerProfileId",
+          "type": "String",
+          "notes": "FK → PartnerProfile"
+        },
+        {
+          "name": "attemptNo",
+          "type": "Int",
+          "notes": "1-based, per profile."
+        },
+        {
+          "name": "status",
+          "type": "PartnerApplicationStatus @default(SUBMITTED)",
+          "notes": ""
+        },
+        {
+          "name": "submittedAt",
+          "type": "DateTime @default(now())",
+          "notes": ""
+        },
+        {
+          "name": "payloadSnapshot",
+          "type": "Json",
+          "notes": "Frozen copy of the business fields as submitted, so later profile edits don't rewrite history."
+        },
+        {
+          "name": "reviewedAt",
+          "type": "DateTime?",
+          "notes": ""
+        },
+        {
+          "name": "reviewedByUserId",
+          "type": "String?",
+          "notes": ""
+        },
+        {
+          "name": "rejectionCode",
+          "type": "PartnerRejectionCode?",
+          "notes": ""
+        },
+        {
+          "name": "reviewNote",
+          "type": "String?",
+          "notes": "Internal + partner-visible. Two fields if we later need to split; MVP: partner-visible."
+        },
+        {
+          "name": "slaDueAt",
+          "type": "DateTime",
+          "notes": "submittedAt + 3 business days (KST). Drives the admin queue's overdue badge."
+        }
+      ],
+      "relations": [
+        "partnerProfile PartnerProfile",
+        "@@unique([partnerProfileId, attemptNo])",
+        "@@index([status, submittedAt])"
+      ]
+    },
+    {
+      "name": "AuthSession",
+      "description": "One row per refresh-token family member. Enables device list, remote logout, and refresh-token reuse detection. Access tokens are stateless and NOT stored.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": "Also the refresh JWT's `jti`."
+        },
+        {
+          "name": "userId",
+          "type": "String",
+          "notes": "FK → User, onDelete: Cascade"
+        },
+        {
+          "name": "familyId",
+          "type": "String",
+          "notes": "Constant across rotations of the same login. Reuse of a rotated token revokes the entire family."
+        },
+        {
+          "name": "refreshTokenHash",
+          "type": "String",
+          "notes": "sha256 of the opaque refresh secret. Never store the token itself."
+        },
+        {
+          "name": "issuedAt",
+          "type": "DateTime @default(now())",
+          "notes": ""
+        },
+        {
+          "name": "expiresAt",
+          "type": "DateTime",
+          "notes": "issuedAt + 30d. Absolute family cap: 90d from first login (no infinite sliding session)."
+        },
+        {
+          "name": "familyStartedAt",
+          "type": "DateTime",
+          "notes": "For the 90-day absolute cap."
+        },
+        {
+          "name": "rotatedToId",
+          "type": "String?",
+          "notes": "Set when this token is consumed. Presence + a reuse attempt = theft signal."
+        },
+        {
+          "name": "revokedAt",
+          "type": "DateTime?",
+          "notes": ""
+        },
+        {
+          "name": "revokeReason",
+          "type": "SessionRevokeReason?",
+          "notes": ""
+        },
+        {
+          "name": "userAgent",
+          "type": "String?",
+          "notes": "Truncated to 255. Display only — never used as an auth factor (mobile UA strings churn)."
+        },
+        {
+          "name": "ipHash",
+          "type": "String?",
+          "notes": "HMAC-SHA256(ip, IP_PEPPER). Never store raw IP (개인정보)."
+        },
+        {
+          "name": "deviceLabel",
+          "type": "String?",
+          "notes": "Derived, e.g. 'Chrome / macOS'. Shown on 내 기기 목록."
+        }
+      ],
+      "relations": [
+        "user User",
+        "@@index([userId, revokedAt])",
+        "@@index([familyId])",
+        "@@unique([refreshTokenHash])"
+      ]
+    },
+    {
+      "name": "TermsAgreement",
+      "description": "Consent ledger. Korean 개인정보보호법 / 정보통신망법 require provable, per-version, separable consent — especially for marketing.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "userId",
+          "type": "String",
+          "notes": "FK → User"
+        },
+        {
+          "name": "termsType",
+          "type": "TermsType",
+          "notes": ""
+        },
+        {
+          "name": "version",
+          "type": "String",
+          "notes": "e.g. '2026-07-01'. Bumping a version re-prompts on next login for REQUIRED types."
+        },
+        {
+          "name": "agreed",
+          "type": "Boolean",
+          "notes": "False rows are kept for optional terms so we can prove the user was asked and declined."
+        },
+        {
+          "name": "agreedAt",
+          "type": "DateTime @default(now())",
+          "notes": ""
+        },
+        {
+          "name": "withdrawnAt",
+          "type": "DateTime?",
+          "notes": "마케팅 수신거부 — required to be one-click."
+        },
+        {
+          "name": "ipHash",
+          "type": "String?",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "user User",
+        "@@index([userId, termsType, version])"
+      ]
+    },
+    {
+      "name": "AdminInvite",
+      "description": "The ONLY path to an ADMIN role besides the seeded bootstrap admin. Admins never self-signup.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "email",
+          "type": "String",
+          "notes": "Lowercased. The invite is bound to this exact Google email."
+        },
+        {
+          "name": "roleToGrant",
+          "type": "UserRole",
+          "notes": "ADMIN in MVP. Constrained to ADMIN at the DTO layer."
+        },
+        {
+          "name": "tokenHash",
+          "type": "String @unique",
+          "notes": "sha256 of a 32-byte random token that is emailed via Resend. Plaintext never persisted."
+        },
+        {
+          "name": "invitedByUserId",
+          "type": "String",
+          "notes": ""
+        },
+        {
+          "name": "expiresAt",
+          "type": "DateTime",
+          "notes": "createdAt + 72h."
+        },
+        {
+          "name": "status",
+          "type": "InviteStatus @default(PENDING)",
+          "notes": ""
+        },
+        {
+          "name": "acceptedAt",
+          "type": "DateTime?",
+          "notes": ""
+        },
+        {
+          "name": "acceptedByUserId",
+          "type": "String?",
+          "notes": ""
+        },
+        {
+          "name": "revokedAt",
+          "type": "DateTime?",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "@@index([email, status])"
+      ]
+    },
+    {
+      "name": "AccountAuditLog",
+      "description": "Append-only. Every privileged mutation in this context writes exactly one row inside the same transaction as the mutation. Never updated, never deleted.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "actorUserId",
+          "type": "String?",
+          "notes": "Null = system/cron."
+        },
+        {
+          "name": "actorRole",
+          "type": "UserRole?",
+          "notes": "Role actually used to authorize the action (matters for multi-role actors)."
+        },
+        {
+          "name": "targetUserId",
+          "type": "String?",
+          "notes": ""
+        },
+        {
+          "name": "targetPartnerProfileId",
+          "type": "String?",
+          "notes": ""
+        },
+        {
+          "name": "action",
+          "type": "AccountAuditAction",
+          "notes": ""
+        },
+        {
+          "name": "before",
+          "type": "Json?",
+          "notes": "Field-level diff only, PII-minimized."
+        },
+        {
+          "name": "after",
+          "type": "Json?",
+          "notes": ""
+        },
+        {
+          "name": "reason",
+          "type": "String?",
+          "notes": ""
+        },
+        {
+          "name": "ipHash",
+          "type": "String?",
+          "notes": ""
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "actor User? @relation(\"actor\")",
+        "target User? @relation(\"target\")",
+        "@@index([targetUserId, createdAt])",
+        "@@index([action, createdAt])"
+      ]
+    },
+    {
+      "name": "SignupTicket",
+      "description": "Short-lived server-side record bridging 'Google callback succeeded' and 'user picked 일반/파트너 and accepted terms'. Prevents a half-created account from ever holding a usable access token.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": "Returned to the browser as a signed, httpOnly, 15-minute cookie — NOT as a query param (query strings leak via Referer and logs)."
+        },
+        {
+          "name": "userId",
+          "type": "String @unique",
+          "notes": "FK → the freshly created User in PENDING_PROFILE."
+        },
+        {
+          "name": "expiresAt",
+          "type": "DateTime",
+          "notes": "createdAt + 15m. Expired ticket ⇒ user restarts Google login; the PENDING_PROFILE User row is reused, not duplicated."
+        },
+        {
+          "name": "consumedAt",
+          "type": "DateTime?",
+          "notes": "Single-use. Consumption is a conditional UPDATE … WHERE consumedAt IS NULL, which is the double-submit defense."
+        }
+      ],
+      "relations": [
+        "user User"
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "name": "UserRole",
+      "values": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ]
+    },
+    {
+      "name": "AccountStatus",
+      "values": [
+        "PENDING_PROFILE",
+        "ACTIVE",
+        "SUSPENDED",
+        "DORMANT",
+        "WITHDRAWAL_PENDING",
+        "WITHDRAWN"
+      ]
+    },
+    {
+      "name": "PartnerApprovalStatus",
+      "values": [
+        "PENDING",
+        "APPROVED",
+        "REJECTED",
+        "RESUBMIT_REQUIRED",
+        "SUSPENDED",
+        "REVOKED"
+      ]
+    },
+    {
+      "name": "PartnerApplicationStatus",
+      "values": [
+        "SUBMITTED",
+        "UNDER_REVIEW",
+        "APPROVED",
+        "REJECTED",
+        "WITHDRAWN"
+      ]
+    },
+    {
+      "name": "PartnerRejectionCode",
+      "values": [
+        "INVALID_BRN",
+        "BRN_ALREADY_CLAIMED",
+        "DOCUMENT_UNREADABLE",
+        "INFO_MISMATCH",
+        "PROHIBITED_CATEGORY",
+        "INCOMPLETE_CONTACT",
+        "OTHER"
+      ]
+    },
+    {
+      "name": "OAuthProvider",
+      "values": [
+        "GOOGLE"
+      ]
+    },
+    {
+      "name": "TermsType",
+      "values": [
+        "SERVICE",
+        "PRIVACY",
+        "AGE_14_OVER",
+        "PARTNER_TERMS",
+        "MARKETING_EMAIL",
+        "MARKETING_INAPP"
+      ]
+    },
+    {
+      "name": "SessionRevokeReason",
+      "values": [
+        "LOGOUT",
+        "LOGOUT_ALL",
+        "ROTATION_REUSE_DETECTED",
+        "ADMIN_FORCE_LOGOUT",
+        "ROLE_CHANGED",
+        "ACCOUNT_SUSPENDED",
+        "ACCOUNT_WITHDRAWN",
+        "ABSOLUTE_LIFETIME_EXCEEDED"
+      ]
+    },
+    {
+      "name": "InviteStatus",
+      "values": [
+        "PENDING",
+        "ACCEPTED",
+        "EXPIRED",
+        "REVOKED"
+      ]
+    },
+    {
+      "name": "AccountAuditAction",
+      "values": [
+        "USER_SIGNED_UP",
+        "USER_LOGGED_IN",
+        "LOGIN_REJECTED",
+        "PROFILE_UPDATED",
+        "ROLE_GRANTED",
+        "ROLE_REVOKED",
+        "PARTNER_APPLIED",
+        "PARTNER_RESUBMITTED",
+        "PARTNER_APPROVED",
+        "PARTNER_REJECTED",
+        "PARTNER_SUSPENDED",
+        "PARTNER_REVOKED",
+        "PARTNER_REINSTATED",
+        "ACCOUNT_SUSPENDED",
+        "ACCOUNT_UNSUSPENDED",
+        "ACCOUNT_DORMANT",
+        "ACCOUNT_REACTIVATED",
+        "WITHDRAWAL_REQUESTED",
+        "WITHDRAWAL_CANCELED",
+        "ACCOUNT_ANONYMIZED",
+        "SESSION_REVOKED",
+        "ADMIN_INVITED",
+        "ADMIN_INVITE_ACCEPTED",
+        "TERMS_AGREED",
+        "TERMS_WITHDRAWN",
+        "OAUTH_LINK_CONFLICT"
+      ]
+    }
+  ],
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/api/v1/auth/google",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "Kicks off Google OAuth. Accepts ?returnTo= (validated against a same-origin path allowlist; anything else falls back to '/'). Generates state + PKCE verifier and stores BOTH in a signed httpOnly 10-minute cookie — no DB, no server session, so any Vercel instance can complete the flow. scope=openid email profile, prompt=select_account."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/auth/google/callback",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "Verifies state+PKCE from the cookie, exchanges the code, resolves OAuthIdentity by (GOOGLE, sub). Existing+ACTIVE ⇒ issues access+refresh cookies and 302s to returnTo. Existing+SUSPENDED/WITHDRAWN ⇒ 302 to /blocked?code=… with no tokens. New sub ⇒ creates User(PENDING_PROFILE) + OAuthIdentity + SignupTicket and 302s to /signup. Never issues a usable access token to a PENDING_PROFILE account."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/auth/signup/context",
+      "roles": [
+        "SIGNUP_TICKET"
+      ],
+      "description": "Returns the prefill for the signup screen (email, suggested 닉네임, avatar) plus the current required terms versions. Authorized by the SignupTicket cookie only."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/auth/signup/complete",
+      "roles": [
+        "SIGNUP_TICKET"
+      ],
+      "description": "Body: { displayName, accountType: 'USER'|'PARTNER', agreements: [{termsType, version, agreed}] }. Rejects accountType='ADMIN' at the zod layer. Single transaction: consume ticket (conditional UPDATE … WHERE consumedAt IS NULL), write TermsAgreement rows, grant roles ([USER] or [USER,PARTNER]), set status=ACTIVE, issue tokens. PARTNER accountType does NOT create a PartnerProfile — it only unlocks /partner/apply."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/auth/refresh",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "Reads the refresh cookie. Rotates: marks old AuthSession consumed, inserts a new one in the same family, returns new access+refresh cookies. If the presented token's row already has rotatedToId set ⇒ theft: revoke the whole familyId, bump User.tokenVersion, 401 AUTH_SESSION_REVOKED. Also re-reads User.status/roles/tokenVersion and refuses to mint for non-ACTIVE accounts."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/auth/logout",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Revokes the current AuthSession (reason=LOGOUT) and clears cookies. Idempotent — a second call on a dead session still returns 204."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/auth/logout-all",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Revokes every live AuthSession for the user and bumps tokenVersion, killing outstanding access tokens within one request."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/auth/me",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Authoritative session snapshot read fresh from DB (never from claims): { id, displayName, avatarUrl, email, roles, status, partner: { id, businessName, approvalStatus } | null, pendingTerms: [...] }. The web app calls this on mount and after every role-affecting action."
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/me/profile",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Edits displayName, avatarUrl, notificationEmail, timeZone. email and roles are NOT editable here. Rate-limited to 5 changes/hour (닉네임 churn is an impersonation vector in partner 쪽지 threads)."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/me/sessions",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "내 기기 목록: live AuthSessions with deviceLabel, lastUsedAt, isCurrent. ipHash is never returned."
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/me/sessions/:sessionId",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Revoke one device. 404 (not 403) if the session belongs to someone else — no cross-account existence leak."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/me/terms",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Current consent state + which required versions are stale."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/me/terms",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Agree/withdraw. Withdrawing MARKETING_* is always allowed and takes effect immediately for Resend and 쪽지 broadcast segments. Withdrawing SERVICE/PRIVACY is rejected — that is 회원탈퇴, not a consent toggle."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/me/withdrawal",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "회원탈퇴 신청. Refuses (409 WITHDRAWAL_BLOCKED_ACTIVE_APPLICATION) if the user has any Application in DEPOSIT_PENDING/VALID on a non-finalized Event, or (for partners) any Event not yet finalized. Otherwise sets status=WITHDRAWAL_PENDING, withdrawalRequestedAt=now, revokes all sessions."
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/me/withdrawal",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "탈퇴 철회 within the 30-day grace window; restores status=ACTIVE. After anonymizedAt is set this returns 410."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/partner/applications",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "파트너 입점 신청. Creates PartnerProfile (if absent) + PartnerApplication(attemptNo). Requires PARTNER_TERMS agreement. Validates BRN checksum and uniqueness (409 BRN_ALREADY_CLAIMED). Blocked if an application is already SUBMITTED/UNDER_REVIEW (409). Guard: JwtAuthGuard + AccountActiveGuard + RolesGuard(PARTNER) — deliberately NOT PartnerApprovedGuard."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/partner/applications/me",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "Own application history + current approvalStatus + rejectionCode/note + slaDueAt. This is the '심사 중입니다' screen's data source."
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/partner/profile",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "Edits non-identity fields (contactPhone, contactEmail, address, businessName). Editing businessRegistrationNumber or businessRegistrationFileUrl on an APPROVED profile does NOT change approvalStatus — it opens a NEW PartnerApplication for re-review while the existing approval stays live (rule BR-13)."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/partner/uploads/business-registration",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "Returns a Vercel Blob client-upload token scoped to a private store, path partner/{partnerProfileId}/brc-{uuid}. MIME allowlist (pdf/jpeg/png), 10MB cap. Token TTL 5 min."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/admin/partner-applications",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Review queue. Filters: status, overdue (slaDueAt < now), q (businessName/BRN prefix), cursor pagination, sort by submittedAt ASC by default."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/admin/partner-applications/:id",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Full submission incl. a 60-second signed URL for the 사업자등록증 file. Viewing writes no audit row; downloading the file does."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/partner-applications/:id/claim",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "SUBMITTED → UNDER_REVIEW, conditional on status=SUBMITTED. Soft-locks the item so two admins don't duplicate work; auto-released by the nightly cron after 2h idle."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/partner-applications/:id/approve",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Conditional UPDATE … WHERE status IN ('SUBMITTED','UNDER_REVIEW'); 0 rows ⇒ 409 ALREADY_REVIEWED. Same transaction: PartnerProfile.approvalStatus=APPROVED, approvedAt/By, User.tokenVersion++, AccountAuditLog, and an outbox row for the 파트너 승인 완료 notification (쪽지 + Resend)."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/partner-applications/:id/reject",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Body: { rejectionCode, reviewNote (required, ≥10 chars) }. Sets PartnerProfile.approvalStatus = REJECTED or RESUBMIT_REQUIRED depending on code. Notifies with the note verbatim."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/partners/:partnerProfileId/suspend",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "APPROVED → SUSPENDED. Immediately blocks event creation and applicant messaging; does NOT cancel live events or invalidate applications (rule BR-16). tokenVersion++."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/partners/:partnerProfileId/reinstate",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "SUSPENDED → APPROVED."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/partners/:partnerProfileId/revoke",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Terminal. Requires reason. Frees the BRN unique slot only after an explicit admin flag (releaseBrn=true), so a bad actor can't recycle it casually."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/admin/users",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Search/filter by email, displayName, role, status, signup date range. Cursor-paginated. Response excludes phone unless ?includeContact=true, which writes an audit row."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/admin/users/:userId",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Full account detail: roles, status history (from audit log), sessions count, partner profile, terms. Writes an AccountAuditLog PII-access row."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/users/:userId/suspend",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Body: { reason (required), until? }. Conditional on status=ACTIVE. Revokes all sessions, tokenVersion++, sends 쪽지+email. Refuses if target holds ADMIN and is the last live admin (rule BR-19)."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/users/:userId/unsuspend",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "SUSPENDED → ACTIVE."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/users/:userId/roles",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Body: { grant?: UserRole[], revoke?: UserRole[], reason }. Writes UserRoleAssignment rows AND rewrites User.roles in one transaction, tokenVersion++. Cannot revoke USER. Cannot grant ADMIN here — ADMIN only via invite (rule BR-18)."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/invites",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Creates an AdminInvite bound to an email, mails the raw token via Resend. Plaintext token exists only in the outbound email."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/admin/invites",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "List with status; supports revoke."
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/admin/invites/:id",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Revoke a pending invite."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/auth/invites/accept",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Body: { token }. Requires the caller to already be logged in via Google AND for the invite email to equal the caller's verified email (case-insensitive). Grants ADMIN, tokenVersion++, marks invite ACCEPTED via conditional update (single-use under concurrency)."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/admin/audit-logs",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Filter by actor, target, action, date range. Read-only, no delete endpoint exists by design."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/internal/cron/account-maintenance",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Vercel Cron, daily 03:10 KST. Guarded by CronSecretGuard (Bearer CRON_SECRET, constant-time compare) — @Public() to JwtAuthGuard but never reachable without the secret. Does: DORMANT transition for lastLoginAt older than the configured window, anonymization of WITHDRAWAL_PENDING past 30 days, AuthSession purge past expiresAt+7d, expiry of stale AdminInvites and SignupTickets, release of 2h-idle UNDER_REVIEW claims."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/events",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "(owned by Event context; listed for guard mapping) @Public with OptionalJwtGuard. Anonymous ⇒ list + 경쟁률 only. Authed ⇒ additionally hasApplied per row. Never returns amounts or ranks."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/events/:id",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "(Event context) @Public + OptionalJwtGuard. The response shape is role-branched by an interceptor in THIS context: anonymous/USER get the ratio-only projection; the owning PARTNER and ADMIN get the full amount/ranking projection. Branch on server-side role, never on a client-supplied flag."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/events/:id/applications",
+      "roles": [
+        "USER"
+      ],
+      "description": "(Application context) Guards: JwtAuthGuard + AccountActiveGuard + RolesGuard(USER) + NotOwnEventGuard. Requires ACTIVE status. Requires Idempotency-Key."
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/applications/:id/bid",
+      "roles": [
+        "USER"
+      ],
+      "description": "(Bid context) Same guard chain. Idempotency-Key REQUIRED — a token refresh mid-flight must not replay a raise (edge case EC-11)."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/partner/events",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "(Event context) Guards: JwtAuthGuard + AccountActiveGuard + RolesGuard(PARTNER) + PartnerApprovedGuard. This is the canonical example of the approval gate."
+    }
+  ],
+  "stateMachines": [
+    {
+      "entity": "User.status (AccountStatus)",
+      "states": [
+        "PENDING_PROFILE",
+        "ACTIVE",
+        "SUSPENDED",
+        "DORMANT",
+        "WITHDRAWAL_PENDING",
+        "WITHDRAWN"
+      ],
+      "transitions": [
+        "(none) → PENDING_PROFILE : Google callback creates a brand-new OAuthIdentity. Holds no usable access token; only a SignupTicket cookie.",
+        "PENDING_PROFILE → ACTIVE : POST /auth/signup/complete succeeds (ticket consumed, required terms agreed, role chosen).",
+        "PENDING_PROFILE → PENDING_PROFILE : ticket expired; user re-runs Google login, same User row reused (idempotent on googleSub).",
+        "PENDING_PROFILE → WITHDRAWN : cron reaps PENDING_PROFILE rows older than 7 days that never completed signup (hard-delete allowed here — no transactional data exists yet).",
+        "ACTIVE → SUSPENDED : admin action. All sessions revoked, tokenVersion++. Read access to own history remains via a restricted screen; all writes blocked.",
+        "SUSPENDED → ACTIVE : admin unsuspend, OR lazily on read when suspendedUntil <= now (no cron dependency).",
+        "ACTIVE → DORMANT : cron, lastLoginAt older than DORMANCY_MONTHS (default 12), evaluated at KST midnight. Sessions revoked.",
+        "DORMANT → ACTIVE : next successful Google login, automatically, with a '휴면 해제' notice. No re-consent unless terms versions are stale.",
+        "ACTIVE|DORMANT → WITHDRAWAL_PENDING : POST /me/withdrawal, only if no blocking applications/events exist.",
+        "WITHDRAWAL_PENDING → ACTIVE : DELETE /me/withdrawal within 30 days (탈퇴 철회).",
+        "WITHDRAWAL_PENDING → WITHDRAWN : cron at requestedAt + 30d. Sets anonymizedAt, tombstones PII, deletes OAuthIdentity rows (so re-signup with the same Google account creates a FRESH account), keeps the User row and its FKs.",
+        "SUSPENDED → WITHDRAWAL_PENDING : BLOCKED. A suspended user cannot exit via withdrawal to dodge moderation; admin must lift or convert the suspension explicitly."
+      ]
+    },
+    {
+      "entity": "PartnerProfile.approvalStatus (PartnerApprovalStatus)",
+      "states": [
+        "PENDING",
+        "APPROVED",
+        "REJECTED",
+        "RESUBMIT_REQUIRED",
+        "SUSPENDED",
+        "REVOKED"
+      ],
+      "transitions": [
+        "(none) → PENDING : POST /partner/applications creates the profile with its first PartnerApplication.",
+        "PENDING → APPROVED : admin approve. Unlocks PartnerApprovedGuard-protected endpoints (venue + event creation, applicant messaging, final-list editing).",
+        "PENDING → REJECTED : admin reject with a terminal code (PROHIBITED_CATEGORY, BRN_ALREADY_CLAIMED). Resubmission requires admin to flip to RESUBMIT_REQUIRED.",
+        "PENDING → RESUBMIT_REQUIRED : admin reject with a fixable code (DOCUMENT_UNREADABLE, INCOMPLETE_CONTACT, INFO_MISMATCH).",
+        "RESUBMIT_REQUIRED → PENDING : partner submits a new PartnerApplication (attemptNo+1). Hard cap of 5 attempts per 30 days, then a 30-day cooldown.",
+        "APPROVED → PENDING : NEVER automatically. Editing identity fields on an approved profile creates a new PartnerApplication in SUBMITTED while approvalStatus STAYS APPROVED — live events must not break because a partner fixed a typo.",
+        "APPROVED → SUSPENDED : admin. Blocks new events/messaging; existing events keep running.",
+        "SUSPENDED → APPROVED : admin reinstate.",
+        "APPROVED|SUSPENDED → REVOKED : terminal admin action. All future partner writes blocked permanently; PARTNER role revoked from User in the same transaction.",
+        "REJECTED → REVOKED : admin cleanup of abandoned records."
+      ]
+    },
+    {
+      "entity": "AuthSession (refresh-token family)",
+      "states": [
+        "LIVE",
+        "ROTATED",
+        "REVOKED",
+        "EXPIRED"
+      ],
+      "transitions": [
+        "(none) → LIVE : successful login or successful refresh rotation.",
+        "LIVE → ROTATED : consumed by POST /auth/refresh; rotatedToId points at the successor. Still queryable for reuse detection.",
+        "ROTATED → (theft signal) : a second presentation of a ROTATED token revokes every session sharing familyId with reason=ROTATION_REUSE_DETECTED and bumps User.tokenVersion.",
+        "LIVE → REVOKED : logout, logout-all, admin force, role change, suspension, withdrawal, or familyStartedAt + 90d absolute cap.",
+        "LIVE → EXPIRED : expiresAt passes. Treated as revoked on read; physically purged by cron at expiresAt + 7d."
+      ]
+    },
+    {
+      "entity": "PartnerApplication.status",
+      "states": [
+        "SUBMITTED",
+        "UNDER_REVIEW",
+        "APPROVED",
+        "REJECTED",
+        "WITHDRAWN"
+      ],
+      "transitions": [
+        "(none) → SUBMITTED : partner submits.",
+        "SUBMITTED → UNDER_REVIEW : admin claims (conditional update; loser gets 409).",
+        "UNDER_REVIEW → SUBMITTED : 2h idle auto-release by cron, or admin unclaims.",
+        "SUBMITTED|UNDER_REVIEW → APPROVED|REJECTED : admin decision, conditional on current status.",
+        "SUBMITTED|UNDER_REVIEW → WITHDRAWN : partner cancels their own pending submission."
+      ]
+    }
+  ],
+  "businessRules": [
+    "BR-01 (Identity key). A user is identified by (provider='GOOGLE', providerAccountId=sub) and by nothing else. Email is a mutable attribute copied on each login, never a lookup key for authentication. This is the single most important rule in the context.",
+    "BR-02 (No implicit account linking). If a Google callback presents a NEW sub whose email already belongs to an existing User, do NOT link and do NOT create a second account. Write an OAUTH_LINK_CONFLICT audit row, refuse login, and show '이미 가입된 이메일입니다. 고객센터로 문의해 주세요.' Google Workspace addresses can be deleted and reassigned to a different human; auto-linking on email is account takeover.",
+    "BR-03 (Provider email drift). If the same sub returns a different email than stored, update User.email and OAuthIdentity.providerEmail — unless the new email already exists on another User, in which case keep the old email, flag the account, and notify admin. Uniqueness must never be violated by a provider-side change.",
+    "BR-04 (Verified email required). Reject login when Google returns email_verified=false. Resend delivery and admin invites both key on email; unverified addresses break both.",
+    "BR-05 (Signup is atomic and single-use). PENDING_PROFILE accounts can never obtain an access token. Signup completion consumes the SignupTicket with `UPDATE SignupTicket SET consumedAt=now() WHERE id=? AND consumedAt IS NULL`; 0 rows affected ⇒ 409, which is the entire double-submit defense.",
+    "BR-06 (Role self-selection is limited to USER and PARTNER). The zod schema for signup and every role-mutating DTO omits ADMIN from its accepted literal union, so a crafted payload cannot even parse.",
+    "BR-07 (Everyone is a USER). Every account always holds the USER role. PARTNER and ADMIN are additive. A partner browsing and applying to someone else's event is normal, expected behavior and requires no account switching.",
+    "BR-08 (One human, one login, mode switch). Multi-role is expressed in the UI as a header switch (내 예약 ⇄ 파트너 센터). The same JWT serves both; there is no per-role token and no re-login.",
+    "BR-09 (Partner approval gates writes, not reads). An unapproved PARTNER can log in, edit their profile, view their application status, and browse/apply as a consumer. They cannot create venues or events, message applicants, or view any applicant list. PartnerApprovedGuard enforces approvalStatus === 'APPROVED' by DB read, never by JWT claim.",
+    "BR-10 (JWT is a hint, DB is the truth). Access tokens carry sub, roles, status, partnerId, partnerApproved, tv, jti. Every request runs `SELECT id, status, roles, tokenVersion FROM \"User\" WHERE id=$1` (PK read, ~0.3ms on Neon) and 401s on tokenVersion mismatch or non-ACTIVE status. Endpoints protected by PartnerApprovedGuard add one indexed PartnerProfile read. We do not trade correctness of revocation for one round trip.",
+    "BR-11 (Token lifetimes). Access 15 min for USER-only accounts, 10 min for accounts holding PARTNER or ADMIN. Refresh 30 days, rotating on every use, with a 90-day absolute family cap. jwt verification uses clockTolerance: 30s to survive skew between Vercel instances.",
+    "BR-12 (Cookies). Access and refresh are httpOnly, Secure, SameSite=Lax, Path scoped (refresh cookie only on /api/v1/auth/refresh). apps/web and apps/api are same-origin via Vercel rewrites, so no CORS credential dance. All state-changing requests additionally carry an `X-CSRF-Token` matched against a non-httpOnly companion cookie (double-submit).",
+    "BR-13 (Approved partners never silently lose approval). Identity-field edits on an APPROVED profile spawn a new PartnerApplication for review while the live approval and all running events remain untouched. Only an explicit admin suspend/revoke removes operating privileges.",
+    "BR-14 (BRN uniqueness and validation). 사업자등록번호 is stored digits-only, validated with the NTS checksum, and unique across PartnerProfile. A duplicate submission is rejected at the DB constraint, mapped to 409 BRN_ALREADY_CLAIMED — the error message must NOT reveal which account holds it.",
+    "BR-15 (Every privileged transition is a conditional update + audit row, in one transaction). Approve, reject, suspend, revoke, role grant, invite accept: all use `WHERE <column> = <expected>` and treat 0 affected rows as 409. This is the only concurrency control this context needs — consistent with the platform's 'don't over-engineer locks' stance.",
+    "BR-16 (Moderation does not retroactively rewrite competition). Suspending a user or partner blocks future writes only. Existing valid applications stay in the BID ranking and keep their INSTANT slots. The partner (or admin) resolves anything problematic on the final-list edit screen, which already exists. Rationale: silently deleting a bid after the deadline would change the cutoff for everyone else.",
+    "BR-17 (Self-dealing block). A user cannot apply to an event whose Event.partnerId resolves to their own PartnerProfile.id. NotOwnEventGuard enforces this — otherwise a partner could inflate their own 경쟁률.",
+    "BR-18 (Admin provisioning). ADMIN is granted only by (a) the seeded bootstrap admin from an env-configured email at first deploy, or (b) accepting an AdminInvite while logged in with the exact invited Google email. POST /admin/users/:id/roles explicitly refuses ADMIN.",
+    "BR-19 (Last-admin protection). Any operation that would leave zero ACTIVE users holding ADMIN — suspend, role revoke, withdrawal — is refused with 409 LAST_ADMIN_PROTECTED. Checked inside the transaction with a counting query, not before it.",
+    "BR-20 (Admins cannot moderate themselves). An admin cannot suspend, revoke, or role-revoke their own userId. Prevents both accidental lockout and 'clean your own record' abuse.",
+    "BR-21 (Lazy state transitions, cron as backstop). Suspension expiry and dormancy are evaluated on read inside the request transaction, exactly mirroring the deposit-hold lazy-expiry pattern used by the Application context. The daily cron is a sweeper for accounts nobody touches, not the mechanism of record.",
+    "BR-22 (Time). All storage UTC timestamptz. All human-facing rendering, all dormancy/SLA/business-day math, and all cron schedules are Asia/Seoul. The server clock is the sole authority; a client-supplied timestamp is never trusted for anything.",
+    "BR-23 (Public vs authed surface). Public: 이벤트 목록/상세, 파트너·업체 검색, 경쟁률. Authed+ACTIVE: 신청, 재입찰, 취소, 보증금, 내 내역, 쪽지. Partner-approved: 이벤트 생성/수정, 신청자 목록, 최종 확정. Admin: everything. Browsing must never require login — that is the top-of-funnel.",
+    "BR-24 (Response projection is server-decided). The role-branched serializer lives in this context and keys off the DB-resolved principal. Amount, rank, and cutoff fields are omitted from the DTO entirely for non-owners — not sent-and-hidden, not null-and-hidden. A field that never leaves the server cannot leak in a devtools network tab.",
+    "BR-25 (Consent is granular and versioned). SERVICE, PRIVACY, AGE_14_OVER are required to complete signup. PARTNER_TERMS is required to submit a partner application. MARKETING_EMAIL and MARKETING_INAPP are independently optional and independently withdrawable, and the Notification context must join against live consent when building broadcast segments.",
+    "BR-26 (Withdrawal preserves competitive integrity). Anonymization tombstones PII but keeps the User row, so Application/Bid/BidHistory FKs and the audit trail survive. Historical rankings must remain reconstructible. Displayed as '탈퇴한 사용자'.",
+    "BR-27 (Withdrawal is blocked mid-competition). Cannot withdraw while holding an application on a non-finalized event or, as a partner, an event past open but not finalized. Otherwise withdrawal becomes a way to vanish from a ranking after seeing the outcome.",
+    "BR-28 (Re-signup after withdrawal is a fresh account). OAuthIdentity rows are deleted at anonymization, so the same Google account signing up again creates a new User with zero history. It does NOT inherit the old account's suspension — which is exactly why suspension enforcement cannot rely on account identity alone (see EC-12).",
+    "BR-29 (PII access by admin is itself audited). Viewing a user detail page, revealing a phone number, or downloading a 사업자등록증 writes an AccountAuditLog row. Admins are trusted but observed.",
+    "BR-30 (Rate limits are stored, not in-memory). Serverless instances share nothing. Login attempts, signup completions, profile edits, and partner resubmissions are limited via a Postgres counter table keyed on (bucket, subjectHash, windowStart) with an upsert, or Upstash if latency demands it. An in-memory Nest ThrottlerGuard is worthless here and must not be used.",
+    "BR-31 (returnTo allowlist). Only same-origin relative paths matching ^/(?!/) are accepted; everything else falls back to '/'. Prevents OAuth-flow open redirect into a credential-phishing clone.",
+    "BR-32 (Cron endpoints are not JWT-authed). /internal/cron/* is @Public to JwtAuthGuard and guarded by CronSecretGuard using a constant-time comparison against CRON_SECRET, plus a check on Vercel's cron header. No user token can ever reach a sweeper."
+  ],
+  "edgeCases": [
+    "EC-01 (Concurrent first login). Two OAuth callbacks for the same brand-new sub race (user double-clicks '구글로 시작하기'). The @@unique([provider, providerAccountId]) index makes one INSERT fail with Prisma P2002; catch it, re-read the identity, and continue. Never create two Users. Same pattern for the SignupTicket's @unique userId.",
+    "EC-02 (Signup double-submit). User double-taps '가입 완료'. The conditional consume of SignupTicket makes the second call a 409; the client treats 409 SIGNUP_ALREADY_COMPLETED as success and navigates on. No duplicate TermsAgreement rows, no duplicate role grants.",
+    "EC-03 (Google email recycled by a Workspace admin). ppdoll@company.co.kr is deleted and given to a new hire. New sub + existing email ⇒ BR-02 refuses login. Without this rule the new hire inherits the previous employee's partner account, venues, and applicant PII.",
+    "EC-04 (Two admins review the same application simultaneously). Both press 승인/반려. The conditional UPDATE means one wins; the loser gets 409 ALREADY_REVIEWED and the UI refetches. Without it, the partner receives two contradictory 쪽지 (승인 and 반려) and the audit log is ambiguous.",
+    "EC-05 (Partner approved one millisecond after their own request was authorized). Not harmful — the worst case is a 403 the partner retries. The inverse (revoked partner still holding a 10-minute access token) IS harmful, which is why tokenVersion is bumped on every privilege-reducing action and checked per request.",
+    "EC-06 (Stale roles in JWT). A user granted PARTNER keeps an access token that says roles=[USER]. Rather than force re-login, POST /admin/users/:id/roles bumps tokenVersion, the next request 401s with code AUTH_TOKEN_STALE, the web client silently refreshes (refresh cookie is still valid — role change revokes access tokens, not the session family) and retries once. Transparent to the user.",
+    "EC-07 (Refresh-token theft). Attacker exfiltrates the refresh cookie via a hypothetical XSS. Both attacker and victim rotate; the second presentation of an already-rotated token trips ROTATION_REUSE_DETECTED, which kills the entire family and forces both parties to re-login. The victim gets a '다른 기기에서 로그인이 감지되었습니다' 쪽지.",
+    "EC-08 (Suspended user mid-bid). A user with a live BID application is suspended at 23:58, deadline 00:00 KST. Per BR-16 their bid stays in the ranking; the partner's final-list screen shows a 제재 회원 badge so they can drop them manually. Silently removing them would move the cutoff amount for everyone below, after those users could no longer react.",
+    "EC-09 (Partner revoked with a live event mid-deadline). Revocation blocks partner writes but the event does not vanish — users have already paid deposits. Admin must explicitly cancel the event through the Event context, which triggers 이벤트 취소 notifications and deposit refunds. Revoke and cancel are deliberately separate actions.",
+    "EC-10 (Access token expires during the deposit window). User applies at T, deposit window closes at T+10min, access token expires at T+9min. The deposit POST 401s. Client must refresh-and-retry transparently; if the retry lands at T+10:03 the hold has expired and the user rightly loses the slot. Mitigation: the web app proactively refreshes when the token has under 2 minutes left AND a deposit countdown is on screen. Auth latency must never be the reason someone loses a slot.",
+    "EC-11 (Re-bid replayed by a token refresh). PATCH /applications/:id/bid fires, the request 401s on an expired token after the DB write but before the response, the client refreshes and retries — a naive implementation raises the bid twice and updates lastBidAt twice, worsening the user's tie-break position. Mandatory Idempotency-Key (client-generated UUID, stored with the response hash, 24h TTL) makes the retry return the original result. This is an auth-layer requirement even though the bid logic lives elsewhere.",
+    "EC-12 (Multi-account slot farming). One person makes five Google accounts to grab five INSTANT slots or to stack BID entries. Google signup is free and unlimited, so account identity alone cannot stop this. Layered mitigation: unique (eventId, userId) on Application; ipHash + device-cookie velocity limits on signup and apply; a feature-flagged PHONE_VERIFICATION_REQUIRED gate that binds one verified 휴대폰 번호 to one applying account; admin fraud flags surfaced on the final-list screen. Accept that MVP is only partially defended and say so to the business.",
+    "EC-13 (Suspension evasion via withdrawal + re-signup). Blocked at the front by BR-'SUSPENDED cannot withdraw'. A determined actor still gets a new Google account (EC-12). Mitigation: retain a hashed 휴대폰 번호 denylist for revoked accounts once phone verification ships. Do not retain a raw email denylist indefinitely — that is itself PII retention past its purpose.",
+    "EC-14 (Partner applies to their own event to fake 경쟁률). Blocked by NotOwnEventGuard. Also blocked for a second account the same human controls — undetectable at MVP; surface a 'same-device/IP cluster' hint to admin rather than pretending it is solved.",
+    "EC-15 (Amount leakage via API shape). Even with amounts hidden in the UI, a naive GET /events/:id that returns the full applications array with a UI-level filter leaks everything. Enforced by BR-24: the ratio-only DTO literally has no amount field. Also: never return a total that allows deriving an individual value (e.g. sum-of-amounts alongside applicant count).",
+    "EC-16 (Rank leakage via HTTP status or timing). If applying returns 200 for 'you'd currently make the cut' and 202 otherwise, ranking is leaked. All BID applications must return an identical 201 with an identical body shape and no positional information whatsoever, and the 경쟁률 must be computed on a cached/rounded interval so it can't be used as an oracle for whether a specific rival just applied.",
+    "EC-17 (Existence leakage through error codes). 403 for 'exists but not yours' vs 404 for 'does not exist' lets an attacker enumerate event and user ids. This context's exception filter maps both to 404 for any resource the principal cannot read.",
+    "EC-18 (Login-time email enumeration). There is no password login, so classic enumeration is moot — but the blocked-account redirect must not differ between 'no such account' and 'suspended account' when reached without a valid Google session. Use one generic /blocked page with a code that is only meaningful to an authenticated principal.",
+    "EC-19 (KST/UTC boundary bugs). Dormancy 'no login for 12 months' computed in UTC drifts 9 hours and can flip an account dormant a day early. SLA 'within 3 business days' must use KST calendar days plus a Korean public-holiday table. Vercel Cron is UTC-only: a '03:10 KST' job is configured as '10 18 * * *' UTC, and this must be commented in vercel.json or someone will 'fix' it.",
+    "EC-20 (DST). Korea has none, but the Resend templates render for users whose timeZone may not be Asia/Seoul. Always render with an explicit zone label ('2026-08-01 20:00 KST') rather than a bare local time.",
+    "EC-21 (SignupTicket expiry mid-form). The 15-minute ticket dies while the user reads the terms. Signup completion 401s with SIGNUP_TICKET_EXPIRED; the client re-runs Google login, which finds the same PENDING_PROFILE User by sub and mints a fresh ticket with the form state preserved client-side. No orphan account, no duplicate.",
+    "EC-22 (Blob upload token abuse). The 사업자등록증 upload token could be reused to write arbitrary files. Scope it to a single path prefix containing the partnerProfileId, 5-minute TTL, MIME allowlist, 10MB cap, and a private store. Serve reads only through 60-second signed URLs to ADMIN and the owning partner — a public Blob URL for a 사업자등록증 is a serious PII incident.",
+    "EC-23 (Partner resubmission spam). A rejected partner resubmits 200 times to flood the admin queue. Cap at 5 attempts per 30 days per PartnerProfile, then a cooldown, plus a per-BRN cap so deleting and recreating a profile doesn't reset the counter.",
+    "EC-24 (Admin invite interception / replay). Token is single-use (conditional UPDATE … WHERE status='PENDING'), 72h TTL, bound to an exact email, and requires an already-authenticated Google session whose verified email matches. A forwarded invite mail alone grants nothing.",
+    "EC-25 (Bootstrap admin foot-gun). The seed admin is keyed on an env var email. If that env var is ever set to an attacker-controlled address in a preview deployment sharing the production database, they become admin. Rule: seeding runs only when NODE_ENV=production AND the admin table is empty AND an explicit ALLOW_ADMIN_SEED flag is set; preview deployments must use a branch database.",
+    "EC-26 (Vercel cold start + Prisma connection storm). Many concurrent instances each opening a Neon connection exhausts the pool at exactly the moment a popular deadline hits. Use the Neon serverless driver / PgBouncer connection string with a low per-instance pool, and keep the per-request auth read to one indexed PK lookup so auth never becomes the bottleneck at deadline peak.",
+    "EC-27 (Clock skew between instances). Two Vercel instances a few hundred ms apart can make a just-issued token appear not-yet-valid. clockTolerance: 30s on verification; never use nbf tightly.",
+    "EC-28 (Withdrawn user's 쪽지 threads). A partner opens an old applicant thread after the applicant anonymized. The Notification context must render '탈퇴한 사용자' and disable reply, rather than 500 on a null join. This context must publish the tombstone contract explicitly.",
+    "EC-29 (Marketing consent withdrawn between segment build and send). Admin builds a broadcast segment at 10:00, Resend batch fires at 10:05, a user opted out at 10:02. Consent must be re-checked at send time, per recipient, not at segment-build time. 정보통신망법 penalties are real.",
+    "EC-30 (Role array and denormalization drift). If User.roles and UserRoleAssignment ever disagree, authorization silently breaks. They are written in one transaction, and a weekly cron reconciliation job asserts equality and alerts on mismatch. Consider a Postgres trigger if drift is ever observed.",
+    "EC-31 (Idempotency-Key collision across users). Keys are client-generated UUIDs; scope the idempotency store to (userId, endpoint, key) so one user cannot replay-poison another's request.",
+    "EC-32 (Deadline-minute login stampede). Soft close means the last N minutes are the traffic peak, and it is also when users who were logged out come back. Auth endpoints must be the cheapest routes in the system: no N+1, no joins in the guard beyond the two PK/indexed reads, and refresh must not write more than one row."
+  ],
+  "terms": [
+    {
+      "technical": "Sign in with Google",
+      "userFriendlyKo": "구글로 시작하기"
+    },
+    {
+      "technical": "USER role",
+      "userFriendlyKo": "일반 회원"
+    },
+    {
+      "technical": "PARTNER role",
+      "userFriendlyKo": "파트너 (업체 회원)"
+    },
+    {
+      "technical": "ADMIN role",
+      "userFriendlyKo": "운영자"
+    },
+    {
+      "technical": "Account type selection at signup",
+      "userFriendlyKo": "어떻게 이용하실 건가요? · 일반 회원으로 시작 / 파트너로 시작"
+    },
+    {
+      "technical": "Partner application submit",
+      "userFriendlyKo": "파트너 입점 신청"
+    },
+    {
+      "technical": "PartnerApprovalStatus = PENDING",
+      "userFriendlyKo": "승인 대기 중이에요"
+    },
+    {
+      "technical": "PartnerApprovalStatus = APPROVED",
+      "userFriendlyKo": "승인 완료"
+    },
+    {
+      "technical": "PartnerApprovalStatus = REJECTED",
+      "userFriendlyKo": "승인이 반려되었어요"
+    },
+    {
+      "technical": "PartnerApprovalStatus = RESUBMIT_REQUIRED",
+      "userFriendlyKo": "서류를 보완해서 다시 신청해 주세요"
+    },
+    {
+      "technical": "PartnerApprovalStatus = SUSPENDED",
+      "userFriendlyKo": "파트너 활동이 일시 중지되었어요"
+    },
+    {
+      "technical": "PartnerApprovalStatus = REVOKED",
+      "userFriendlyKo": "파트너 자격이 해지되었어요"
+    },
+    {
+      "technical": "businessRegistrationNumber",
+      "userFriendlyKo": "사업자등록번호"
+    },
+    {
+      "technical": "businessRegistrationFile",
+      "userFriendlyKo": "사업자등록증 사본"
+    },
+    {
+      "technical": "businessName",
+      "userFriendlyKo": "상호명"
+    },
+    {
+      "technical": "representativeName",
+      "userFriendlyKo": "대표자명"
+    },
+    {
+      "technical": "AccountStatus = ACTIVE",
+      "userFriendlyKo": "이용 중"
+    },
+    {
+      "technical": "AccountStatus = SUSPENDED",
+      "userFriendlyKo": "이용이 제한된 계정이에요"
+    },
+    {
+      "technical": "AccountStatus = DORMANT",
+      "userFriendlyKo": "휴면 계정"
+    },
+    {
+      "technical": "Dormant account reactivated on login",
+      "userFriendlyKo": "휴면 상태가 해제되었어요"
+    },
+    {
+      "technical": "Withdrawal request",
+      "userFriendlyKo": "회원 탈퇴"
+    },
+    {
+      "technical": "Cancel withdrawal within grace period",
+      "userFriendlyKo": "탈퇴 신청 취소"
+    },
+    {
+      "technical": "Anonymized user tombstone",
+      "userFriendlyKo": "탈퇴한 사용자"
+    },
+    {
+      "technical": "Withdrawal blocked by active application",
+      "userFriendlyKo": "진행 중인 신청이 있어 지금은 탈퇴할 수 없어요"
+    },
+    {
+      "technical": "displayName",
+      "userFriendlyKo": "닉네임"
+    },
+    {
+      "technical": "AuthSession list",
+      "userFriendlyKo": "로그인된 기기"
+    },
+    {
+      "technical": "Revoke one session",
+      "userFriendlyKo": "이 기기에서 로그아웃"
+    },
+    {
+      "technical": "logout-all",
+      "userFriendlyKo": "모든 기기에서 로그아웃"
+    },
+    {
+      "technical": "Session expired / token stale",
+      "userFriendlyKo": "로그인이 만료되었어요. 다시 로그인해 주세요"
+    },
+    {
+      "technical": "Refresh-token reuse detected",
+      "userFriendlyKo": "다른 기기에서 로그인이 감지되어 안전을 위해 로그아웃했어요"
+    },
+    {
+      "technical": "TermsType SERVICE",
+      "userFriendlyKo": "이용약관 동의 (필수)"
+    },
+    {
+      "technical": "TermsType PRIVACY",
+      "userFriendlyKo": "개인정보 수집·이용 동의 (필수)"
+    },
+    {
+      "technical": "TermsType AGE_14_OVER",
+      "userFriendlyKo": "만 14세 이상입니다 (필수)"
+    },
+    {
+      "technical": "TermsType PARTNER_TERMS",
+      "userFriendlyKo": "파트너 운영 약관 동의 (필수)"
+    },
+    {
+      "technical": "TermsType MARKETING_EMAIL",
+      "userFriendlyKo": "이메일 혜택·소식 받기 (선택)"
+    },
+    {
+      "technical": "TermsType MARKETING_INAPP",
+      "userFriendlyKo": "쪽지·알림으로 소식 받기 (선택)"
+    },
+    {
+      "technical": "Terms version bumped, re-consent required",
+      "userFriendlyKo": "약관이 변경되었어요. 확인 후 계속해 주세요"
+    },
+    {
+      "technical": "403 from PartnerApprovedGuard",
+      "userFriendlyKo": "승인 후 이용할 수 있는 기능이에요"
+    },
+    {
+      "technical": "Partner console (multi-role switch)",
+      "userFriendlyKo": "파트너 센터"
+    },
+    {
+      "technical": "Consumer console (multi-role switch)",
+      "userFriendlyKo": "내 예약"
+    },
+    {
+      "technical": "NotOwnEventGuard rejection",
+      "userFriendlyKo": "내가 등록한 이벤트에는 신청할 수 없어요"
+    },
+    {
+      "technical": "Login required (401 on apply)",
+      "userFriendlyKo": "로그인하고 신청해 보세요"
+    },
+    {
+      "technical": "AdminInvite email",
+      "userFriendlyKo": "운영자 초대"
+    },
+    {
+      "technical": "BRN already claimed",
+      "userFriendlyKo": "이미 등록된 사업자등록번호예요. 고객센터로 문의해 주세요"
+    },
+    {
+      "technical": "Rate limited",
+      "userFriendlyKo": "잠시 후 다시 시도해 주세요"
+    }
+  ],
+  "openQuestions": [
+    "Q1. Suspension vs. live competition — BR-16 says a suspended user's existing bid STAYS in the ranking and the partner drops them manually on the final-list screen. The alternative (auto-exclude, which moves the cutoff for everyone) is defensible if suspensions are mostly fraud. Which does the business want? If auto-exclude, does the excluded user's deposit get refunded?",
+    "Q2. Dormancy — the 12-month 휴면 requirement was relaxed in Korean law (개인정보보호법 개정, 유효기간제 폐지). Do we still want DORMANT at all, or drop it to reduce friction? Current design keeps it behind a configurable DORMANCY_MONTHS with 0 = disabled.",
+    "Q3. Withdrawal grace period — 30 days is my default. Some services withdraw immediately. Also: do we retain 거래기록 for 5 years per 전자상거래법 once real payments ship? That decision changes what 'anonymize' means, and it is easier to design in now than to retrofit.",
+    "Q4. Phone verification — is 휴대폰 본인인증 (PASS/NICE) in scope for v1.1? It is the only mechanism that meaningfully limits multi-account slot farming (EC-12) and suspension evasion (EC-13). If yes, is it required for all applications or only for events above an amount threshold?",
+    "Q5. Partner approval SLA and staffing — 3 business days assumed. Is there an admin on duty daily? Should we auto-approve low-risk partners (valid BRN checksum + verified 국세청 상태조회) and human-review only the rest? That API integration would need budget approval.",
+    "Q6. Should we integrate the 국세청 사업자등록 상태조회 open API to auto-verify BRN validity/휴폐업 status at submission time? It is free and would kill most fraudulent submissions before an admin sees them.",
+    "Q7. Multi-venue partners — one PartnerProfile currently owns many Venues. Do we ever need multiple STAFF users under one partner business (사장 + 매니저 accounts sharing an event)? That would require a PartnerMembership join table with per-member permissions. I have deliberately NOT modeled it; retrofitting is a real migration, so decide now if it is a v1.x item.",
+    "Q8. Admin sub-roles — is one flat ADMIN enough, or do we need SUPER_ADMIN (role grants, admin invites) vs OPERATOR (partner review, moderation) vs SUPPORT (read-only + PII masked)? The enum and guard support adding these; the audit log already records actorRole.",
+    "Q9. Do partners see applicant identity? The visibility section says partners see full amounts and ranking, but it does not say whether they see 실명/휴대폰번호/이메일 of applicants, and if so at what stage (during the period vs. only after selection). This is a significant privacy decision and it directly shapes the DTO projections in this context. My assumption: 닉네임 only until selection, contact details revealed only for the confirmed list.",
+    "Q10. Access-token lifetime vs. deposit window — with DEPOSIT_HOLD_ENABLED=true and a 10-minute window, a 15-minute access token can expire mid-countdown (EC-10). I mitigate with proactive client refresh. Would the business prefer a longer access TTL (30 min) accepting slower revocation, or should the deposit window minimum be constrained to be shorter than the access TTL?",
+    "Q11. Should we keep an email denylist for revoked partner accounts, or is that PII retention beyond purpose? Legal input needed on retention period.",
+    "Q12. Preview deployments — will Vercel preview branches point at the production Neon database or at branch databases? If production, EC-25 (admin seeding) and the CRON_SECRET both need environment-scoped handling before the first preview deploy."
+  ]
+}

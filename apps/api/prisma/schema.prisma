@@ -1,0 +1,2068 @@
+// Dibs — 데이터 모델
+//
+// datasource가 URL을 둘로 나눠 쓰는 이유:
+//   url       — pooled(pgbouncer) 주소. 서버리스 런타임이 쓴다.
+//   directUrl — 직결 주소. 마이그레이션에만 쓴다(pgbouncer 뒤에서는 DDL이 안 된다).
+//
+// 제품 규칙의 근거는 docs/DECISIONS.md 를 보라.
+
+generator client {
+  provider = "prisma-client-js"
+  // postgresqlExtensions: datasource 의 extensions 를 쓰기 위한 프리뷰 플래그.
+  // 없으면 `migrate dev` 가 만드는 **섀도 DB** 에 확장이 안 깔려
+  //   ERROR: operator class "gin_trgm_ops" does not exist for access method "gin"
+  // 로 마이그레이션 검증이 실패한다. 실제 DB 에는 있는데 섀도에만 없어서 헷갈리기 쉽다.
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+
+  // pg_trgm  — 한글 부분일치 검색(검색 모듈의 GIN 인덱스)
+  // pgcrypto — 감사 로그 해시 체인의 digest()
+  extensions = [pg_trgm, pgcrypto]
+}
+
+// =============================================================================
+// ENUMS — CHUNK A ("accounts")
+// =============================================================================
+
+enum UserRole {
+  USER
+  PARTNER
+  ADMIN
+}
+
+enum AccountStatus {
+  PENDING_PROFILE
+  ACTIVE
+  SUSPENDED
+  DORMANT
+  WITHDRAWAL_PENDING
+  WITHDRAWN
+}
+
+enum PartnerApprovalStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  REJECTED
+  RESUBMIT_REQUIRED
+  SUSPENDED
+  REVOKED
+}
+
+enum VenueStatus {
+  DRAFT
+  PENDING_REVIEW
+  ACTIVE
+  HIDDEN
+  SUSPENDED
+  ARCHIVED
+}
+
+enum BusinessType {
+  INDIVIDUAL
+  CORPORATION
+  SIMPLIFIED
+  TAX_EXEMPT
+  NONPROFIT
+}
+
+enum BusinessVerificationStatus {
+  UNSUBMITTED
+  PENDING
+  VERIFIED
+  REJECTED
+  REVOKED
+}
+
+enum PartnerRejectionCode {
+  INVALID_BRN
+  BRN_ALREADY_CLAIMED
+  DOCUMENT_UNREADABLE
+  INFO_MISMATCH
+  PROHIBITED_CATEGORY
+  INCOMPLETE_CONTACT
+  OTHER
+}
+
+enum VenueImageStatus {
+  PENDING
+  READY
+  QUARANTINED
+  DELETING
+}
+
+enum RegionLevel {
+  SIDO
+  SIGUNGU
+  EUPMYEONDONG
+}
+
+/// 동일인 추정 근거. SelectionExclusionReason.DUPLICATE_ACCOUNT 를 파트너가 적용하려면
+/// "왜 같은 사람이라고 보는가"의 증거가 행으로 남아 있어야 한다(구글 계정은 무한 생성 가능).
+enum IdentitySignal {
+  IP_HASH_CLUSTER
+  PHONE_MATCH
+  DEVICE_MATCH
+  PAYMENT_MATCH
+  ADMIN_MANUAL
+}
+
+// =============================================================================
+// ENUMS — CHUNK B ("core")
+// =============================================================================
+
+enum EventMode {
+  INSTANT
+  BID
+}
+
+/// SUSPENDED 가 필요한 이유: 운영자 정지가 status 를 바꾸지 않으면 INSTANT 정원 UPDATE,
+/// BID 신청 가드, 소프트 클로즈 연장, 노출 목록, 라이프사이클 크론이 전부 "아직 살아있는 이벤트"로
+/// 계속 취급한다(= 정지가 장식이 된다). 상태 하나로 모든 가드를 한 번에 닫는다.
+enum EventStatus {
+  DRAFT
+  SCHEDULED
+  OPEN
+  CLOSED
+  FINALIZED
+  CANCELED
+  SUSPENDED
+}
+
+enum ApplicationStatus {
+  PENDING_DEPOSIT
+  VALID
+  CONFIRMED
+  NOT_SELECTED
+  EXPIRED
+  CANCELED
+  REJECTED
+  EVENT_CANCELED
+}
+
+enum DepositStatus {
+  NOT_REQUIRED
+  PENDING
+  PAID
+  SHORTFALL_PENDING
+  EXPIRED
+  SUPERSEDED
+  CANCELED
+  VOIDED
+  REFUND_REQUESTED
+  REFUNDED
+  FORFEITED
+}
+
+enum SelectionStatus {
+  CANDIDATE
+  PRESELECTED
+  SELECTED
+  WAITING
+  NOT_SELECTED
+  REVOKED
+}
+
+enum VisibilityLevel {
+  HIDDEN
+  AFTER_DEADLINE
+  AFTER_FINALIZED
+  ALWAYS
+}
+
+enum DepositType {
+  FIXED
+  PERCENT
+}
+
+enum DepositReason {
+  INITIAL
+  RAISE_SHORTFALL
+  REAPPLY
+}
+
+enum DepositRefundStatus {
+  REQUESTED
+  PROCESSING
+  COMPLETED
+  FAILED
+  MANUAL_REQUIRED
+}
+
+enum DepositRefundReason {
+  NOT_SELECTED
+  EVENT_CANCELED
+  PARTNER_REJECTED
+  USER_CANCELED
+  ADMIN_REVERSAL
+  DUPLICATE_PAYMENT
+  ROLLBACK_OVERPAY
+}
+
+/// CANCEL 이 필요한 이유: 취소 → 대기 → 재신청으로 타이브레이크 시계를 세탁하는 어뷰징이
+/// Application.canceledAt 스칼라 하나만 남기고 재신청 때 덮어써져 흔적이 사라진다.
+/// 취소도 이력 1행으로 남겨야 bid_history_user_time_idx 로 교차 이벤트 추적이 가능하다.
+enum BidSource {
+  INITIAL_APPLY
+  RAISE
+  ROLLBACK
+  REAPPLY
+  CANCEL
+  ADMIN_ADJUST
+}
+
+enum ApplicationCancelReason {
+  USER_REQUEST
+  DEPOSIT_TIMEOUT
+  PARTNER_REJECT
+  EVENT_CANCELED
+  ADMIN
+}
+
+enum EventCloseReason {
+  PERIOD_ENDED
+  PARTNER_EARLY_CLOSE
+  ADMIN_FORCED
+  VENUE_SUSPENDED
+}
+
+enum EventCancelReason {
+  PARTNER_REQUEST
+  VENUE_UNAVAILABLE
+  INSUFFICIENT_APPLICANTS
+  PRICING_ERROR
+  POLICY_VIOLATION
+  ADMIN_FORCED
+  OTHER
+}
+
+enum SelectionRoundStatus {
+  PENDING
+  RANKING_READY
+  DRAFT
+  FINALIZED
+  REOPENED
+  CANCELED
+}
+
+enum SelectionEntrySource {
+  AUTO_RANK
+  PARTNER_ADD
+  PARTNER_REMOVE
+  PARTNER_PROMOTE
+  PARTNER_REORDER
+  ADMIN_OVERRIDE
+  SYSTEM_REVOKE
+  SYSTEM_EVENT_CANCELED
+  INSTANT_CLAIM
+}
+
+enum SelectionExclusionReason {
+  DEPOSIT_UNPAID
+  DEPOSIT_EXPIRED
+  USER_CANCELED
+  BLOCKED_USER
+  ADMIN_DISQUALIFIED
+  DUPLICATE_ACCOUNT
+  ALREADY_SELECTED_PRIOR_ROUND
+}
+
+enum SelectionRevokeReason {
+  USER_CANCELED
+  NO_SHOW
+  PARTNER_REMOVED
+  PAYMENT_FAILED
+  ADMIN_ACTION
+  EVENT_CANCELED
+}
+
+enum CoreActorType {
+  USER
+  PARTNER
+  ADMIN
+  SYSTEM_CRON
+  SYSTEM_LAZY
+}
+
+// =============================================================================
+// ENUMS — CHUNK C ("ops")
+// =============================================================================
+
+enum NotificationType {
+  APPLICATION_RECEIVED
+  APPLICATION_CONFIRMED_INSTANT
+  APPLICATION_CANCELED_BY_USER
+  DEPOSIT_REQUIRED
+  DEPOSIT_REMINDER
+  DEPOSIT_CONFIRMED
+  DEPOSIT_HOLD_EXPIRED
+  DEPOSIT_REFUND_SCHEDULED
+  REBID_ACCEPTED
+  REBID_DEPOSIT_SHORTFALL
+  REBID_ROLLED_BACK
+  DEADLINE_EXTENDED
+  EVENT_CANCELED
+  EVENT_CLOSED_CAPACITY_REACHED
+  SELECTION_FINALIZED_SELECTED
+  SELECTION_FINALIZED_NOT_SELECTED
+  SELECTION_REVISED_BY_PARTNER
+  PARTNER_APPROVAL_APPROVED
+  PARTNER_APPROVAL_REJECTED
+  PARTNER_NEW_APPLICATION_DIGEST
+  PARTNER_EVENT_DEADLINE_REACHED
+  PARTNER_BROADCAST_BLOCKED
+  ACCOUNT_SUSPENDED
+  ADMIN_ANNOUNCEMENT
+  // 아래는 운영자/파트너 상태 전이인데 알릴 방법이 없어 당사자가 폴링해야 했던 것들.
+  // 특히 APPLICATION_REJECTED_BY_PARTNER 는 환불까지 걸리는데 통보가 없으면 소비자보호 문제가 된다.
+  BUSINESS_VERIFICATION_APPROVED
+  BUSINESS_VERIFICATION_REJECTED
+  VENUE_REVIEW_APPROVED
+  VENUE_REVIEW_REJECTED
+  VENUE_IMAGE_QUARANTINED
+  PARTNER_SUSPENDED
+  PARTNER_REINSTATED
+  APPLICATION_REJECTED_BY_PARTNER
+  DEPOSIT_REFUND_COMPLETED
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+}
+
+enum DeliveryStatus {
+  PENDING
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  DELAYED
+  BOUNCED
+  COMPLAINED
+  FAILED
+  SKIPPED
+  CANCELED
+}
+
+enum BroadcastSegment {
+  ALL_USERS
+  ALL_PARTNERS
+  APPROVED_PARTNERS
+  PENDING_PARTNER_APPLICANTS
+  EVENT_APPLICANTS
+  EVENT_APPLICANTS_BY_STATUS
+  EVENT_SELECTED
+  EVENT_NOT_SELECTED
+  REGION
+  CATEGORY_INTEREST
+  INACTIVE_USERS
+  EXPLICIT_USER_LIST
+}
+
+/// append-only. CHUNK A 가 요구한 도메인 액션(PARTNER_APPLIED, BUSINESS_*, VENUE_*,
+/// PII_ACCESSED, REGISTRATION_DOC_VIEWED 등)을 병합 시 추가했다.
+enum AuditAction {
+  ADMIN_INVITED
+  ADMIN_ACTIVATED
+  ADMIN_DEACTIVATED
+  ADMIN_PERMISSION_CHANGED
+  ADMIN_LOGIN
+  PARTNER_APPLIED
+  PARTNER_APPLICATION_CLAIMED
+  PARTNER_APPLICATION_APPROVED
+  PARTNER_APPLICATION_REJECTED
+  PARTNER_APPLICATION_MORE_INFO
+  PARTNER_APPROVED
+  PARTNER_REJECTED
+  PARTNER_SUSPENDED
+  PARTNER_REVOKED
+  PARTNER_REINSTATED
+  BUSINESS_SUBMITTED
+  BUSINESS_VERIFIED
+  BUSINESS_REJECTED
+  BUSINESS_REVOKED
+  VENUE_SUBMITTED
+  VENUE_PUBLISHED
+  VENUE_HIDDEN
+  VENUE_SUSPENDED
+  VENUE_ARCHIVED
+  VENUE_IMAGE_QUARANTINED
+  ACCOUNT_SUSPENDED
+  ACCOUNT_SUSPENSION_LIFTED
+  ACCOUNT_ROLE_CHANGED
+  ACCOUNT_ANONYMIZED
+  PII_ACCESSED
+  REGISTRATION_DOC_VIEWED
+  CONTENT_HIDDEN
+  CONTENT_RESTORED
+  EVENT_FORCE_CLOSED
+  EVENT_FORCE_CANCELED
+  EVENT_UNPUBLISHED
+  EVENT_RESTORED
+  EVENT_DEADLINE_EXTENDED
+  EVENT_CAPACITY_EDITED
+  EVENT_FINAL_LIST_RESET
+  PARTNER_FINAL_LIST_EDITED
+  PARTNER_SELECTION_OVERRIDE
+  PARTNER_APPLICANT_REMOVED
+  PARTNER_DEADLINE_EXTENDED
+  PARTNER_EVENT_CANCELED
+  BROADCAST_CREATED
+  BROADCAST_APPROVED
+  BROADCAST_SENT
+  BROADCAST_CANCELED
+  BROADCAST_MODERATION_BLOCKED
+  EMAIL_SUPPRESSION_RELEASED
+  EMAIL_DELIVERY_RESENT
+  CATEGORY_CREATED
+  CATEGORY_UPDATED
+  CATEGORY_MERGED
+  CATEGORY_DEACTIVATED
+  REGION_UPDATED
+  /// PartnerBlockedUser 생성/해제. BLOCKED_USER 제외 사유의 근거가 감사 가능해야 한다.
+  PARTNER_USER_BLOCKED
+  PARTNER_USER_UNBLOCKED
+  SETTING_CHANGED
+  FEATURE_FLAG_TOGGLED
+  FEE_POLICY_CREATED
+  FEE_POLICY_ENDED
+  SETTLEMENT_COMPUTED
+  SETTLEMENT_STATUS_CHANGED
+  AUDIT_EXPORTED
+  SYSTEM_SWEEP_EXPIRED_HOLDS
+  SYSTEM_REBID_ROLLED_BACK
+  SYSTEM_RANKING_FINALIZED
+  SYSTEM_AUDIT_CHAIN_VERIFIED
+}
+
+enum SettlementStatus {
+  DRAFT
+  COMPUTED
+  READY
+  ON_HOLD
+  PAID
+  CANCELED
+}
+
+enum NotificationCategory {
+  APPLICATION
+  DEPOSIT
+  RESULT
+  EVENT_CHANGE
+  MESSAGE
+  ACCOUNT
+  PARTNER_OPS
+  ANNOUNCEMENT
+  MARKETING
+}
+
+enum NotificationPriority {
+  CRITICAL
+  HIGH
+  NORMAL
+  LOW
+}
+
+enum MessageKind {
+  ADMIN_DIRECT
+  ADMIN_BROADCAST
+  PARTNER_EVENT
+}
+
+enum MessageStatus {
+  DELIVERED
+  SKIPPED
+  BLOCKED
+}
+
+enum DeliverySkipReason {
+  PREFERENCE_OPTED_OUT
+  GLOBAL_EMAIL_OFF
+  SUPPRESSED_UNSUBSCRIBED
+  SUPPRESSED_BOUNCED
+  SUPPRESSED_COMPLAINED
+  NO_EMAIL_ON_ACCOUNT
+  NO_MARKETING_CONSENT
+  NO_NIGHT_MARKETING_CONSENT
+  RECIPIENT_DEACTIVATED
+  FEATURE_FLAG_OFF
+  COALESCED
+  MODERATION_BLOCKED
+}
+
+enum BroadcastStatus {
+  DRAFT
+  PENDING_APPROVAL
+  SCHEDULED
+  EXPANDING
+  SENDING
+  SENT
+  PARTIALLY_FAILED
+  CANCELED
+  BLOCKED
+}
+
+enum ModerationState {
+  NOT_REQUIRED
+  AUTO_FLAGGED
+  PENDING_REVIEW
+  APPROVED
+  BLOCKED
+}
+
+enum EmailSuppressionReason {
+  USER_UNSUBSCRIBED
+  HARD_BOUNCE
+  SOFT_BOUNCE_THRESHOLD
+  SPAM_COMPLAINT
+  ADMIN_MANUAL
+  INVALID_ADDRESS
+}
+
+enum SuppressionScope {
+  MARKETING_ONLY
+  ALL
+}
+
+enum DigestMode {
+  IMMEDIATE
+  DAILY_DIGEST
+}
+
+enum AuditActorRole {
+  USER
+  PARTNER
+  ADMIN
+  SYSTEM
+}
+
+enum AuditTargetType {
+  USER
+  PARTNER_PROFILE
+  BUSINESS
+  VENUE
+  VENUE_IMAGE
+  EVENT
+  APPLICATION
+  BID_HISTORY
+  DEPOSIT
+  SELECTION
+  SELECTION_ENTRY
+  NOTIFICATION
+  MESSAGE
+  BROADCAST
+  CATEGORY
+  REGION
+  SETTING
+  PLATFORM_FEE
+  SETTLEMENT
+  SYSTEM
+}
+
+enum FeeScope {
+  GLOBAL
+  CATEGORY
+  REGION
+  PARTNER
+}
+
+enum FeeType {
+  PERCENT
+  FIXED
+  HYBRID
+}
+
+// =============================================================================
+// MODELS — CHUNK A ("accounts")
+// =============================================================================
+
+/// 계정 1행 = 사람 1명. 역할이 여러 개여도 행은 하나.
+/// 생성 경로는 구글 OAuth 콜백 또는 운영자 시드/초대뿐이다.
+model User {
+  id String @id @default(cuid())
+
+  // --- 구글 OAuth 신원 ---
+  /// nullable 인 이유: 익명화(anonymizedAt)는 이 두 값을 반드시 지워야 하는데,
+  /// NOT NULL + UNIQUE 면 지울 수가 없어 탈퇴자의 실제 구글 계정/이메일이 영구 잔존한다.
+  /// (그러면 같은 사람이 재가입할 때 AuthModule 이 탈퇴 행을 되살린다.)
+  /// Postgres 유니크 인덱스는 NULL 을 여러 개 허용하므로 익명화 행끼리 충돌하지 않는다.
+  /// 살아있는 계정은 둘 다 NOT NULL 이어야 한다 → CHECK 는 raw SQL 로 건다.
+  googleSub        String?   @unique @db.VarChar(64)
+  email            String?   @unique @db.VarChar(255)
+  emailVerifiedAt  DateTime? @db.Timestamptz(3)
+  googleProfileRaw Json?
+
+  // --- 프로필 ---
+  displayName     String    @db.VarChar(20)
+  realName        String?   @db.VarChar(40)
+  phone           String?   @db.VarChar(20)
+  phoneVerifiedAt DateTime? @db.Timestamptz(3)
+  avatarUrl       String?   @db.VarChar(500)
+
+  // --- 권한/상태 ---
+  roles          UserRole[]    @default([USER])
+  status         AccountStatus @default(PENDING_PROFILE)
+  statusReason   String?       @db.VarChar(500)
+  suspendedUntil DateTime?     @db.Timestamptz(3)
+  tokenVersion   Int           @default(0)
+
+  // --- 로그인/환경 ---
+  lastLoginAt       DateTime? @db.Timestamptz(3)
+  loginCount        Int       @default(0)
+  locale            String    @default("ko-KR") @db.VarChar(10)
+  timeZone          String    @default("Asia/Seoul") @db.VarChar(40)
+  notificationEmail String?   @db.VarChar(255)
+
+  /// BroadcastSegment.REGION 이 팬아웃할 실체. 이 컬럼이 없으면 그 세그먼트는
+  /// "과거 신청에서 지역을 추론" 같은 비결정적 정의를 크론이 매번 새로 지어내야 한다.
+  /// 값 공간은 Region.code(법정동코드 10자리)와 같다.
+  preferredRegionCode String? @db.VarChar(10)
+
+  // --- 약관 동의 원장 (법적 증빙 원본) ---
+  serviceTermsVersion       String?   @db.VarChar(20)
+  serviceTermsAgreedAt      DateTime? @db.Timestamptz(3)
+  privacyTermsVersion       String?   @db.VarChar(20)
+  privacyTermsAgreedAt      DateTime? @db.Timestamptz(3)
+  age14ConfirmedAt          DateTime? @db.Timestamptz(3)
+  marketingEmailAgreedAt    DateTime? @db.Timestamptz(3)
+  marketingEmailWithdrawnAt DateTime? @db.Timestamptz(3)
+  marketingInAppAgreedAt    DateTime? @db.Timestamptz(3)
+  marketingInAppWithdrawnAt DateTime? @db.Timestamptz(3)
+
+  // --- 탈퇴/익명화 ---
+  withdrawalRequestedAt DateTime? @db.Timestamptz(3)
+  anonymizedAt          DateTime? @db.Timestamptz(3)
+  deletedAt             DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // --- 관계 (CHUNK A 내부) ---
+  partnerProfile          PartnerProfile?  @relation("UserPartnerProfile")
+  approvedPartnerProfiles PartnerProfile[] @relation("PartnerApprovedBy")
+  verifiedBusinesses      Business[]       @relation("BusinessVerifiedBy")
+  uploadedVenueImages     VenueImage[]     @relation("VenueImageUploader")
+
+  // --- 관계 (CHUNK B) ---
+  applications     Application[]
+  /// 비정규화 사본(Deposit.userId / BidHistory.userId / SelectionEntry.userId)에도 실제 FK 를 건다.
+  /// 이 컬럼들은 환불 큐·팬아웃·선정 조회가 직접 읽는 값이라, 잘못 들어가도 DB 가 아무것도 못 잡았다.
+  deposits         Deposit[]        @relation("UserDeposits")
+  bidHistories     BidHistory[]     @relation("UserBidHistories")
+  selectionEntries SelectionEntry[] @relation("UserSelectionEntries")
+
+  // --- 관계 (CHUNK C) ---
+  notifications           Notification[]           @relation("UserNotifications")
+  receivedMessages        Message[]                @relation("MessageRecipient")
+  sentMessages            Message[]                @relation("MessageSender")
+  emailDeliveries         EmailDelivery[]          @relation("UserEmailDeliveries")
+  notificationPreferences NotificationPreference[]
+  notificationSetting     UserNotificationSetting?
+  broadcasts              Broadcast[]              @relation("BroadcastSender")
+  auditLogs               AuditLog[]               @relation("AuditActor")
+
+  // --- 관계 (신규) ---
+  categoryInterests    UserCategoryInterest[]
+  blockedByPartners    PartnerBlockedUser[]   @relation("PartnerBlockedTarget")
+  partnerBlocksCreated PartnerBlockedUser[]   @relation("PartnerBlockAuthor")
+  identityLinksFrom    UserIdentityLink[]     @relation("IdentityLinkFrom")
+  identityLinksTo      UserIdentityLink[]     @relation("IdentityLinkTo")
+
+  @@index([status, createdAt], map: "user_status_created_idx")
+  @@index([status, lastLoginAt], map: "user_dormancy_sweep_idx")
+  @@index([status, withdrawalRequestedAt], map: "user_withdrawal_sweep_idx")
+  @@index([displayName], map: "user_display_name_idx")
+  /// BroadcastSegment.REGION 커서 팬아웃이 페이징할 인덱스.
+  @@index([status, preferredRegionCode], map: "user_region_segment_idx")
+  /// roles 는 enum 배열이라 GET /admin/users 의 역할 필터가 seq scan 이었다. 배열 포함 검색은 GIN.
+  @@index([roles], type: Gin, map: "user_roles_gin")
+}
+
+/// 파트너 계정의 사업 프로필. User(roles 에 PARTNER 포함) 1 : 1.
+model PartnerProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation("UserPartnerProfile", fields: [userId], references: [id], onDelete: Cascade)
+
+  contactName  String  @db.VarChar(50)
+  contactEmail String  @db.VarChar(255)
+  contactPhone String? @db.VarChar(20)
+
+  approvalStatus PartnerApprovalStatus @default(DRAFT)
+  submittedAt    DateTime?             @db.Timestamptz(3)
+  slaDueAt       DateTime?             @db.Timestamptz(3)
+
+  approvedAt       DateTime? @db.Timestamptz(3)
+  approvedByUserId String?
+  approvedBy       User?     @relation("PartnerApprovedBy", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+
+  rejectedAt      DateTime?             @db.Timestamptz(3)
+  rejectionCode   PartnerRejectionCode?
+  rejectionReason String?               @db.VarChar(500)
+  resubmitCount   Int                   @default(0)
+
+  suspendedAt      DateTime? @db.Timestamptz(3)
+  suspensionReason String?   @db.VarChar(500)
+  revokedAt        DateTime? @db.Timestamptz(3)
+
+  partnerTermsVersion  String?   @db.VarChar(20)
+  partnerTermsAgreedAt DateTime? @db.Timestamptz(3)
+
+  deletedAt DateTime? @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+
+  businesses Business[]
+
+  // --- 관계 (CHUNK B) ---
+  events Event[]
+
+  // --- 관계 (CHUNK C) ---
+  settlements  Settlement[]         @relation("PartnerSettlements")
+  blockedUsers PartnerBlockedUser[]
+
+  @@index([approvalStatus, submittedAt], map: "partner_approval_queue_idx")
+  @@index([approvalStatus, slaDueAt], map: "partner_sla_overdue_idx")
+}
+
+/// 사업자 단위(브랜드/법인). 파트너 1 : N 사업자, 사업자 1 : N 매장.
+model Business {
+  id               String         @id @default(cuid())
+  partnerProfileId String
+  partner          PartnerProfile @relation(fields: [partnerProfileId], references: [id], onDelete: Restrict)
+
+  name      String @db.VarChar(60)
+  legalName String @db.VarChar(60)
+
+  /// 하이픈 제거 10자리. 부분 유니크 인덱스는 raw SQL 마이그레이션에서 생성한다:
+  ///   CREATE UNIQUE INDEX business_brn_uq ON "Business"("businessRegistrationNumber")
+  ///     WHERE "deletedAt" IS NULL AND "verificationStatus" <> 'REJECTED';
+  businessRegistrationNumber String       @db.VarChar(10)
+  businessType               BusinessType
+  representativeName         String       @db.VarChar(30)
+
+  /// private Blob. 원본 URL 은 어떤 응답에도 넣지 않고 60초 서명 URL 만 발급.
+  registrationDocPathname String? @db.VarChar(500)
+
+  verificationStatus          BusinessVerificationStatus @default(UNSUBMITTED)
+  verificationSubmittedAt     DateTime?                  @db.Timestamptz(3)
+  verifiedAt                  DateTime?                  @db.Timestamptz(3)
+  verifiedByUserId            String?
+  verifiedBy                  User?                      @relation("BusinessVerifiedBy", fields: [verifiedByUserId], references: [id], onDelete: SetNull)
+  verificationRejectionReason String?                    @db.VarChar(500)
+
+  contactEmail  String  @db.VarChar(255)
+  contactPhone  String  @db.VarChar(20)
+  postalCode    String? @db.VarChar(5)
+  roadAddress   String? @db.VarChar(255)
+  detailAddress String? @db.VarChar(255)
+
+  // 정산 계좌: 모델만 존재(SETTLEMENT_ENABLED=false). 앱 레벨 AES-GCM 암호문.
+  settlementBankCode         String? @db.VarChar(10)
+  settlementAccountNumberEnc Bytes?
+  settlementAccountHolder    String? @db.VarChar(30)
+  settlementAccountLast4     String? @db.VarChar(4)
+
+  deletedAt DateTime? @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+
+  venues Venue[]
+
+  @@index([partnerProfileId], map: "business_partner_idx")
+  @@index([verificationStatus, verificationSubmittedAt], map: "business_verify_queue_idx")
+  @@index([businessRegistrationNumber], map: "business_brn_lookup_idx")
+}
+
+/// 실제 매장/공간. 이벤트(Event)가 걸리는 대상이자 검색의 1차 엔티티.
+model Venue {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Restrict)
+
+  name        String  @db.VarChar(60)
+  /// 유니크가 여기 없는 이유: 소프트 삭제된 시설이 slug를 영구 점유하면 안 된다.
+  /// 부분 유니크(WHERE "deletedAt" IS NULL)는 Prisma DSL로 표현할 수 없어
+  /// prisma/sql/001_constraints.sql §10의 venue_slug_uq가 담당한다.
+  /// 여기에 @unique를 되살리면 migrate가 총(total) 유니크를 다시 만들어 그걸 무력화한다.
+  slug        String  @db.VarChar(80)
+  summary     String? @db.VarChar(60)
+  description String? @db.Text
+
+  status VenueStatus @default(DRAFT)
+
+  // --- 분류 ---
+  primaryCategoryId   String
+  primaryCategory     Category   @relation("VenuePrimaryCategory", fields: [primaryCategoryId], references: [id], onDelete: Restrict)
+  secondaryCategories Category[] @relation("VenueSecondaryCategories")
+
+  // --- 위치 ---
+  regionCode    String   @db.VarChar(10)
+  region        Region   @relation(fields: [regionCode], references: [code], onDelete: Restrict)
+  sido          String   @db.VarChar(20)
+  sigungu       String   @db.VarChar(30)
+  postalCode    String   @db.VarChar(5)
+  roadAddress   String   @db.VarChar(255)
+  detailAddress String?  @db.VarChar(255)
+  latitude      Decimal? @db.Decimal(9, 6)
+  longitude     Decimal? @db.Decimal(9, 6)
+
+  // --- 연락/부가 ---
+  phone             String  @db.VarChar(20)
+  websiteUrl        String? @db.VarChar(500)
+  instagramHandle   String? @db.VarChar(40)
+  seatCount         Int?
+  reservationNotice String? @db.Text
+  timezone          String  @default("Asia/Seoul") @db.VarChar(40)
+
+  // --- 영업시간 (Json, KST 벽시계 문자열) ---
+  businessHours Json?
+  specialHours  Json?
+
+  // --- 대표 이미지 ---
+  coverImageId String?      @unique
+  coverImage   VenueImage?  @relation("VenueCoverImage", fields: [coverImageId], references: [id], onDelete: SetNull)
+  images       VenueImage[] @relation("VenueImages")
+
+  // --- 검색/비정규화 캐시 ---
+  searchText      String?   @db.Text
+  imageCount      Int       @default(0)
+  openEventCount  Int       @default(0)
+  lastEventEndsAt DateTime? @db.Timestamptz(3)
+
+  version Int @default(0)
+
+  submittedForReviewAt DateTime? @db.Timestamptz(3)
+  publishedAt          DateTime? @db.Timestamptz(3)
+  hiddenAt             DateTime? @db.Timestamptz(3)
+  suspendedAt          DateTime? @db.Timestamptz(3)
+  suspensionReason     String?   @db.VarChar(500)
+  deletedAt            DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // --- 관계 (CHUNK B) ---
+  events Event[]
+
+  /// (businessId, name) 유니크는 001_constraints.sql §10의 venue_business_name_live_uq.
+  /// 부분 유니크여야 '강남점'을 지운 뒤 같은 이름을 다시 쓸 수 있다.
+  @@index([status, sido, sigungu], map: "venue_search_region_idx")
+  @@index([status, primaryCategoryId], map: "venue_search_category_idx")
+  @@index([status, openEventCount], map: "venue_search_open_event_idx")
+  @@index([status, publishedAt], map: "venue_search_recent_idx")
+  /// venue_business_name_uq 를 (deletedAt IS NULL) 부분 유니크로 바꾸면 FK 커버가 사라지므로 남겨둔다.
+  @@index([businessId], map: "venue_business_idx")
+  @@index([regionCode], map: "venue_region_idx")
+  @@index([status, submittedForReviewAt], map: "venue_review_queue_idx")
+  /// primaryCategoryId 는 ON DELETE RESTRICT 인데 선행 인덱스가 없어서
+  /// 카테고리 비활성화 검사가 매번 Venue 전체를 훑었다(venue_search_category_idx 는 status 로 시작한다).
+  @@index([primaryCategoryId], map: "venue_primary_category_idx")
+  /// 검색 텍스트 부분일치. raw SQL 로 빼면 migrate 가 매번 DROP INDEX 를 생성하므로 스키마에 둔다.
+  /// 선행 조건: CREATE EXTENSION pg_trgm (마이그레이션에서 1회).
+  @@index([searchText(ops: raw("gin_trgm_ops"))], type: Gin, map: "venue_search_text_trgm")
+}
+
+/// 매장 이미지. Vercel Blob 직접 업로드 후 서버에 등록하는 2단계 핸드셰이크의 결과 행.
+model VenueImage {
+  id      String @id @default(cuid())
+  venueId String
+  venue   Venue  @relation("VenueImages", fields: [venueId], references: [id], onDelete: Cascade)
+
+  blobUrl      String  @db.VarChar(500)
+  /// 유니크는 001_constraints.sql §10의 venue_image_pathname_uq (부분).
+  blobPathname String  @db.VarChar(500)
+  mimeType     String  @db.VarChar(50)
+  byteSize     Int
+  width        Int
+  height       Int
+  altText      String? @db.VarChar(120)
+
+  sortOrder Int
+  isCover   Boolean          @default(false)
+  status    VenueImageStatus @default(READY)
+
+  uploadedByUserId String
+  uploadedBy       User   @relation("VenueImageUploader", fields: [uploadedByUserId], references: [id], onDelete: Restrict)
+
+  quarantineReason String? @db.VarChar(500)
+
+  deletedAt DateTime? @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+
+  coverOfVenue Venue? @relation("VenueCoverImage")
+
+  /// (venueId, sortOrder) 유니크는 001_constraints.sql §10의 venue_image_order_live_uq.
+  /// 부분 유니크는 DEFERRABLE이 될 수 없으므로, 순서 재배치는 음수 영역으로 대피시키는
+  /// 2단계 쓰기로 한다. 자세한 건 §10 주석에 있다.
+  @@index([venueId, status, sortOrder], map: "venue_image_gallery_idx")
+  @@index([status, createdAt], map: "venue_image_sweeper_idx")
+}
+
+/// 업종 분류 트리(최대 2단계). 운영자만 관리하는 마스터 데이터.
+model Category {
+  id   String @id @default(cuid())
+  /// 유니크는 001_constraints.sql §10의 category_code_uq (부분).
+  /// Region.code는 FK 대상이라 총 유니크로 남겨두었다 — 헷갈리지 말 것.
+  code String @db.VarChar(40)
+
+  nameKo     String  @db.VarChar(40)
+  nameEn    String? @db.VarChar(40)
+  iconKey   String? @db.VarChar(40)
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+
+  // venueCount 를 두지 않는다.
+  //
+  // 예전에 비정규화 캐시로 있었는데, 갱신하는 코드가 없어 시드 값이 그대로 굳었다.
+  // 시설을 전부 지운 뒤에도 "시설 1곳"이라고 표시돼 운영자가 빈 목록을 보게 됐다.
+  // 업종은 많아야 수십 개짜리 마스터 데이터라 필요할 때 세는 편이 싸고 항상 맞는다.
+  // (AdminCategoriesService.countVenuesByCategory 가 목록 필터와 같은 조건으로 센다.)
+
+  parentId String?
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children Category[] @relation("CategoryTree")
+
+  primaryVenues   Venue[] @relation("VenuePrimaryCategory")
+  secondaryVenues Venue[] @relation("VenueSecondaryCategories")
+
+  deletedAt DateTime? @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+
+  // --- 관계 (CHUNK B) ---
+  events Event[]
+
+  // --- 관계 (신규) ---
+  userInterests UserCategoryInterest[]
+
+  @@index([parentId, sortOrder], map: "category_tree_idx")
+  @@index([isActive, sortOrder], map: "category_active_idx")
+}
+
+/// 행정구역 마스터(법정동코드 기준). 지역 필터의 소스. 시드 데이터.
+model Region {
+  id   String @id @default(cuid())
+  code String @unique @db.VarChar(10)
+
+  level        RegionLevel
+  /// 행정표준코드 시군구 5자리(예: 11680). code(법정동코드 10자리)와 값 공간이 달라서
+  /// Event 의 검색용 사본을 code 에서 그대로 복사할 수 없었다 — 모든 행에 시드로 채운다.
+  /// SIDO 행은 NULL.
+  sigunguCode  String?     @db.VarChar(5)
+  sido         String      @db.VarChar(20)
+  sigungu      String?     @db.VarChar(30)
+  eupmyeondong String?     @db.VarChar(30)
+  displayName  String      @db.VarChar(60)
+  isActive     Boolean     @default(true)
+
+  // Category 와 같은 이유로 venueCount 를 두지 않는다. 위 주석 참고.
+
+  parentCode String?  @db.VarChar(10)
+  parent     Region?  @relation("RegionTree", fields: [parentCode], references: [code], onDelete: Restrict)
+  children   Region[] @relation("RegionTree")
+
+  venues Venue[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // --- 관계 (CHUNK B) ---
+  events Event[]
+
+  @@index([level, parentCode], map: "region_tree_idx")
+  @@index([isActive, level], map: "region_active_idx")
+  @@index([sigunguCode], map: "region_sigungu_code_idx")
+}
+
+// =============================================================================
+// MODELS — CHUNK B ("core")
+// =============================================================================
+
+/// 이벤트(오퍼) 애그리게이트 루트. 하나의 모델이 INSTANT/BID 두 모드를 모두 담는다.
+/// 모드별 상호배타 규칙은 raw SQL CHECK 제약으로 강제한다(mergeNotes 참고).
+model Event {
+  id String @id @default(cuid())
+
+  // --- 소유/분류 ---
+  venueId     String
+  partnerId   String
+  categoryId  String?
+  regionId    String?
+  /// 행정표준코드 시군구 5자리(예: 11680). 검색 조인 회피용 비정규화 사본.
+  /// 이름을 regionCode 에서 바꾼 이유: Region.code / Venue.regionCode 는 법정동코드 10자리라
+  /// 같은 이름인데 값 공간이 겹치지 않아 복사하면 잘리고 조인하면 0건이 나왔다.
+  /// Char(5) → VarChar(5): bpchar 는 공백 패딩·후행공백 비교 규칙이 달라 varchar 비교와 어긋난다.
+  /// 채우는 경로는 하나뿐이다 — venue.region.sigunguCode 를 복사한다.
+  sigunguCode String? @db.VarChar(5)
+
+  // --- 기본 정보 ---
+  title       String   @db.VarChar(80)
+  /// 유니크는 001_constraints.sql §10의 event_slug_uq (부분).
+  slug        String?
+  description String   @db.Text
+  tags        String[]
+
+  mode                EventMode
+  status              EventStatus  @default(DRAFT)
+  /// 정지 해제 시 되돌릴 원래 상태. SUSPENDED 로 덮어쓰기 전 값을 보관한다.
+  statusBeforeSuspend EventStatus?
+
+  // --- 정원 / INSTANT 카운터 ---
+  /// 유일한 증가 경로:
+  ///   UPDATE "Event" SET "claimedCount" = "claimedCount" + 1
+  ///   WHERE id = $1 AND "claimedCount" < "capacity" AND status = 'OPEN'
+  ///         AND now() >= "applyStartAt" AND now() < "applyEndAt"
+  capacity                Int
+  claimedCount            Int       @default(0)
+  soldOutAt               DateTime? @db.Timestamptz(3)
+  /// claimedCount 를 Application.slotClaimed 실제 개수로 재계산한 시각.
+  /// 스위퍼가 중간에 죽거나 운영자가 손으로 상태를 고치면 카운터가 영구히 어긋나는데
+  /// 지금까지 그걸 탐지할 방법이 아예 없었다(통계 크론은 claimedCount 를 갱신하지 않는다).
+  claimedCountRefreshedAt DateTime? @db.Timestamptz(3)
+
+  // --- 금액 규칙 (전부 Int, KRW 원 단위) ---
+  fixedAmount Int?
+  minAmount   Int?
+  maxAmount   Int?
+  amountStep  Int    @default(1)
+  currency    String @default("KRW") @db.Char(3)
+
+  // --- 신청 기간 / 이용 일시 ---
+  applyStartAt       DateTime  @db.Timestamptz(3)
+  applyEndAt         DateTime  @db.Timestamptz(3)
+  originalApplyEndAt DateTime? @db.Timestamptz(3)
+  /// = applyEndAt + depositWindowMinutes + FINALIZE_GRACE(1분).
+  rankingLockAt      DateTime? @db.Timestamptz(3)
+
+  serviceStartAt DateTime? @db.Timestamptz(3)
+  serviceEndAt   DateTime? @db.Timestamptz(3)
+  serviceDateKst String?   @db.Char(10)
+  timezone       String    @default("Asia/Seoul") @db.VarChar(40)
+
+  // --- 예약금 정책 (이벤트별) ---
+  depositRequired      Boolean      @default(false)
+  depositType          DepositType?
+  depositFixedAmount   Int?
+  /// basis point (1000 = 10%). 부동소수 금지.
+  depositPercentBp     Int?
+  depositRoundingUnit  Int          @default(100)
+  depositMinAmount     Int?
+  depositMaxAmount     Int?
+  depositWindowMinutes Int          @default(10)
+  depositRefundNote    String?      @db.VarChar(500)
+
+  // --- 소프트 클로즈 (BID 전용) ---
+  softCloseEnabled              Boolean   @default(false)
+  softCloseWindowMinutes        Int?
+  softCloseExtendMinutes        Int?
+  softCloseMaxExtensions        Int       @default(6)
+  /// FIXED 예약금이면 상향해도 부족분이 0이라 "부족분 있으면 연장 안 함" 보호가 통째로 무력하다.
+  /// 그래서 한 사람이 최소 amountStep 만으로 마감을 6번까지 혼자 밀 수 있었다.
+  /// BidHistory.triggeredSoftClose 개수로 1인당 상한을 건다.
+  softCloseMaxExtensionsPerUser Int       @default(2)
+  softCloseHardEndAt            DateTime? @db.Timestamptz(3)
+  softCloseExtensionCount       Int       @default(0)
+
+  // --- 공개 정책 ---
+  showCompetitionRatio         Boolean         @default(true)
+  ratioMinApplicantsToShow     Int             @default(0)
+  cutoffVisibility             VisibilityLevel @default(HIDDEN)
+  rankVisibility               VisibilityLevel @default(HIDDEN)
+  amountDistributionVisibility VisibilityLevel @default(HIDDEN)
+
+  // --- 집계 캐시 (신청 hot path 에서는 절대 갱신 금지: 크론 + lazy refresh 전용) ---
+  liveApplicantCount    Int       @default(0)
+  totalApplicationCount Int       @default(0)
+  expiredCount          Int       @default(0)
+  canceledCount         Int       @default(0)
+  /// round(liveApplicantCount * 10 / capacity) — "4.7:1" 을 정수로 저장.
+  competitionRatioX10   Int       @default(0)
+  statsRefreshedAt      DateTime? @db.Timestamptz(3)
+
+  // --- 종료/취소/모더레이션 ---
+  closeReason     EventCloseReason?
+  cancelReason    EventCancelReason?
+  cancelMemo      String?            @db.VarChar(500)
+  openedAt        DateTime?          @db.Timestamptz(3)
+  closedAt        DateTime?          @db.Timestamptz(3)
+  finalizedAt     DateTime?          @db.Timestamptz(3)
+  canceledAt      DateTime?          @db.Timestamptz(3)
+  suspendedAt     DateTime?          @db.Timestamptz(3)
+  suspendedReason String?            @db.VarChar(500)
+
+  /// 예약금/금액/정원 같은 "신청자에게 약속한 정책"이 바뀔 때만 올린다.
+  /// Application.policyVersion 이 이 값을 스냅샷으로 들고 있어서, 단순 문구 수정에도 올리면
+  /// 그 스냅샷이 의미를 잃는다.
+  policyVersion Int @default(1)
+  /// 낙관적 락 토큰. 지금까지 If-Match 가 policyVersion 을 쓰는 바람에 두 개념이 한 컬럼에 섞였다.
+  /// 소프트 클로즈 연장(applyEndAt/rankingLockAt 변경)을 포함해 모든 가드 UPDATE 가 이 값을 올린다.
+  version       Int @default(0)
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  // --- 관계 (CHUNK A) ---
+  venue    Venue          @relation(fields: [venueId], references: [id], onDelete: Restrict)
+  partner  PartnerProfile @relation(fields: [partnerId], references: [id], onDelete: Restrict)
+  category Category?      @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  region   Region?        @relation(fields: [regionId], references: [id], onDelete: SetNull)
+
+  // --- 관계 (CHUNK B 내부) ---
+  images           EventImage[]
+  applications     Application[]
+  selections       Selection[]
+  /// 비정규화 사본에 붙인 실제 FK. 조인 없이 읽는 컬럼일수록 DB 가 지켜줘야 한다.
+  deposits         Deposit[]        @relation("EventDeposits")
+  bidHistories     BidHistory[]     @relation("EventBidHistories")
+  selectionEntries SelectionEntry[] @relation("EventSelectionEntries")
+
+  // --- 관계 (CHUNK C) ---
+  notifications Notification[] @relation("EventNotifications")
+  messages      Message[]      @relation("EventMessages")
+  broadcasts    Broadcast[]    @relation("EventBroadcasts")
+  settlements   Settlement[]   @relation("EventSettlements")
+
+  /// Application/Selection 이 (eventId, eventMode) 복합 FK 로 참조할 대상.
+  /// 이게 있어야 "INSTANT 이벤트에 달린 BID 신청" 같은 행이 표현 자체가 불가능해진다.
+  @@unique([id, mode], map: "event_id_mode_uq")
+  @@index([status, applyEndAt], map: "event_status_apply_end_idx")
+  @@index([status, applyStartAt], map: "event_status_apply_start_idx")
+  @@index([status, rankingLockAt], map: "event_ranking_lock_idx")
+  @@index([status, statsRefreshedAt], map: "event_stats_refresh_idx")
+  @@index([partnerId, status, createdAt(sort: Desc)], map: "event_partner_list_idx")
+  @@index([venueId, status], map: "event_venue_idx")
+  @@index([categoryId, status, applyEndAt], map: "event_category_search_idx")
+  @@index([sigunguCode, status, applyEndAt], map: "event_sigungu_search_idx")
+  @@index([regionId, status], map: "event_region_id_idx")
+  @@index([serviceDateKst], map: "event_service_date_idx")
+  @@index([mode, status], map: "event_mode_status_idx")
+  @@index([status, openedAt(sort: Desc)], map: "event_status_recent_idx")
+  @@index([status, competitionRatioX10(sort: Desc)], map: "event_status_ratio_idx")
+  /// tags 는 배열이라 포함 검색이 seq scan 이었다. raw SQL 로 빼면 migrate 가 DROP 을 만든다.
+  @@index([tags], type: Gin, map: "event_tags_gin")
+}
+
+/// 이벤트 이미지 (파일은 Vercel Blob, 여기에는 메타데이터만).
+model EventImage {
+  id      String @id @default(cuid())
+  eventId String
+
+  /// VenueImage 와 같은 보증을 갖춘다: 같은 Blob 객체를 한 이벤트에 두 번 등록하면
+  /// 1회용 업로드 토큰 핸드셰이크와 blob-orphan-sweep 대사(對査)가 둘 다 깨진다.
+  blobUrl     String  @db.VarChar(500)
+  /// 유니크는 001_constraints.sql §10의 event_image_pathname_uq (부분).
+  pathname    String  @db.VarChar(500)
+  width       Int
+  height      Int
+  byteSize    Int
+  mimeType    String  @db.VarChar(50)
+  blurDataUrl String? @db.Text
+  altText     String? @db.VarChar(200)
+  sortOrder   Int     @default(0)
+  isCover     Boolean @default(false)
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  /// 순서 재배치(permutation rewrite)를 한 트랜잭션에서 하려면 raw SQL 로
+  /// DEFERRABLE INITIALLY DEFERRED 로 바꿔야 한다 — venue_image_order_uq 와 동일한 처리.
+  /// event_image_order_idx 는 이 유니크와 컬럼이 완전히 같아 순수 쓰기 비용이라 제거했다.
+  /// (eventId, sortOrder) 유니크는 001_constraints.sql §10의 event_image_order_live_uq.
+  /// 컬럼이 같은 event_image_order_idx를 따로 두지 않는 이유도 그 유니크가 덮어주기 때문이다.
+  @@index([eventId, sortOrder], map: "event_image_order_idx")
+}
+
+/// 신청. (eventId, userId)당 정확히 한 행. 절대 삭제하지 않고 상태만 전이한다.
+model Application {
+  id      String @id @default(cuid())
+  eventId String
+  userId  String
+
+  /// ★ 랭킹 3순위 키. id(cuid v1)가 "우연히" 시간순이라 지금까지는 공정해 보였을 뿐이고,
+  /// cuid(2)/uuid 로 바꾸는 순간 조용히 임의 순서가 된다. text 정렬은 DB collation 에도 의존한다.
+  /// 정수 시퀀스로 의도를 명시한다 — 결정적이고, 먼저 들어온 신청이 이긴다(D-04 취지와 일치).
+  applySeq BigInt @default(autoincrement())
+
+  eventMode EventMode
+  status    ApplicationStatus @default(PENDING_DEPOSIT)
+
+  /// 신청 금액(원). 랭킹의 1차 키. INSTANT 는 서버가 Event.fixedAmount 를 복사.
+  amount            Int
+  /// 타이브레이크 시계: "현재 amount 에 도달한 순간". 항상 DB now() 로만 설정.
+  lastBidAt         DateTime @db.Timestamptz(6)
+  /// 최초 신청 시각. 표시/포렌식 전용이며 랭킹 키가 아니다.
+  firstAppliedAt    DateTime @db.Timestamptz(6)
+  /// 예약금이 완납된 최고 금액(= 롤백 목표).
+  settledAmount     Int
+  /// settledAmount 에 대응하던 lastBidAt. 롤백 시 금액과 "쌍으로" 복원.
+  settledLastBidAt  DateTime @db.Timestamptz(6)
+  highestAmountEver Int
+
+  // --- 예약금 비정규화 (조인 없이 스위퍼/랭킹이 돌 수 있도록) ---
+  depositStatus         DepositStatus @default(NOT_REQUIRED)
+  depositDueAt          DateTime?     @db.Timestamptz(3)
+  depositRequiredAmount Int           @default(0)
+  depositPaidAmount     Int           @default(0)
+  depositRefundedAmount Int           @default(0)
+  policyVersion         Int           @default(1)
+
+  rebidCount   Int @default(0)
+  reapplyCount Int @default(0)
+
+  /// INSTANT 전용. 반환 경로가 `WHERE id=? AND slotClaimed=true` 라 이중 차감 불가.
+  slotClaimed Boolean @default(false)
+
+  /// 최초 취소 시각(덮어쓰지 않는다).
+  canceledAt         DateTime?                @db.Timestamptz(3)
+  /// 마지막 취소/재신청 시각. "10분에 1회" 재신청 레이트리밋을 걸 근거가 지금까지 없었다.
+  lastCanceledAt     DateTime?                @db.Timestamptz(3)
+  lastReapplyAt      DateTime?                @db.Timestamptz(3)
+  cancelReason       ApplicationCancelReason?
+  confirmedAt        DateTime?                @db.Timestamptz(3)
+  /// finalRank 제거됨(D-07): 이 행이 곧 GET /applications/me 의 응답 행이라,
+  /// select 를 빠뜨린 핸들러 하나만 있어도 "자기 순위 비공개" 규칙이 깨진다.
+  /// 순위는 SelectionEntry.rankNo 를 파트너/운영자 리포지토리로만 읽는다.
+  partnerNote        String?                  @db.VarChar(500)
+  agreedTermsVersion String?                  @db.VarChar(20)
+
+  version Int @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  /// (eventId, eventMode) → Event(id, mode) 복합 FK.
+  /// eventMode 는 Event.mode 의 사본인데 아무것도 동기화를 지켜주지 않았고,
+  /// 이 값이 어긋나면 스위퍼의 "INSTANT 자리 반환" 분기가 통째로 잘못 돈다.
+  /// 복합 FK 로 만들면 Postgres 가 공짜로 정합성을 강제한다.
+  event            Event            @relation(fields: [eventId, eventMode], references: [id, mode], onDelete: Restrict)
+  user             User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  bidHistories     BidHistory[]
+  deposits         Deposit[]
+  selectionEntries SelectionEntry[]
+
+  /// 1인 1신청 불변식.
+  @@unique([eventId, userId], map: "application_event_user_uq")
+  /// Deposit/BidHistory/SelectionEntry 의 (applicationId, eventId, userId) 복합 FK 대상.
+  /// 실제 제약은 raw SQL 로 건다(Prisma 는 3컬럼 참조 FK 를 자식 쪽에서 선언하기 곤란하다).
+  @@unique([id, eventId, userId], map: "application_identity_uq")
+  /// ★ 랭킹 인덱스: ORDER BY amount DESC, "lastBidAt" ASC, "applySeq" ASC 를 Sort 노드 없이 처리.
+  /// 부분 인덱스(WHERE status=...)로 만들지 않은 이유: BID 는 VALID 에서, INSTANT 는 CONFIRMED 에서
+  /// 끝나므로 status='VALID' 로 거르면 INSTANT 이벤트의 파트너 최종명단 화면이 통째로 빈다.
+  /// status IN ('VALID','CONFIRMED') 부분 인덱스는 Prisma DSL 로 표현 불가 → raw SQL 로 미룬다.
+  @@index([eventId, amount(sort: Desc), lastBidAt(sort: Asc), applySeq], map: "application_rank_idx")
+  /// ★ 예약금 만료 스위퍼: depositStatus='PENDING' AND depositDueAt <= now()
+  @@index([depositStatus, depositDueAt], map: "application_deposit_due_idx")
+  @@index([userId, status, createdAt(sort: Desc)], map: "application_my_list_idx")
+  @@index([eventId, slotClaimed], map: "application_slot_idx")
+  /// Broadcast 세그먼트(EVENT_APPLICANTS_BY_STATUS) 커서 팬아웃.
+  /// application_event_status_idx(eventId, status)는 이 인덱스의 진부분집합이라 제거했다
+  /// — 스키마에서 가장 뜨거운 쓰기 경로에 얹힌 순수 오버헤드였다.
+  @@index([eventId, status, userId], map: "application_broadcast_fanout_idx")
+}
+
+/// 입찰 이력 (append-only, UPDATE/DELETE 금지).
+model BidHistory {
+  id            String @id @default(cuid())
+  applicationId String
+  eventId       String
+  userId        String
+
+  seq            Int
+  source         BidSource
+  previousAmount Int?
+  newAmount      Int
+  deltaAmount    Int
+
+  bidAt             DateTime  @db.Timestamptz(6)
+  restoredLastBidAt DateTime? @db.Timestamptz(6)
+
+  depositRequiredAfter Int     @default(0)
+  depositId            String?
+
+  triggeredSoftClose Boolean   @default(false)
+  deadlineBefore     DateTime? @db.Timestamptz(3)
+  deadlineAfter      DateTime? @db.Timestamptz(3)
+
+  idempotencyKey String?       @db.VarChar(64)
+  actorType      CoreActorType @default(USER)
+  actorUserId    String?
+  /// SHA-256(ip + serverSalt). 원본 IP 는 저장하지 않는다.
+  ipHash         String?       @db.Char(64)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  /// 복합 FK — Deposit.application 과 같은 이유. 자세한 설명은 그쪽 주석 참고.
+  application Application @relation(fields: [applicationId, eventId, userId], references: [id, eventId, userId], onDelete: Cascade, map: "bid_history_app_identity_fk")
+  deposit     Deposit?    @relation(fields: [depositId], references: [id], onDelete: SetNull)
+  /// 비정규화 사본에 실제 FK. 크로스 이벤트 어뷰징 조회가 이 컬럼들만 보고 돈다.
+  event       Event       @relation("EventBidHistories", fields: [eventId], references: [id], onDelete: Restrict)
+  user        User        @relation("UserBidHistories", fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([applicationId, seq], map: "bid_history_app_seq_uq")
+  /// 멱등키 저장소가 우회되더라도 같은 상향이 두 번 기록되는 것만은 DB 가 막는다.
+  /// (idempotencyKey 가 NULL 인 행은 Postgres 유니크에서 서로 충돌하지 않는다.)
+  @@unique([applicationId, idempotencyKey], map: "bid_history_app_idem_uq")
+  @@index([eventId, bidAt], map: "bid_history_event_time_idx")
+  @@index([applicationId, bidAt], map: "bid_history_app_time_idx")
+  @@index([userId, bidAt], map: "bid_history_user_time_idx")
+  /// depositId 는 ON DELETE SET NULL 인데 선행 인덱스가 없어서
+  /// Deposit 정리가 append-only 입찰 로그 전체를 훑었다.
+  @@index([depositId], map: "bid_history_deposit_idx")
+  /// 소프트 클로즈 1인당 연장 횟수 상한(Event.softCloseMaxExtensionsPerUser) 카운트용.
+  @@index([eventId, userId, triggeredSoftClose], map: "bid_history_softclose_by_user_idx")
+}
+
+/// 예약금 홀드 + 환불 (결제 실행은 유보: PG 연동 없음).
+/// 하나의 신청은 동시에 최대 1개의 열린 홀드만 가진다.
+/// ★ 열린 홀드의 status 는 언제나 'PENDING' 하나뿐이다. 상향 부족분인지 여부는 reason 이 구분한다.
+///   SHORTFALL_PENDING 을 Deposit.status 에 쓰면 one_open_deposit 부분 유니크와
+///   deposit_sweep_idx 술어에 동시에 안 걸려서, 홀드가 영원히 만료되지 않고
+///   "올려놓고 안 내기" 어뷰징이 영구 이득이 된다. (그 값은 Application.depositStatus 전용)
+model Deposit {
+  id            String @id @default(cuid())
+  applicationId String
+  eventId       String
+  userId        String
+
+  seq    Int
+  reason DepositReason
+
+  // --- 산정 스냅샷 ---
+  basisAmount        Int
+  depositType        DepositType
+  depositFixedAmount Int?
+  depositPercentBp   Int?
+  requiredAmount     Int
+  amountDue          Int
+  amountPaid         Int         @default(0)
+  windowMinutes      Int
+
+  openedAt DateTime @db.Timestamptz(3)
+  /// = openedAt + windowMinutes. SQL(make_interval)로 계산.
+  dueAt    DateTime @db.Timestamptz(3)
+
+  status         DepositStatus @default(PENDING)
+  paidAt         DateTime?     @db.Timestamptz(3)
+  resolvedAt     DateTime?     @db.Timestamptz(3)
+  /// DEPOSIT_REMINDER 를 홀드당 정확히 1회만 보내기 위한 상태.
+  /// 이게 없으면 매분 도는 크론이 열린 홀드 전부에 대해 insert 를 시도하고
+  /// Notification 유니크 위반으로 트랜잭션을 굴리는 수밖에 없었다.
+  reminderSentAt DateTime?     @db.Timestamptz(3)
+
+  // --- 향후 PG 연동 자리 (MVP 에서는 전부 NULL) ---
+  paymentIntentId     String? @unique
+  paymentMethod       String? @db.VarChar(30)
+  featureFlagSnapshot Boolean @default(false)
+
+  // --- 환불 (모델링만, 집행 유보) ---
+  refundStatus         DepositRefundStatus?
+  refundReason         DepositRefundReason?
+  refundAmount         Int                  @default(0)
+  refundRequestedAt    DateTime?            @db.Timestamptz(3)
+  refundProcessedAt    DateTime?            @db.Timestamptz(3)
+  /// 결정적 키 `refund:{depositId}:{reason}`.
+  refundIdempotencyKey String?              @unique
+  refundProviderId     String?              @unique
+  refundFailureCode    String?              @db.VarChar(50)
+  refundAttemptCount   Int                  @default(0)
+  forfeitedAmount      Int                  @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  /// 복합 FK. `applicationId` 하나만 걸면 비정규화 사본인 eventId·userId 가 부모와
+  /// 어긋나도 DB 가 막지 않는다 — 스위퍼와 환불 큐가 그 값으로 필터하므로 조용히 틀린
+  /// 대상을 집는다. (id, eventId, userId) 로 묶어 "부모의 **같은 행**"에 못박는다.
+  /// map 은 001 이 만들던 제약 이름 그대로다. 이름을 유지해야 이미 배포된 DB 와 어긋나지 않는다.
+  application  Application  @relation(fields: [applicationId, eventId, userId], references: [id, eventId, userId], onDelete: Cascade, map: "deposit_app_identity_fk")
+  bidHistories BidHistory[]
+  /// 비정규화 사본에 실제 FK. 이 두 컬럼을 환불 큐와 팬아웃이 직접 읽기 때문에
+  /// 한 번 잘못 들어가면 엉뚱한 이벤트에 환불이 나가고 DB 는 끝까지 모른다.
+  event        Event        @relation("EventDeposits", fields: [eventId], references: [id], onDelete: Restrict)
+  user         User         @relation("UserDeposits", fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([applicationId, seq], map: "deposit_app_seq_uq")
+  /// ★ 만료 스위퍼: WHERE status='PENDING' AND dueAt <= now() ORDER BY dueAt LIMIT 200 FOR UPDATE SKIP LOCKED
+  /// (술어는 'PENDING' 하나뿐이다 — 모델 주석 참고.)
+  @@index([status, dueAt], map: "deposit_sweep_idx")
+  @@index([eventId, status], map: "deposit_event_status_idx")
+  @@index([refundStatus, refundRequestedAt], map: "deposit_refund_queue_idx")
+  @@index([userId, createdAt(sort: Desc)], map: "deposit_user_idx")
+  /// 리마인더 크론 클레임용. 이상적인 형태는 WHERE status='PENDING' AND reminderSentAt IS NULL
+  /// 부분 인덱스지만 Prisma 로는 못 쓰므로 복합 인덱스로 근사한다.
+  @@index([status, reminderSentAt, dueAt], map: "deposit_reminder_idx")
+}
+
+/// 선정 라운드 (파트너 심사 1회분). roundNo=1 이 최초 확정, 2 이상은 결원 보충.
+model Selection {
+  id      String @id @default(cuid())
+  eventId String
+  roundNo Int
+
+  status    SelectionRoundStatus @default(PENDING)
+  eventMode EventMode
+
+  capacitySnapshot     Int
+  remainingSeats       Int
+  effectiveDeadlineAt  DateTime @db.Timestamptz(3)
+  depositWindowMinutes Int      @default(0)
+  /// = effectiveDeadlineAt + depositWindowMinutes (+ FINALIZE_GRACE).
+  rankingBasisAt       DateTime @db.Timestamptz(3)
+
+  rankingComputedAt   DateTime? @db.Timestamptz(3)
+  rankingSnapshotHash String?   @db.Char(64)
+
+  eligibleCount        Int @default(0)
+  excludedCount        Int @default(0)
+  autoPreselectedCount Int @default(0)
+  selectedCount        Int @default(0)
+  overrideCount        Int @default(0)
+  /// 커트라인 3개 컬럼은 SelectionCutoff 로 분리했다 — 아래 cutoff 관계 참고.
+
+  // --- 라운드별 정책 ---
+  autoPreselectEnabled         Boolean @default(true)
+  requireReasonOnOverride      Boolean @default(true)
+  allowSelectOverCapacity      Boolean @default(false)
+  overCapacityTolerance        Int     @default(0)
+  waitlistSize                 Int     @default(0)
+  editAfterFinalizeWindowHours Int     @default(72)
+  maxReopenCount               Int     @default(3)
+
+  finalizedAt        DateTime? @db.Timestamptz(3)
+  finalizedByUserId  String?
+  notifyDispatchedAt DateTime? @db.Timestamptz(3)
+  reopenCount        Int       @default(0)
+  lastReopenedAt     DateTime? @db.Timestamptz(3)
+  canceledAt         DateTime? @db.Timestamptz(3)
+  partnerMemo        String?   @db.VarChar(1000)
+
+  version Int @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  /// Application 과 같은 이유로 (eventId, eventMode) 복합 FK.
+  event   Event            @relation(fields: [eventId, eventMode], references: [id, mode], onDelete: Cascade)
+  entries SelectionEntry[]
+  /// 커트라인은 별도 테이블로 뺐다(D-07). Prisma 는 역관계 선언을 강제하므로 필드 자체는 남지만,
+  /// 스칼라가 아니라 관계라서 `include: { selections: true }` 한 줄로는 절대 따라오지 않는다.
+  /// 즉 "실수로 커트라인이 딸려 나가는" 기본 경로가 구조적으로 사라진다.
+  cutoff  SelectionCutoff?
+
+  @@unique([eventId, roundNo], map: "selection_event_round_uq")
+  @@index([status, rankingBasisAt], map: "selection_open_sweep_idx")
+  @@index([eventId, status], map: "selection_event_status_idx")
+}
+
+/// 정원 경계 금액(커트라인). Selection 1 : 0..1.
+/// 별도 모델인 이유: Event.selections → Selection 은 공개 조회 경로에서 닿는다.
+/// 커트라인은 제품 규칙상 파트너 화면 밖으로 절대 나가면 안 되는 유일한 숫자인데(D-07),
+/// Selection 의 스칼라로 두면 `include: { selections: true }` 한 번으로 공개된다.
+/// 화이트리스트 매퍼는 관례일 뿐이고, 관계 분리는 구조다.
+/// Event 쪽에는 이 모델로 가는 역관계를 절대 만들지 않는다.
+model SelectionCutoff {
+  selectionId String @id
+
+  cutoffAmount    Int?
+  cutoffLastBidAt DateTime? @db.Timestamptz(6)
+  hasCutoffTie    Boolean   @default(false)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  selection Selection @relation(fields: [selectionId], references: [id], onDelete: Cascade)
+}
+
+/// 라운드 내 신청자 1명. 앞부분은 write-once 동결 스냅샷, 뒷부분만 가변.
+model SelectionEntry {
+  id            String @id @default(cuid())
+  selectionId   String
+  eventId       String
+  applicationId String
+  userId        String
+
+  // --- 동결 스냅샷 (write-once) ---
+  displayNameSnapshot        String        @db.VarChar(100)
+  amountSnapshot             Int
+  lastBidAtSnapshot          DateTime      @db.Timestamptz(6)
+  appliedAtSnapshot          DateTime      @db.Timestamptz(6)
+  rebidCountSnapshot         Int           @default(0)
+  depositStatusSnapshot      DepositStatus @default(NOT_REQUIRED)
+  depositPaidSnapshot        Int           @default(0)
+  depositConfirmedAtSnapshot DateTime?     @db.Timestamptz(6)
+
+  rankNo          Int?
+  isEligible      Boolean                   @default(true)
+  exclusionReason SelectionExclusionReason?
+  /// 동점 그룹 키 = (amount, lastBidAt) 조합. `2147483647-1769515200123456` 형태라 20자로는
+  /// 반드시 22001(value too long)이 난다 — 그것도 "동점이 실제로 발생한 이벤트"에서만 터진다.
+  tieGroupKey     String?                   @db.VarChar(64)
+  tieOrdinal      Int?
+  withinCapacity  Boolean                   @default(false)
+
+  // --- 가변 심사 상태 ---
+  status            SelectionStatus      @default(CANDIDATE)
+  source            SelectionEntrySource @default(AUTO_RANK)
+  amountAtSelection Int?
+  position          Int?
+
+  isOverride         Boolean   @default(false)
+  overrideReason     String?   @db.VarChar(500)
+  overriddenByUserId String?
+  overriddenAt       DateTime? @db.Timestamptz(3)
+
+  preselectedAt DateTime?              @db.Timestamptz(3)
+  selectedAt    DateTime?              @db.Timestamptz(3)
+  notifiedAt    DateTime?              @db.Timestamptz(3)
+  revokedAt     DateTime?              @db.Timestamptz(3)
+  revokeReason  SelectionRevokeReason?
+  revokedByRole CoreActorType?
+
+  promotedFromEntryId String?
+  refundSignaledAt    DateTime? @db.Timestamptz(3)
+
+  version Int @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  selection    Selection        @relation(fields: [selectionId], references: [id], onDelete: Cascade)
+  /// 복합 FK — Deposit.application 과 같은 이유. 자세한 설명은 그쪽 주석 참고.
+  application  Application      @relation(fields: [applicationId, eventId, userId], references: [id, eventId, userId], onDelete: Cascade, map: "selection_entry_app_identity_fk")
+  promotedFrom SelectionEntry?  @relation("SelectionEntryBackfill", fields: [promotedFromEntryId], references: [id], onDelete: SetNull)
+  backfilledBy SelectionEntry[] @relation("SelectionEntryBackfill")
+  /// 비정규화 사본에 실제 FK. selection_entry_user_event_idx 가 이 두 컬럼만 보고 조회한다.
+  event        Event            @relation("EventSelectionEntries", fields: [eventId], references: [id], onDelete: Cascade)
+  user         User             @relation("UserSelectionEntries", fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([selectionId, applicationId], map: "selection_entry_round_app_uq")
+  @@unique([selectionId, rankNo], map: "selection_entry_round_rank_uq")
+  @@index([selectionId, status, rankNo], map: "selection_entry_list_idx")
+  @@index([applicationId], map: "selection_entry_app_idx")
+  @@index([userId, eventId], map: "selection_entry_user_event_idx")
+  @@index([eventId, status], map: "selection_entry_event_status_idx")
+}
+
+// =============================================================================
+// MODELS — CHUNK C ("ops")
+// =============================================================================
+
+/// 시스템 자동 알림 1행 = 수신자 1명. (사람이 쓴 쪽지는 Message 모델)
+/// 트랜잭셔널 아웃박스: 도메인 상태변경과 같은 트랜잭션에서 이 행 + EmailDelivery(PENDING) 를 insert.
+model Notification {
+  id String @id @default(cuid())
+
+  userId String
+  type   NotificationType
+
+  category NotificationCategory
+  priority NotificationPriority @default(NORMAL)
+
+  titleKo String @db.VarChar(120)
+  bodyKo  String @db.Text
+
+  /// 타입별 zod 화이트리스트 검증. 타인의 금액/커트라인/본인 순위는 절대 들어갈 수 없다.
+  payload Json?
+
+  /// Next.js 상대경로만 허용(오픈 리다이렉트 방지).
+  deepLinkPath String? @db.VarChar(300)
+
+  eventId       String?
+  /// Application.id 값만 보관(FK 미설정: 알림은 신청 생명주기와 독립 보존).
+  applicationId String?
+
+  /// 예: `DEPOSIT_REQUIRED:{applicationId}` / `DEADLINE_EXTENDED:{eventId}:{userId}:{extensionSeq}`
+  /// 전역 유니크였을 때의 문제: EVENT_CANCELED 처럼 이벤트 단위 키는 두 번째 수신자에서 충돌하고,
+  /// enqueue 가 도메인 트랜잭션 안에서 일어나므로 그 유니크 위반이 "이벤트 취소" 자체를 롤백시킨다.
+  /// 중복 제거의 단위는 애초에 수신자별이다.
+  dedupeKey String @db.VarChar(200)
+
+  coalesceKey String? @db.VarChar(200)
+
+  readAt     DateTime? @db.Timestamptz(3)
+  archivedAt DateTime? @db.Timestamptz(3)
+  expiresAt  DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  user       User            @relation("UserNotifications", fields: [userId], references: [id], onDelete: Cascade)
+  event      Event?          @relation("EventNotifications", fields: [eventId], references: [id], onDelete: SetNull)
+  deliveries EmailDelivery[]
+
+  @@unique([userId, dedupeKey], map: "uq_notification_user_dedupe")
+  @@index([userId, readAt, createdAt(sort: Desc)], map: "idx_notification_inbox_unread")
+  @@index([userId, createdAt(sort: Desc)], map: "idx_notification_inbox_page")
+  @@index([eventId, type], map: "idx_notification_event_type")
+  @@index([applicationId], map: "idx_notification_application")
+  @@index([expiresAt], map: "idx_notification_expires")
+  @@index([coalesceKey], map: "idx_notification_coalesce")
+}
+
+/// 사람이 쓴 쪽지 1행 = 수신자 1명.
+/// broadcastId 가 있으면 이 행 자체가 "그 공지의 수신자 스냅샷"이다.
+model Message {
+  id String @id @default(cuid())
+
+  kind        MessageKind
+  broadcastId String?
+  eventId     String?
+
+  senderUserId      String?
+  senderDisplayName String?
+
+  recipientUserId String
+
+  titleKo String @db.VarChar(120)
+  bodyKo  String @db.Text
+
+  status     MessageStatus       @default(DELIVERED)
+  skipReason DeliverySkipReason?
+
+  applicationStatusAtSend ApplicationStatus?
+
+  readAt     DateTime? @db.Timestamptz(3)
+  archivedAt DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  sender     User?           @relation("MessageSender", fields: [senderUserId], references: [id], onDelete: SetNull)
+  recipient  User            @relation("MessageRecipient", fields: [recipientUserId], references: [id], onDelete: Cascade)
+  event      Event?          @relation("EventMessages", fields: [eventId], references: [id], onDelete: SetNull)
+  broadcast  Broadcast?      @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+  deliveries EmailDelivery[]
+
+  @@unique([broadcastId, recipientUserId], map: "uq_message_broadcast_recipient")
+  @@index([recipientUserId, readAt, createdAt(sort: Desc)], map: "idx_message_inbox_unread")
+  @@index([recipientUserId, createdAt(sort: Desc)], map: "idx_message_inbox_page")
+  @@index([eventId, createdAt(sort: Desc)], map: "idx_message_event")
+  @@index([senderUserId, createdAt(sort: Desc)], map: "idx_message_sender")
+  @@index([broadcastId, status, id], map: "idx_message_broadcast_cursor")
+}
+
+/// (알림 또는 쪽지) x EMAIL 채널 1건의 발송 시도 체인 + 재시도 상태기계.
+model EmailDelivery {
+  id String @id @default(cuid())
+
+  notificationId String?
+  messageId      String?
+
+  recipientUserId String?
+  channel         NotificationChannel @default(EMAIL)
+  status          DeliveryStatus      @default(PENDING)
+
+  toAddress String?
+  subjectKo String?
+  bodyText  String? @db.Text
+  bodyHtml  String? @db.Text
+
+  providerMessageId String? @unique
+  /// 이 행의 id 를 Resend Idempotency-Key 로 전송.
+  /// @default(cuid()) 인 이유: NOT NULL 인데 기본값이 없으면 모든 insert 지점이 손으로 값을 넣어야 하고,
+  /// 빠뜨리면 컴파일이 아니라 런타임에 터진다.
+  idempotencyKey    String  @unique @default(cuid())
+
+  /// 프로바이더 웹훅은 재전송·역순 도착이 정상이다. 이 값보다 오래된 이벤트는 무시해서
+  /// 재생된 'sent' 가 'delivered' 를, 재생된 'delivered' 가 'bounced' 를 덮어쓰지 못하게 한다.
+  /// (bounced 가 덮여버리면 재시도 스윕이 나쁜 주소의 차단을 풀어버린다.)
+  lastProviderEventAt DateTime? @db.Timestamptz(3)
+
+  attemptCount  Int       @default(0)
+  maxAttempts   Int       @default(5)
+  nextAttemptAt DateTime? @db.Timestamptz(3)
+  lockedUntil   DateTime? @db.Timestamptz(3)
+
+  skipReason     DeliverySkipReason?
+  failureCode    String?
+  failureMessage String?             @db.Text
+
+  sentAt      DateTime? @db.Timestamptz(3)
+  deliveredAt DateTime? @db.Timestamptz(3)
+  openedAt    DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  notification Notification? @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  message      Message?      @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  recipient    User?         @relation("UserEmailDeliveries", fields: [recipientUserId], references: [id], onDelete: SetNull)
+
+  @@unique([notificationId, channel], map: "uq_email_delivery_notification")
+  @@unique([messageId, channel], map: "uq_email_delivery_message")
+  @@index([status, nextAttemptAt], map: "idx_email_delivery_dispatch")
+  @@index([status, lockedUntil], map: "idx_email_delivery_lease")
+  @@index([toAddress, createdAt(sort: Desc)], map: "idx_email_delivery_address")
+  @@index([recipientUserId, createdAt(sort: Desc)], map: "idx_email_delivery_recipient")
+}
+
+/// 사용자 x 범주 단위 채널 옵트인.
+model NotificationPreference {
+  id String @id @default(cuid())
+
+  userId   String
+  category NotificationCategory
+
+  inAppEnabled Boolean @default(true)
+  emailEnabled Boolean @default(true)
+  /// isMandatory 제거됨: "필수 범주인가"는 범주의 성질이지 사용자의 성질이 아니다.
+  /// 사용자 행에 두면 통짜 PUT 한 번으로 DEPOSIT 의 필수 플래그를 지우고 옵트아웃할 수 있고,
+  /// 그러면 자리와 돈을 잃으면서 알림도 못 받는다. 상수 맵(packages/shared)으로 파생시킨다.
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// idx_notification_preference_user(userId)는 이 유니크의 진부분집합이라 제거했다.
+  @@unique([userId, category], map: "uq_notification_preference")
+}
+
+/// 범주와 무관한 계정 단위 알림 스위치.
+/// 마케팅 동의 "법적 원장"은 User.marketing*AgreedAt/WithdrawnAt 이며 여기 값은 운영 미러다.
+model UserNotificationSetting {
+  id String @id @default(cuid())
+
+  userId String @unique
+
+  /// 마스터 이메일 스위치. 단 CRITICAL 거래성 메일은 이 값과 무관하게 발송.
+  emailGloballyEnabled Boolean @default(true)
+
+  marketingConsentAt          DateTime? @db.Timestamptz(3)
+  marketingConsentWithdrawnAt DateTime? @db.Timestamptz(3)
+  nightMarketingConsentAt     DateTime? @db.Timestamptz(3)
+
+  digestMode      DigestMode @default(IMMEDIATE)
+  preferredLocale String     @default("ko-KR")
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// 이메일 "주소" 기준 차단 목록(userId 기준 아님).
+model EmailSuppression {
+  id String @id @default(cuid())
+
+  email  String
+  reason EmailSuppressionReason
+  scope  SuppressionScope       @default(MARKETING_ONLY)
+
+  userId                String?
+  sourceProviderEventId String?
+  bounceCount           Int     @default(0)
+
+  expiresAt        DateTime? @db.Timestamptz(3)
+  releasedAt       DateTime? @db.Timestamptz(3)
+  releasedByUserId String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  /// idx_email_suppression_email(email)은 이 유니크의 진부분집합이라 제거했다.
+  @@unique([email, scope], map: "uq_email_suppression")
+  @@index([scope, expiresAt], map: "idx_email_suppression_sweep")
+}
+
+/// 운영자 세그먼트 공지 + 파트너→자기 이벤트 신청자 발송. 수신자는 Message 행으로 물질화된다.
+model Broadcast {
+  id String @id @default(cuid())
+
+  senderUserId String
+  senderRole   UserRole
+  eventId      String?
+
+  segment             BroadcastSegment
+  segmentFilter       Json?
+  applicationStatuses ApplicationStatus[]
+
+  titleKo String @db.VarChar(120)
+  bodyKo  String @db.Text
+
+  channels NotificationChannel[]
+  category NotificationCategory  @default(ANNOUNCEMENT)
+
+  status      BroadcastStatus @default(DRAFT)
+  scheduledAt DateTime?       @db.Timestamptz(3)
+
+  expansionCursor    String?
+  audienceSnapshotAt DateTime? @db.Timestamptz(3)
+  totalRecipients    Int       @default(0)
+  sentCount          Int       @default(0)
+  failedCount        Int       @default(0)
+  suppressedCount    Int       @default(0)
+
+  moderationState ModerationState @default(NOT_REQUIRED)
+  moderationNote  String?         @db.Text
+
+  requiresApproval Boolean   @default(false)
+  approvedByUserId String?
+  approvedAt       DateTime? @db.Timestamptz(3)
+
+  canceledAt       DateTime? @db.Timestamptz(3)
+  canceledByUserId String?
+
+  idempotencyKey String @unique
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  sender   User      @relation("BroadcastSender", fields: [senderUserId], references: [id], onDelete: Cascade)
+  event    Event?    @relation("EventBroadcasts", fields: [eventId], references: [id], onDelete: SetNull)
+  messages Message[]
+
+  @@index([senderUserId, createdAt(sort: Desc)], map: "idx_broadcast_sender")
+  @@index([status, scheduledAt], map: "idx_broadcast_schedule")
+  @@index([eventId, createdAt(sort: Desc)], map: "idx_broadcast_event")
+  @@index([moderationState, createdAt(sort: Desc)], map: "idx_broadcast_moderation")
+}
+
+/// 추가 전용(append-only) 감사 로그. UPDATE/DELETE 는 DB 권한 + BEFORE 트리거로 차단.
+model AuditLog {
+  id String @id @default(cuid())
+
+  /// 해시 체인의 전순서 보장용.
+  seq BigInt @unique @default(autoincrement())
+
+  actorUserId String?
+  actorRole   AuditActorRole
+  /// 길이 상한이 없으면 append-only 테이블이라 지워지지도 않는데 무한정 커진다.
+  actorLabel  String         @db.VarChar(120)
+
+  action            AuditAction
+  targetType        AuditTargetType
+  targetId          String
+  targetOwnerUserId String?
+
+  summary String @db.VarChar(500)
+
+  beforeJson Json?
+  afterJson  Json?
+
+  reasonCode String? @db.VarChar(50)
+  reasonMemo String? @db.VarChar(1000)
+
+  requestId      String? @db.VarChar(80)
+  /// 배치/크론 재실행이 이중 적용되지 않도록 하는 멱등 키(NULL 다중 허용).
+  idempotencyKey String? @unique @db.VarChar(120)
+  /// 한 사용자 요청이 만든 여러 감사 행을 묶는 상관관계 키.
+  correlationId  String? @db.VarChar(64)
+  ipHash         String? @db.Char(64)
+  /// 적대적인 User-Agent 헤더가 append-only 테이블을 부풀리지 못하게 상한을 둔다.
+  userAgent      String? @db.VarChar(500)
+
+  prevHash String? @db.Char(64)
+  rowHash  String  @db.Char(64)
+  /// 'global' 단일 체인이면 finalize 트랜잭션이 자문 락을 잡는 동안 플랫폼 전체의
+  /// 감사 기록 쓰기가 그 뒤에 줄을 선다. 샤딩 규칙은 앱 레벨에서 정한다(예: 'event:{eventId}').
+  chainKey String  @default("global") @db.VarChar(80)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  /// 규약상 존재하지만 이 테이블은 UPDATE 가 금지된다(= 항상 createdAt 과 동일).
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  actor User? @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([targetType, targetId, createdAt(sort: Desc)], map: "idx_audit_target")
+  @@index([actorUserId, createdAt(sort: Desc)], map: "idx_audit_actor")
+  @@index([action, createdAt(sort: Desc)], map: "idx_audit_action")
+  @@index([createdAt(sort: Desc)], map: "idx_audit_recent")
+  @@index([chainKey, seq], map: "idx_audit_chain")
+  @@index([correlationId], map: "idx_audit_correlation")
+}
+
+/// 플랫폼 수수료 정책(플레이스홀더 — SETTLEMENT_ENABLED=false).
+model PlatformFee {
+  id String @id @default(cuid())
+
+  name String
+
+  scope      FeeScope   @default(GLOBAL)
+  scopeRefId String?
+  eventMode  EventMode?
+
+  feeType        FeeType
+  /// 베이시스 포인트(350 = 3.5%).
+  percentBps     Int?
+  fixedAmountKrw Int?
+  minFeeKrw      Int?
+  maxFeeKrw      Int?
+  vatIncluded    Boolean @default(false)
+
+  effectiveFrom DateTime  @db.Timestamptz(3)
+  effectiveTo   DateTime? @db.Timestamptz(3)
+  isActive      Boolean   @default(true)
+
+  createdByUserId String?
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  settlements Settlement[]
+
+  @@index([scope, scopeRefId, eventMode, effectiveFrom], map: "idx_platform_fee_resolution")
+  @@index([isActive, effectiveFrom], map: "idx_platform_fee_active")
+}
+
+/// 정산 레코드(플레이스홀더). 금액은 계산·저장하되 실제 이체는 하지 않는다.
+model Settlement {
+  id String @id @default(cuid())
+
+  partnerProfileId String
+  eventId          String
+  /// KST 기준 정산 주기. 정확히 'YYYY-MM' 7자. 형식 CHECK 는 raw SQL.
+  periodKstMonth   String @db.VarChar(7)
+
+  confirmedCount      Int @default(0)
+  grossAmountKrw      Int @default(0)
+  depositCollectedKrw Int @default(0)
+  depositRefundedKrw  Int @default(0)
+
+  feePolicyId       String?
+  feePolicySnapshot Json?
+  platformFeeKrw    Int     @default(0)
+  vatKrw            Int     @default(0)
+  netPayoutKrw      Int     @default(0)
+
+  status      SettlementStatus @default(DRAFT)
+  holdReason  String?
+  payoutRefId String?
+
+  computedAt        DateTime? @db.Timestamptz(3)
+  confirmedByUserId String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  event     Event          @relation("EventSettlements", fields: [eventId], references: [id], onDelete: Cascade)
+  partner   PartnerProfile @relation("PartnerSettlements", fields: [partnerProfileId], references: [id], onDelete: Cascade)
+  feePolicy PlatformFee?   @relation(fields: [feePolicyId], references: [id], onDelete: SetNull)
+
+  @@unique([eventId, periodKstMonth], map: "uq_settlement_event_period")
+  @@index([partnerProfileId, periodKstMonth], map: "idx_settlement_partner_period")
+  @@index([status, periodKstMonth], map: "idx_settlement_status")
+}
+
+// =============================================================================
+// MODELS — 플랫폼 운영 기반 (신규)
+// =============================================================================
+
+/// 런타임 설정 + 피처 플래그 저장소.
+/// env 로만 두면 DEPOSIT_HOLD_ENABLED 하나 끄는 데 재배포가 필요하고, 감사 행이 안 남고,
+/// 무엇보다 Deposit.featureFlagSnapshot 이 나중에 "그때 값이 뭐였는지" 복원 불가능해진다.
+/// AuditAction.SETTING_CHANGED / FEATURE_FLAG_TOGGLED 가 이미 약속하고 있던 테이블이다.
+model Setting {
+  key         String  @id @db.VarChar(80)
+  valueJson   Json
+  description String? @db.VarChar(500)
+
+  /// FK 를 걸지 않는다: 설정 이력은 계정 생명주기와 독립적으로 보존돼야 한다(감사 근거).
+  updatedByUserId String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+}
+
+/// Idempotency-Key 저장소.
+/// 이게 없으면 재시도한 상향 요청이 `WHERE version=$expected` 에서 밀려 409 를 받는데,
+/// 실제로는 첫 시도가 이미 성공한 상태다. 마감 직전 재시도에서 이건 복구 불가능한 UX 실패이고,
+/// 클라이언트가 "더 높은 금액으로 다시 시도"로 해석하면 돈이 나가는 실패가 된다.
+/// PK insert 자체가 상호배제이므로, 반드시 도메인 쓰기와 같은 트랜잭션에서 넣어야 한다.
+/// (Vercel KV 로 대체 불가 — claimedCount 를 올리는 Postgres 트랜잭션에 참여할 수 없다.)
+model IdempotencyRecord {
+  key         String @db.VarChar(64)
+  userId      String
+  endpoint    String @db.VarChar(120)
+  /// 같은 키인데 본문이 다르면 재생이 아니라 충돌이다.
+  requestHash String @db.Char(64)
+
+  responseStatus Int?
+  responseBody   Json?
+
+  lockedAt    DateTime? @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+  expiresAt   DateTime  @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@id([userId, endpoint, key], map: "idempotency_record_pk")
+  @@index([expiresAt], map: "idem_sweep_idx")
+}
+
+/// 파트너가 특정 이용자를 차단한 기록.
+/// SelectionExclusionReason.BLOCKED_USER 를 적을 수는 있는데 근거를 남길 곳이 없어서,
+/// 일관되게 적용할 수도, 파트너의 다른 이벤트에 재사용할 수도, 민원 시 운영자가 검토할 수도 없었다.
+model PartnerBlockedUser {
+  id               String @id @default(cuid())
+  partnerProfileId String
+  userId           String
+
+  reason          String? @db.VarChar(500)
+  createdByUserId String
+
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+  releasedAt DateTime? @db.Timestamptz(3)
+
+  partner   PartnerProfile @relation(fields: [partnerProfileId], references: [id], onDelete: Cascade)
+  user      User           @relation("PartnerBlockedTarget", fields: [userId], references: [id], onDelete: Cascade)
+  createdBy User           @relation("PartnerBlockAuthor", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  @@unique([partnerProfileId, userId], map: "partner_blocked_user_uq")
+  @@index([userId], map: "partner_blocked_user_user_idx")
+}
+
+/// 이용자가 고른 관심 카테고리.
+/// BroadcastSegment.CATEGORY_INTEREST 가 팬아웃할 실체가 없어서, 크론이 정의를 지어내야 했다.
+/// (categoryId, userId) 인덱스는 커서 팬아웃이 페이징할 순서를 준다.
+model UserCategoryInterest {
+  id         String @id @default(cuid())
+  userId     String
+  categoryId String
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, categoryId], map: "user_category_interest_uq")
+  @@index([categoryId, userId], map: "user_category_interest_fanout_idx")
+}
+
+/// 동일인 추정 링크. DUPLICATE_ACCOUNT 제외 사유의 유일한 증거 테이블.
+/// 구글 가입은 무제한이고 phone 은 nullable·비유니크라, 계정 3개면 INSTANT 자리 3개와
+/// BID 순위 3개를 먹고 경쟁률 표시까지 부풀릴 수 있다. 판정은 사람이 하되 근거는 행으로 남긴다.
+model UserIdentityLink {
+  id           String @id @default(cuid())
+  userId       String
+  linkedUserId String
+
+  signal     IdentitySignal
+  /// 0~100. 자동 신호는 낮게, 운영자 수동 확인은 100.
+  confidence Int            @default(0)
+  note       String?        @db.VarChar(500)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  user   User @relation("IdentityLinkFrom", fields: [userId], references: [id], onDelete: Cascade)
+  linked User @relation("IdentityLinkTo", fields: [linkedUserId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, linkedUserId, signal], map: "user_identity_link_uq")
+  @@index([linkedUserId], map: "user_identity_link_reverse_idx")
+}

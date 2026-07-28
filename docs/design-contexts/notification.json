@@ -1,0 +1,1643 @@
+{
+  "context": "Bounded Context: **Notifications (쪽지 + Email)** for the Dibs (딥스) reservation platform.\n\nOwns everything about *telling a human something happened*: in-app 알림 (system-generated, typed) and 쪽지 (human-authored direct messages from 운영자/파트너), plus email delivery via Resend. Owns templates, per-user channel preferences, delivery logs, retries, unsubscribe/suppression, admin broadcasts to segments, and partner→applicant messaging.\n\nDoes NOT own: Event/Application/Bid/DepositHold lifecycle, ranking, or capacity. Those contexts emit domain events; this context subscribes. In a Vercel serverless monorepo there is no message bus in MVP, so \"emit\" = the owning service calls `NotificationsService.enqueue(...)` **inside the same Prisma transaction** that mutates the domain row, writing a `NotificationOutbox` row. A Vercel Cron sweeper drains the outbox. This gives transactional-outbox semantics (no lost notifications, no notifications for rolled-back transactions) with zero infrastructure.\n\nPlacement: `apps/api/src/notifications/**`, shared enums + payload zod schemas in `packages/shared/src/notifications/`. All timestamps stored `DateTime` UTC; **all rendering formats to Asia/Seoul (KST)** — never send a raw UTC string to a Korean user.\n\nHard invariant for this context: **a notification may never reveal another applicant's amount, the cutoff amount, or a user's own rank**, unless the event's visibility settings explicitly allow it. This is enforced structurally (payload whitelists per type + a render-time VisibilityGuard), not by template author discipline.\n\nFeature flags respected: `DEPOSIT_HOLD_ENABLED=false` in MVP suppresses the DEPOSIT_* notification types at enqueue time (rows are still modeled and the code path is testable).",
+  "summary": "Design covers: (1) `Notification` as the single per-recipient in-app inbox row, unified for system 알림 and human 쪽지 via `sourceType`; (2) `NotificationOutbox` transactional outbox + `NotificationDelivery` per-channel delivery log with exponential-backoff retry driven by Vercel Cron; (3) `NotificationTemplate` with versioned KO copy per (type, channel) and a strict zod-validated payload contract; (4) `NotificationPreference` split into transactional (non-optoutable) vs optional categories; (5) `EmailSuppression` + HMAC unsubscribe tokens + RFC 8058 one-click, fed by a Resend webhook with replay-safe dedupe; (6) `Broadcast` (운영자 segment broadcast) and partner→applicant messaging, both modeled as an audience spec that is *expanded to a recipient snapshot* in chunked cron passes so a 50k-recipient send survives a 60s serverless limit; (7) an anti-leak architecture: per-type payload field whitelist, a `VisibilityGuard` consulted at render time, and a lexical scanner + moderation flag on partner-authored copy sent during an open BID event. Includes 12 notification types with concrete Korean copy rules, three state machines, 30+ business rules, 28 adversarial edge cases (soft-close notification storms, deposit-expiry vs rebid races, KST/DST-free but midnight-boundary formatting, double-submit idempotency, unsubscribe-then-critical-notice, enumeration via unsubscribe tokens, partner leaking the cutoff in free text, cron overlap double-send), and 14 open questions.",
+  "entities": [
+    {
+      "name": "Notification",
+      "description": "A single row in ONE recipient's in-app inbox. Unified representation of both system 알림 and human-authored 쪽지 — the UI splits them by `sourceType`, but read-state, pagination, and retention logic are shared. Fan-out is materialized (one row per recipient); no shared-row + read-receipt design, because unread-count queries must be a single indexed count.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "recipientId",
+          "type": "String",
+          "notes": "FK -> User.id. The only person who can read this row."
+        },
+        {
+          "name": "sourceType",
+          "type": "NotificationSourceType",
+          "notes": "SYSTEM | ADMIN_MESSAGE | PARTNER_MESSAGE. Drives the 알림 vs 쪽지 tab."
+        },
+        {
+          "name": "type",
+          "type": "NotificationType",
+          "notes": "For SYSTEM rows: the trigger. For message rows: ADMIN_DIRECT_MESSAGE / PARTNER_EVENT_MESSAGE."
+        },
+        {
+          "name": "category",
+          "type": "NotificationCategory",
+          "notes": "Denormalized from type at enqueue time (frozen), so that later reclassification of a type does not retroactively change what a user opted out of."
+        },
+        {
+          "name": "priority",
+          "type": "NotificationPriority @default(NORMAL)",
+          "notes": "CRITICAL rows bypass optional-preference filtering and are pinned in the UI (e.g. DEPOSIT_REQUIRED, EVENT_CANCELED)."
+        },
+        {
+          "name": "titleKo",
+          "type": "String @db.VarChar(120)",
+          "notes": "RENDERED at enqueue time and stored. Deliberate denormalization: inbox lists must not re-run the template engine, and historical notifications must not silently change wording when a template is edited."
+        },
+        {
+          "name": "bodyKo",
+          "type": "String @db.Text",
+          "notes": "Rendered plain/limited-markdown body for the in-app card."
+        },
+        {
+          "name": "payload",
+          "type": "Json",
+          "notes": "Zod-validated per type (see NotificationPayloadSchemas in packages/shared). Whitelisted fields ONLY. Never contains otherApplicantAmount, cutoffAmount, rank, or applicantCount-by-amount."
+        },
+        {
+          "name": "deepLinkPath",
+          "type": "String?",
+          "notes": "Relative Next.js path e.g. /events/{eventId}/my-application. Relative only — prevents open-redirect from a partner-authored message."
+        },
+        {
+          "name": "eventId",
+          "type": "String?",
+          "notes": "FK -> Event.id, nullable. Indexed; used for 'delete all notifications for canceled event' and partner scoping."
+        },
+        {
+          "name": "applicationId",
+          "type": "String?",
+          "notes": "FK -> Application.id, nullable. Lets the UI reconcile a stale notification against current application state on open (lazy correctness)."
+        },
+        {
+          "name": "senderUserId",
+          "type": "String?",
+          "notes": "FK -> User.id. Null for SYSTEM. Set for 쪽지 so the user sees '운영자' or the partner's business display name."
+        },
+        {
+          "name": "senderDisplayName",
+          "type": "String?",
+          "notes": "Snapshot of the business/admin display name at send time — a partner renaming their venue must not rewrite old 쪽지."
+        },
+        {
+          "name": "broadcastId",
+          "type": "String?",
+          "notes": "FK -> Broadcast.id when this row came from a fan-out job."
+        },
+        {
+          "name": "dedupeKey",
+          "type": "String @unique",
+          "notes": "CRITICAL. e.g. `DEPOSIT_REQUIRED:{applicationId}:{depositHoldId}` or `DEADLINE_EXTENDED:{eventId}:{recipientId}:{extensionSeq}`. A unique constraint is the entire double-send defense; enqueue uses createMany({skipDuplicates:true})."
+        },
+        {
+          "name": "readAt",
+          "type": "DateTime?",
+          "notes": "Null = unread."
+        },
+        {
+          "name": "archivedAt",
+          "type": "DateTime?",
+          "notes": "User-hidden but retained for audit/support."
+        },
+        {
+          "name": "expiresAt",
+          "type": "DateTime?",
+          "notes": "Soft TTL for retention sweeper; also used to auto-hide a stale DEPOSIT_REQUIRED countdown card."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "recipient: User @relation(\"NotificationRecipient\", fields:[recipientId])",
+        "sender: User? @relation(\"NotificationSender\", fields:[senderUserId])",
+        "event: Event? @relation(fields:[eventId])",
+        "broadcast: Broadcast? @relation(fields:[broadcastId])",
+        "deliveries: NotificationDelivery[]",
+        "@@index([recipientId, readAt, createdAt(sort: Desc)])  // unread-count + inbox page",
+        "@@index([recipientId, sourceType, createdAt(sort: Desc)])",
+        "@@index([eventId, type])"
+      ]
+    },
+    {
+      "name": "NotificationOutbox",
+      "description": "Transactional outbox. Written by domain services INSIDE the same Prisma transaction as the state change (application created, deposit confirmed, hold expired, ranking finalized...). A Vercel Cron sweeper claims and expands rows into Notification + NotificationDelivery. Guarantees at-least-once with dedupeKey providing effectively-once.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "type",
+          "type": "NotificationType"
+        },
+        {
+          "name": "audience",
+          "type": "Json",
+          "notes": "Discriminated union: {kind:'USER', userId} | {kind:'APPLICATION', applicationId} | {kind:'EVENT_APPLICANTS', eventId, statuses: ApplicationStatus[]} | {kind:'BROADCAST', broadcastId}. Resolved at drain time, NOT at write time, so the recipient set reflects reality at send time."
+        },
+        {
+          "name": "payload",
+          "type": "Json",
+          "notes": "Template variables. Validated against the type's zod schema before persisting — a bad payload fails the domain transaction loudly rather than producing a broken email later."
+        },
+        {
+          "name": "status",
+          "type": "OutboxStatus @default(PENDING)",
+          "notes": "PENDING | CLAIMED | EXPANDED | FAILED | SKIPPED"
+        },
+        {
+          "name": "claimedUntil",
+          "type": "DateTime?",
+          "notes": "Lease. Claim = UPDATE ... SET status='CLAIMED', claimedUntil=now()+interval '2 minutes' ... FOR UPDATE SKIP LOCKED LIMIT 200. Expired leases are reclaimable — makes cron overlap safe."
+        },
+        {
+          "name": "attemptCount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "availableAt",
+          "type": "DateTime @default(now())",
+          "notes": "Enables deliberately DELAYED notifications: e.g. DEPOSIT_REMINDER scheduled at holdExpiresAt - 3min, and coalesced DEADLINE_EXTENDED emails."
+        },
+        {
+          "name": "coalesceKey",
+          "type": "String?",
+          "notes": "e.g. `DEADLINE_EXTENDED:{eventId}`. On drain, PENDING rows sharing a coalesceKey collapse to the newest payload; the older ones become SKIPPED. This is the soft-close notification-storm defense."
+        },
+        {
+          "name": "lastError",
+          "type": "String? @db.Text"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "@@index([status, availableAt])",
+        "@@index([coalesceKey, status])"
+      ]
+    },
+    {
+      "name": "NotificationDelivery",
+      "description": "One row per (notification, channel) delivery attempt-chain. The delivery log + retry state machine. IN_APP deliveries are trivially SENT at creation; EMAIL deliveries carry the real lifecycle.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "notificationId",
+          "type": "String",
+          "notes": "FK -> Notification.id"
+        },
+        {
+          "name": "channel",
+          "type": "NotificationChannel",
+          "notes": "IN_APP | EMAIL. (PUSH/SMS/KAKAO reserved, not implemented.)"
+        },
+        {
+          "name": "status",
+          "type": "DeliveryStatus @default(PENDING)"
+        },
+        {
+          "name": "toAddress",
+          "type": "String?",
+          "notes": "Snapshot of the email at send time. If the user later changes their Google email, the log still shows where it actually went."
+        },
+        {
+          "name": "subjectKo",
+          "type": "String?",
+          "notes": "Rendered email subject snapshot."
+        },
+        {
+          "name": "providerMessageId",
+          "type": "String?",
+          "notes": "Resend id. Unique-indexed (sparse) so webhook callbacks map back."
+        },
+        {
+          "name": "idempotencyKey",
+          "type": "String @unique",
+          "notes": "= delivery.id, sent to Resend as Idempotency-Key. Prevents a cron retry after an ambiguous timeout from producing a second real email."
+        },
+        {
+          "name": "attemptCount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "nextAttemptAt",
+          "type": "DateTime?",
+          "notes": "Backoff schedule: 1m, 5m, 15m, 60m, 6h; maxAttempts 5 then FAILED."
+        },
+        {
+          "name": "lockedUntil",
+          "type": "DateTime?",
+          "notes": "Lease for the dispatch cron, same SKIP LOCKED pattern as the outbox."
+        },
+        {
+          "name": "skipReason",
+          "type": "DeliverySkipReason?",
+          "notes": "PREFERENCE_OPTED_OUT | SUPPRESSED_UNSUBSCRIBED | SUPPRESSED_BOUNCED | SUPPRESSED_COMPLAINED | NO_EMAIL_ON_ACCOUNT | FEATURE_FLAG_OFF | QUIET_HOURS_DROPPED. Skips are recorded, never silently dropped — support needs to answer '왜 메일이 안 왔나요'."
+        },
+        {
+          "name": "failureCode",
+          "type": "String?"
+        },
+        {
+          "name": "failureMessage",
+          "type": "String? @db.Text"
+        },
+        {
+          "name": "sentAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "deliveredAt",
+          "type": "DateTime?",
+          "notes": "From Resend webhook email.delivered."
+        },
+        {
+          "name": "openedAt",
+          "type": "DateTime?",
+          "notes": "Optional; only if open tracking is enabled — see open questions (PIPA consent)."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt"
+        }
+      ],
+      "relations": [
+        "notification: Notification @relation(fields:[notificationId], onDelete: Cascade)",
+        "@@unique([notificationId, channel])  // one chain per channel; retries mutate this row",
+        "@@index([status, nextAttemptAt])",
+        "@@index([providerMessageId])"
+      ]
+    },
+    {
+      "name": "NotificationTemplate",
+      "description": "Versioned Korean copy per (type, channel, locale). Stored in DB (not code) so 운영자 can fix a typo without a deploy, but seeded from a checked-in TS fixture so environments are reproducible. Rendering uses a whitelisted variable set — no arbitrary expression evaluation.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "type",
+          "type": "NotificationType"
+        },
+        {
+          "name": "channel",
+          "type": "NotificationChannel"
+        },
+        {
+          "name": "locale",
+          "type": "String @default(\"ko-KR\")"
+        },
+        {
+          "name": "version",
+          "type": "Int",
+          "notes": "Monotonic per (type, channel, locale)."
+        },
+        {
+          "name": "isActive",
+          "type": "Boolean @default(false)",
+          "notes": "Exactly one active version per key, enforced by a partial unique index."
+        },
+        {
+          "name": "subjectKoTemplate",
+          "type": "String?",
+          "notes": "Email only. e.g. '[딥스] {{eventTitle}} 참가비 결제 안내 (오늘 {{holdExpiresAtKst}}까지)'"
+        },
+        {
+          "name": "titleKoTemplate",
+          "type": "String @db.VarChar(200)"
+        },
+        {
+          "name": "bodyKoTemplate",
+          "type": "String @db.Text",
+          "notes": "Handlebars-ish, restricted to {{var}} and {{#if var}}. No helpers that can traverse arbitrary objects."
+        },
+        {
+          "name": "emailHtmlTemplate",
+          "type": "String? @db.Text",
+          "notes": "React Email component name is preferable; this column is the DB-editable fallback. See open questions."
+        },
+        {
+          "name": "allowedVariables",
+          "type": "String[]",
+          "notes": "THE ANTI-LEAK GATE. Render() throws if the template references a variable outside this list. Ships with cutoffAmount / rank / otherAmount permanently absent for user-facing types."
+        },
+        {
+          "name": "deepLinkPathTemplate",
+          "type": "String?"
+        },
+        {
+          "name": "createdByAdminId",
+          "type": "String?"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "@@unique([type, channel, locale, version])",
+        "@@index([type, channel, locale, isActive])"
+      ]
+    },
+    {
+      "name": "NotificationPreference",
+      "description": "Per-user, per-category channel opt-in. One row per (userId, category). Transactional categories are stored but their EMAIL/IN_APP flags are ignored for CRITICAL priority — modeled explicitly rather than by absence, so the settings screen can render them greyed-out with '필수 알림' rather than hiding them.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "userId",
+          "type": "String"
+        },
+        {
+          "name": "category",
+          "type": "NotificationCategory"
+        },
+        {
+          "name": "inAppEnabled",
+          "type": "Boolean @default(true)"
+        },
+        {
+          "name": "emailEnabled",
+          "type": "Boolean @default(true)"
+        },
+        {
+          "name": "isMandatory",
+          "type": "Boolean @default(false)",
+          "notes": "Denormalized from category config; true for APPLICATION, DEPOSIT, RESULT, EVENT_CHANGE, ACCOUNT."
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt"
+        }
+      ],
+      "relations": [
+        "user: User @relation(fields:[userId])",
+        "@@unique([userId, category])"
+      ]
+    },
+    {
+      "name": "UserNotificationSettings",
+      "description": "Account-level knobs that are not per-category. Separate from NotificationPreference so a single upsert covers the global switches.",
+      "fields": [
+        {
+          "name": "userId",
+          "type": "String @id"
+        },
+        {
+          "name": "emailGloballyEnabled",
+          "type": "Boolean @default(true)",
+          "notes": "Master email switch. Still overridden by CRITICAL transactional mail."
+        },
+        {
+          "name": "marketingConsentAt",
+          "type": "DateTime?",
+          "notes": "PIPA: explicit opt-in timestamp required before any MARKETING send. Null = never send marketing."
+        },
+        {
+          "name": "marketingConsentWithdrawnAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "nightMarketingConsentAt",
+          "type": "DateTime?",
+          "notes": "Korea requires separate consent for 21:00–08:00 KST advertising. Gate for quiet-hours marketing."
+        },
+        {
+          "name": "digestMode",
+          "type": "DigestMode @default(IMMEDIATE)",
+          "notes": "IMMEDIATE | DAILY_DIGEST. Applies only to non-CRITICAL categories."
+        },
+        {
+          "name": "preferredLocale",
+          "type": "String @default(\"ko-KR\")"
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt"
+        }
+      ],
+      "relations": [
+        "user: User @relation(fields:[userId])"
+      ]
+    },
+    {
+      "name": "EmailSuppression",
+      "description": "Hard block list keyed by email ADDRESS (not userId) — a bounced or complained address must stay blocked even if a different account later claims it. Checked before every EMAIL delivery.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "email",
+          "type": "String",
+          "notes": "Lowercased, normalized."
+        },
+        {
+          "name": "reason",
+          "type": "EmailSuppressionReason"
+        },
+        {
+          "name": "scope",
+          "type": "SuppressionScope @default(MARKETING_ONLY)",
+          "notes": "MARKETING_ONLY (user unsubscribed from optional mail) | ALL (hard bounce / spam complaint). Critical transactional mail is still sent for MARKETING_ONLY, never for ALL."
+        },
+        {
+          "name": "sourceProviderEventId",
+          "type": "String?",
+          "notes": "Resend webhook event id for provenance."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        },
+        {
+          "name": "expiresAt",
+          "type": "DateTime?",
+          "notes": "Soft bounces auto-expire after 7 days; hard bounces never."
+        },
+        {
+          "name": "releasedAt",
+          "type": "DateTime?",
+          "notes": "Admin manual release, audited."
+        }
+      ],
+      "relations": [
+        "@@unique([email, scope])",
+        "@@index([email])"
+      ]
+    },
+    {
+      "name": "UnsubscribeToken",
+      "description": "Stateless-verifiable HMAC token persisted for revocation and audit. Format sent in URL: base64url(userId.category.exp).hmacSha256. Persisted row lets us revoke and detect enumeration.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "userId",
+          "type": "String"
+        },
+        {
+          "name": "tokenHash",
+          "type": "String @unique",
+          "notes": "sha256 of the token; the raw token is never stored."
+        },
+        {
+          "name": "scope",
+          "type": "UnsubscribeScope",
+          "notes": "CATEGORY | ALL_OPTIONAL"
+        },
+        {
+          "name": "category",
+          "type": "NotificationCategory?"
+        },
+        {
+          "name": "expiresAt",
+          "type": "DateTime",
+          "notes": "180 days — email clients surface old mail."
+        },
+        {
+          "name": "usedAt",
+          "type": "DateTime?",
+          "notes": "Not single-use (one-click may be re-fired by mail clients); records first use."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "user: User @relation(fields:[userId])",
+        "@@index([userId])"
+      ]
+    },
+    {
+      "name": "Broadcast",
+      "description": "An 운영자 segment broadcast OR a 파트너 message to applicants of their own event. One entity, distinguished by senderRole + audience spec, because the fan-out machinery, moderation, and delivery reporting are identical. The audience is expanded into BroadcastRecipient rows in chunked cron passes.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "senderUserId",
+          "type": "String"
+        },
+        {
+          "name": "senderRole",
+          "type": "UserRole",
+          "notes": "ADMIN | PARTNER. PARTNER is hard-scoped to audience.kind === 'EVENT_APPLICANTS' on an event they own."
+        },
+        {
+          "name": "eventId",
+          "type": "String?",
+          "notes": "Required when audience targets an event. Ownership checked at create AND again at each expansion chunk (partner could lose the event in between)."
+        },
+        {
+          "name": "audience",
+          "type": "Json",
+          "notes": "BroadcastAudienceSpec: {kind:'ALL_USERS'|'ALL_PARTNERS'|'ALL_APPROVED_PARTNERS'|'EVENT_APPLICANTS'|'USER_IDS'|'SEGMENT', eventId?, applicationStatuses?: ApplicationStatus[], userIds?: string[], segment?: {region?, category?, lastActiveAfter?, hasAppliedSince?}}. Validated by zod; PARTNER senders may only use EVENT_APPLICANTS."
+        },
+        {
+          "name": "audienceSnapshotCount",
+          "type": "Int?",
+          "notes": "Filled after expansion completes. Shown as '총 1,284명에게 발송'."
+        },
+        {
+          "name": "titleKo",
+          "type": "String @db.VarChar(120)"
+        },
+        {
+          "name": "bodyKo",
+          "type": "String @db.Text",
+          "notes": "Author-written. Sanitized (no HTML, no raw URLs auto-linked to external hosts without allowlist)."
+        },
+        {
+          "name": "channels",
+          "type": "NotificationChannel[]",
+          "notes": "[IN_APP] or [IN_APP, EMAIL]. Partners may NOT send EMAIL-only; in-app is always included so there is an auditable record in the user's 쪽지함."
+        },
+        {
+          "name": "category",
+          "type": "NotificationCategory",
+          "notes": "Admin may choose MARKETING (requires per-recipient marketingConsentAt) or ANNOUNCEMENT. Partner→applicant is always EVENT_CHANGE (operational) — partners cannot send marketing."
+        },
+        {
+          "name": "status",
+          "type": "BroadcastStatus @default(DRAFT)"
+        },
+        {
+          "name": "scheduledAt",
+          "type": "DateTime?",
+          "notes": "KST-entered in the UI, stored UTC."
+        },
+        {
+          "name": "expansionCursor",
+          "type": "String?",
+          "notes": "Last recipient userId processed; enables resumable chunked fan-out across 60s function invocations."
+        },
+        {
+          "name": "moderationState",
+          "type": "ModerationState @default(NOT_REQUIRED)",
+          "notes": "For PARTNER broadcasts on an OPEN BID event: AUTO_FLAGGED if the leak scanner hits, then PENDING_REVIEW. See businessRules."
+        },
+        {
+          "name": "moderationNote",
+          "type": "String? @db.Text"
+        },
+        {
+          "name": "sentCount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "failedCount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "canceledAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt"
+        }
+      ],
+      "relations": [
+        "sender: User @relation(fields:[senderUserId])",
+        "event: Event? @relation(fields:[eventId])",
+        "recipients: BroadcastRecipient[]",
+        "notifications: Notification[]",
+        "@@index([senderUserId, createdAt(sort: Desc)])",
+        "@@index([status, scheduledAt])",
+        "@@index([eventId])"
+      ]
+    },
+    {
+      "name": "BroadcastRecipient",
+      "description": "Materialized recipient snapshot. Exists so a broadcast is auditable ('who exactly received this') and resumable, and so that a user who cancels their application mid-fan-out still gets a consistent send rather than a half-set.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "broadcastId",
+          "type": "String"
+        },
+        {
+          "name": "userId",
+          "type": "String"
+        },
+        {
+          "name": "notificationId",
+          "type": "String?",
+          "notes": "Set once the inbox row is created."
+        },
+        {
+          "name": "status",
+          "type": "BroadcastRecipientStatus @default(PENDING)",
+          "notes": "PENDING | CREATED | SKIPPED | FAILED"
+        },
+        {
+          "name": "skipReason",
+          "type": "DeliverySkipReason?"
+        },
+        {
+          "name": "applicationStatusAtSend",
+          "type": "ApplicationStatus?",
+          "notes": "Snapshot for partner sends — supports '이 쪽지는 당시 선정 대기 중이던 분들께 발송됨'."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "broadcast: Broadcast @relation(fields:[broadcastId], onDelete: Cascade)",
+        "user: User @relation(fields:[userId])",
+        "@@unique([broadcastId, userId])  // idempotent chunked expansion",
+        "@@index([broadcastId, status])"
+      ]
+    },
+    {
+      "name": "ProviderWebhookEvent",
+      "description": "Raw Resend webhook envelope, stored before processing. Gives replay-safety, signature-verification audit, and a place to reprocess after a bug.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "provider",
+          "type": "String @default(\"resend\")"
+        },
+        {
+          "name": "providerEventId",
+          "type": "String",
+          "notes": "Unique with provider — the dedupe key for webhook retries."
+        },
+        {
+          "name": "eventType",
+          "type": "String",
+          "notes": "email.sent | email.delivered | email.delivery_delayed | email.bounced | email.complained | email.opened | email.clicked"
+        },
+        {
+          "name": "payload",
+          "type": "Json"
+        },
+        {
+          "name": "signatureValid",
+          "type": "Boolean"
+        },
+        {
+          "name": "processedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "processingError",
+          "type": "String? @db.Text"
+        },
+        {
+          "name": "receivedAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "@@unique([provider, providerEventId])",
+        "@@index([processedAt])"
+      ]
+    },
+    {
+      "name": "NotificationAuditLog",
+      "description": "Append-only record of privileged notification actions: admin broadcast created/canceled, template activated, suppression released, moderation decision. Separate from the delivery log because the retention and access rules differ.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "actorUserId",
+          "type": "String"
+        },
+        {
+          "name": "action",
+          "type": "String",
+          "notes": "e.g. BROADCAST_CREATED, BROADCAST_CANCELED, TEMPLATE_ACTIVATED, SUPPRESSION_RELEASED, MODERATION_BLOCKED"
+        },
+        {
+          "name": "targetType",
+          "type": "String"
+        },
+        {
+          "name": "targetId",
+          "type": "String"
+        },
+        {
+          "name": "diff",
+          "type": "Json?"
+        },
+        {
+          "name": "ipHash",
+          "type": "String?"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "@@index([targetType, targetId, createdAt(sort: Desc)])",
+        "@@index([actorUserId, createdAt(sort: Desc)])"
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "name": "NotificationType",
+      "values": [
+        "APPLICATION_RECEIVED",
+        "APPLICATION_CONFIRMED_INSTANT",
+        "DEPOSIT_REQUIRED",
+        "DEPOSIT_REMINDER",
+        "DEPOSIT_CONFIRMED",
+        "DEPOSIT_HOLD_EXPIRED",
+        "REBID_ACCEPTED",
+        "REBID_DEPOSIT_SHORTFALL",
+        "REBID_ROLLED_BACK",
+        "DEADLINE_EXTENDED",
+        "APPLICATION_CANCELED_BY_USER",
+        "EVENT_CANCELED",
+        "EVENT_CLOSED_CAPACITY_REACHED",
+        "SELECTION_FINALIZED_SELECTED",
+        "SELECTION_FINALIZED_NOT_SELECTED",
+        "SELECTION_REVISED_BY_PARTNER",
+        "DEPOSIT_REFUND_SCHEDULED",
+        "PARTNER_APPROVAL_APPROVED",
+        "PARTNER_APPROVAL_REJECTED",
+        "PARTNER_NEW_APPLICATION_DIGEST",
+        "PARTNER_EVENT_DEADLINE_REACHED",
+        "PARTNER_EVENT_MESSAGE",
+        "ADMIN_DIRECT_MESSAGE",
+        "ADMIN_ANNOUNCEMENT"
+      ]
+    },
+    {
+      "name": "NotificationCategory",
+      "values": [
+        "APPLICATION",
+        "DEPOSIT",
+        "RESULT",
+        "EVENT_CHANGE",
+        "MESSAGE",
+        "ACCOUNT",
+        "PARTNER_OPS",
+        "ANNOUNCEMENT",
+        "MARKETING"
+      ]
+    },
+    {
+      "name": "NotificationPriority",
+      "values": [
+        "CRITICAL",
+        "HIGH",
+        "NORMAL",
+        "LOW"
+      ]
+    },
+    {
+      "name": "NotificationChannel",
+      "values": [
+        "IN_APP",
+        "EMAIL"
+      ]
+    },
+    {
+      "name": "NotificationSourceType",
+      "values": [
+        "SYSTEM",
+        "ADMIN_MESSAGE",
+        "PARTNER_MESSAGE"
+      ]
+    },
+    {
+      "name": "DeliveryStatus",
+      "values": [
+        "PENDING",
+        "QUEUED",
+        "SENDING",
+        "SENT",
+        "DELIVERED",
+        "DELAYED",
+        "BOUNCED",
+        "COMPLAINED",
+        "FAILED",
+        "SKIPPED",
+        "CANCELED"
+      ]
+    },
+    {
+      "name": "DeliverySkipReason",
+      "values": [
+        "PREFERENCE_OPTED_OUT",
+        "GLOBAL_EMAIL_OFF",
+        "SUPPRESSED_UNSUBSCRIBED",
+        "SUPPRESSED_BOUNCED",
+        "SUPPRESSED_COMPLAINED",
+        "NO_EMAIL_ON_ACCOUNT",
+        "NO_MARKETING_CONSENT",
+        "NO_NIGHT_MARKETING_CONSENT",
+        "FEATURE_FLAG_OFF",
+        "RECIPIENT_DEACTIVATED",
+        "COALESCED",
+        "MODERATION_BLOCKED"
+      ]
+    },
+    {
+      "name": "OutboxStatus",
+      "values": [
+        "PENDING",
+        "CLAIMED",
+        "EXPANDED",
+        "FAILED",
+        "SKIPPED"
+      ]
+    },
+    {
+      "name": "BroadcastStatus",
+      "values": [
+        "DRAFT",
+        "SCHEDULED",
+        "EXPANDING",
+        "SENDING",
+        "COMPLETED",
+        "PARTIALLY_FAILED",
+        "CANCELED",
+        "BLOCKED"
+      ]
+    },
+    {
+      "name": "BroadcastRecipientStatus",
+      "values": [
+        "PENDING",
+        "CREATED",
+        "SKIPPED",
+        "FAILED"
+      ]
+    },
+    {
+      "name": "BroadcastAudienceKind",
+      "values": [
+        "ALL_USERS",
+        "ALL_PARTNERS",
+        "ALL_APPROVED_PARTNERS",
+        "EVENT_APPLICANTS",
+        "USER_IDS",
+        "SEGMENT"
+      ]
+    },
+    {
+      "name": "EmailSuppressionReason",
+      "values": [
+        "USER_UNSUBSCRIBED",
+        "HARD_BOUNCE",
+        "SOFT_BOUNCE_THRESHOLD",
+        "SPAM_COMPLAINT",
+        "ADMIN_MANUAL",
+        "INVALID_ADDRESS"
+      ]
+    },
+    {
+      "name": "SuppressionScope",
+      "values": [
+        "MARKETING_ONLY",
+        "ALL"
+      ]
+    },
+    {
+      "name": "UnsubscribeScope",
+      "values": [
+        "CATEGORY",
+        "ALL_OPTIONAL"
+      ]
+    },
+    {
+      "name": "ModerationState",
+      "values": [
+        "NOT_REQUIRED",
+        "AUTO_FLAGGED",
+        "PENDING_REVIEW",
+        "APPROVED",
+        "BLOCKED"
+      ]
+    },
+    {
+      "name": "DigestMode",
+      "values": [
+        "IMMEDIATE",
+        "DAILY_DIGEST"
+      ]
+    }
+  ],
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/notifications",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Cursor-paginated inbox for the authenticated user. Query: ?tab=ALL|SYSTEM|MESSAGE, ?category=, ?unreadOnly=true, ?cursor=, ?limit=20 (max 50). Returns rendered titleKo/bodyKo, deepLinkPath, readAt, createdAt, and createdAtKstLabel (server-formatted, e.g. '오늘 오후 3:12'). Never returns payload fields not in the type's public whitelist."
+    },
+    {
+      "method": "GET",
+      "path": "/notifications/unread-count",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "{ total, byTab: { system, message }, hasCritical }. Backed by @@index([recipientId, readAt, createdAt]). Cached 10s at the edge per user; polled by the bell badge."
+    },
+    {
+      "method": "GET",
+      "path": "/notifications/stream",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "SSE. Emits {type:'unread', total} heartbeats every 15s and on new rows detected by a lightweight since-cursor poll. Hard-closes at 50s (Vercel limit) with a retry: 3000 hint so EventSource reconnects. Client MUST also fall back to 30s polling — SSE is an optimization, not a guarantee. No WebSocket."
+    },
+    {
+      "method": "GET",
+      "path": "/notifications/:id",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Single notification detail (full 쪽지 body). 404 — not 403 — if recipientId != caller, to avoid confirming existence."
+    },
+    {
+      "method": "PATCH",
+      "path": "/notifications/:id/read",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Idempotent: sets readAt = now() only if null. Returns the new unread count so the badge updates without a second round trip."
+    },
+    {
+      "method": "POST",
+      "path": "/notifications/read-all",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Body: { tab?, category?, beforeCursor? }. Bounded UPDATE using beforeCursor to avoid marking rows that arrived after the user's list snapshot."
+    },
+    {
+      "method": "PATCH",
+      "path": "/notifications/:id/archive",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Soft hide. Archiving never deletes; CRITICAL unread rows may be archived but reappear pinned if the underlying deadline is still live (lazy re-surface on read)."
+    },
+    {
+      "method": "GET",
+      "path": "/me/notification-preferences",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Returns all categories with {inAppEnabled, emailEnabled, isMandatory, labelKo, descriptionKo} plus global settings (emailGloballyEnabled, marketingConsentAt, nightMarketingConsentAt, digestMode). Missing rows are materialized with defaults on read."
+    },
+    {
+      "method": "PUT",
+      "path": "/me/notification-preferences",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Bulk upsert. Rejects (422) any attempt to disable a mandatory category with a Korean error naming the category. Toggling marketing on records marketingConsentAt = now(); toggling off records withdrawal and writes a MARKETING_ONLY suppression."
+    },
+    {
+      "method": "GET",
+      "path": "/unsubscribe",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "Token-based landing page (no login). ?t=<token>. Shows what will be turned off in Korean and a confirm button. Verifies HMAC + expiry + tokenHash row; on invalid shows a neutral '링크가 만료되었습니다' page and never reveals whether the user exists."
+    },
+    {
+      "method": "POST",
+      "path": "/unsubscribe",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "RFC 8058 one-click target, also used by the landing page. Body/query: token. Applies the scope, writes EmailSuppression(MARKETING_ONLY) or clears category emailEnabled, records usedAt. Always returns 200 even for an already-used token (mail clients re-fire)."
+    },
+    {
+      "method": "POST",
+      "path": "/webhooks/resend",
+      "roles": [
+        "PUBLIC_SIGNED"
+      ],
+      "description": "Resend event webhook. Verifies the Svix/HMAC signature against RESEND_WEBHOOK_SECRET BEFORE parsing. Inserts ProviderWebhookEvent (unique on providerEventId → 200 on replay, no work). Then maps to NotificationDelivery via providerMessageId: delivered→DELIVERED, bounced(hard)→BOUNCED + EmailSuppression(ALL), complained→COMPLAINED + EmailSuppression(ALL), delivery_delayed→DELAYED. Returns 200 quickly; heavy work deferred to the processing cron if the mapping row is not yet visible."
+    },
+    {
+      "method": "POST",
+      "path": "/partner/events/:eventId/messages",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "파트너 → 자기 이벤트 신청자 쪽지. Body: { titleKo, bodyKo, applicationStatuses?: ApplicationStatus[] (default: all non-canceled), channels: ['IN_APP'] | ['IN_APP','EMAIL'], scheduledAt? }. Verifies event.partnerId === caller AND partner.approvalStatus === APPROVED. Runs the leak scanner (see rules); may return 202 with moderationState=PENDING_REVIEW instead of sending. Rate-limited: 5 broadcasts per event per 24h."
+    },
+    {
+      "method": "GET",
+      "path": "/partner/events/:eventId/messages",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "Sent-message history for the event with per-broadcast delivery stats (발송 1,284 / 도착 1,251 / 실패 33) and moderation state."
+    },
+    {
+      "method": "GET",
+      "path": "/partner/events/:eventId/messages/recipient-preview",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "?applicationStatuses=... → { count } only. Deliberately returns a COUNT, never a list of names/emails, and never amounts. Prevents the messaging screen from becoming a data-export side channel."
+    },
+    {
+      "method": "POST",
+      "path": "/partner/events/:eventId/messages/:id/cancel",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "Cancels a SCHEDULED or still-EXPANDING broadcast. Already-CREATED in-app rows remain (they were delivered); pending EMAIL deliveries flip to CANCELED. Returns how many were already sent so the partner isn't misled."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/broadcasts",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Create an 운영자 broadcast. Body: { audience: BroadcastAudienceSpec, titleKo, bodyKo, channels, category, scheduledAt? }. category=MARKETING forces a consent filter at expansion. Returns { id, estimatedRecipients }."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/broadcasts",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "List/filter broadcasts (own + partners'), with status, counts, moderation state."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/broadcasts/:id",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Detail incl. per-skipReason breakdown and a sample of failed deliveries."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/broadcasts/:id/send",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "DRAFT|SCHEDULED → EXPANDING. Requires a confirmation token echoing estimatedRecipients (double-submit + fat-finger guard on a 50k send)."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/broadcasts/:id/cancel",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Cancels expansion and all pending deliveries."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/broadcasts/:id/test-send",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Renders and sends to the admin's own address only. Does not create BroadcastRecipient rows."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/messages/direct",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "1:1 쪽지 to a specific user (support replies, moderation notices). Body: { userId, titleKo, bodyKo, channels }."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/notifications/deliveries",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Delivery log search: ?userId= &email= &type= &status= &from= &to=. The support console for '메일이 안 왔어요'. Returns skipReason and failureMessage."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/notifications/deliveries/:id/resend",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Manual retry of a FAILED/BOUNCED delivery. Generates a NEW idempotencyKey (deliberate — this is a human-authorized duplicate). Blocked if the address is under a SuppressionScope.ALL suppression unless force=true, which is audited."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/notification-templates",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "List templates by type/channel with active version."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/notification-templates",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Create a new draft version. Validates that every {{var}} used is in allowedVariables; 422 with the offending variable name otherwise. This is where a leak attempt ('{{cutoffAmount}}') is rejected."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/notification-templates/:id/activate",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Atomically deactivates the previous active version for the same (type, channel, locale). Audited."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/notification-templates/:id/preview",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Renders with sample payload; returns HTML + text + the KST-formatted strings so copy can be proofread."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/email-suppressions",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Search suppression list by email/reason."
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/email-suppressions/:id",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Release a suppression (e.g. user fixed their mailbox). Audited; refuses SPAM_COMPLAINT releases without an explicit reason string."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/broadcasts/:id/moderate",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Body: { decision: 'APPROVED'|'BLOCKED', note }. Approving a flagged partner broadcast resumes expansion; blocking sets BLOCKED and notifies the partner."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/notifications/outbox-drain",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Every minute. Claims up to 200 PENDING outbox rows with availableAt<=now via FOR UPDATE SKIP LOCKED + lease, applies coalesceKey collapsing, resolves audiences, creates Notification (createMany skipDuplicates on dedupeKey) and NotificationDelivery rows. Idempotent and resumable. Authorized by CRON_SECRET header, not by IP."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/notifications/broadcast-expand",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Every minute. Advances EXPANDING broadcasts by chunks of 2,000 recipients using expansionCursor; also promotes SCHEDULED→EXPANDING when scheduledAt<=now. Stops at 45s wall-clock and leaves the cursor for the next tick."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/notifications/dispatch",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Every minute. Claims QUEUED/PENDING EMAIL deliveries with nextAttemptAt<=now, batches up to 100 per Resend batch call, sets providerMessageId, advances status. Per-delivery Idempotency-Key = delivery.id."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/notifications/retry-sweep",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Every 5 minutes. Re-queues SENDING rows whose lockedUntil has passed (crashed invocation), applies backoff, marks >maxAttempts as FAILED, expires soft-bounce suppressions."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/notifications/deposit-reminders",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Every minute. Emits DEPOSIT_REMINDER for holds expiring within the reminder lead time that are still unpaid. Skipped entirely while DEPOSIT_HOLD_ENABLED=false."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/notifications/retention-sweep",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Daily 04:00 KST. Deletes Notification rows past retention, prunes processed ProviderWebhookEvent payloads, anonymizes toAddress on old deliveries."
+    },
+    {
+      "method": "POST",
+      "path": "/internal/notifications/enqueue",
+      "roles": [
+        "INTERNAL"
+      ],
+      "description": "Not an HTTP route in MVP — documented as the in-process NotificationsService.enqueue(tx, {type, audience, payload, coalesceKey?, availableAt?}) contract that other bounded contexts call inside their transaction. Listed here so the interface is explicit and can later become a real route if the API splits."
+    }
+  ],
+  "stateMachines": [
+    {
+      "entity": "NotificationDelivery (EMAIL channel)",
+      "states": [
+        "PENDING",
+        "QUEUED",
+        "SENDING",
+        "SENT",
+        "DELIVERED",
+        "DELAYED",
+        "BOUNCED",
+        "COMPLAINED",
+        "FAILED",
+        "SKIPPED",
+        "CANCELED"
+      ],
+      "transitions": [
+        "PENDING -> SKIPPED : preference/suppression/consent/feature-flag check fails at dispatch time (skipReason recorded). Terminal.",
+        "PENDING -> QUEUED : passed all gates, ready for the dispatch cron.",
+        "QUEUED -> SENDING : claimed by cron (lockedUntil = now + 2min, attemptCount += 1).",
+        "SENDING -> SENT : Resend accepted, providerMessageId stored.",
+        "SENDING -> QUEUED : transient error (5xx / network / 429). nextAttemptAt = now + backoff[attemptCount]; backoff = [1m,5m,15m,60m,6h].",
+        "SENDING -> QUEUED : lease expired (cron invocation died) — recovered by retry-sweep, attemptCount already incremented so it cannot loop forever.",
+        "SENDING -> FAILED : permanent 4xx (invalid address, blocked domain) OR attemptCount >= 5. Terminal.",
+        "SENT -> DELIVERED : webhook email.delivered.",
+        "SENT -> DELAYED : webhook email.delivery_delayed. May still reach DELIVERED or BOUNCED.",
+        "SENT|DELAYED -> BOUNCED : webhook email.bounced. Hard bounce also writes EmailSuppression(scope=ALL). Terminal.",
+        "DELIVERED|SENT -> COMPLAINED : webhook email.complained. Writes EmailSuppression(scope=ALL, SPAM_COMPLAINT). Terminal.",
+        "PENDING|QUEUED -> CANCELED : parent broadcast canceled, or EVENT_CANCELED supersedes a not-yet-sent DEPOSIT_REQUIRED for the same event. Terminal.",
+        "FAILED|BOUNCED -> QUEUED : ONLY via admin manual resend (new idempotencyKey, attemptCount reset, audited)."
+      ]
+    },
+    {
+      "entity": "NotificationDelivery (IN_APP channel)",
+      "states": [
+        "PENDING",
+        "SENT",
+        "SKIPPED",
+        "CANCELED"
+      ],
+      "transitions": [
+        "PENDING -> SENT : created together with the Notification row in the same transaction — in-app delivery cannot fail.",
+        "PENDING -> SKIPPED : category inAppEnabled=false AND priority != CRITICAL.",
+        "PENDING -> CANCELED : broadcast canceled before the inbox row was written."
+      ]
+    },
+    {
+      "entity": "Broadcast",
+      "states": [
+        "DRAFT",
+        "SCHEDULED",
+        "EXPANDING",
+        "SENDING",
+        "COMPLETED",
+        "PARTIALLY_FAILED",
+        "CANCELED",
+        "BLOCKED",
+        "AUTO_FLAGGED(moderation sub-state)"
+      ],
+      "transitions": [
+        "DRAFT -> SCHEDULED : scheduledAt set in the future (KST-entered).",
+        "DRAFT|SCHEDULED -> BLOCKED : leak scanner AUTO_FLAGGED and admin moderates to BLOCKED. Terminal; partner receives a 쪽지 explaining why.",
+        "DRAFT|SCHEDULED -> EXPANDING : send() called, or scheduledAt reached and moderationState in (NOT_REQUIRED, APPROVED).",
+        "EXPANDING -> EXPANDING : chunked cursor advance, 2,000 recipients per pass, resumable across invocations.",
+        "EXPANDING -> SENDING : cursor exhausted, audienceSnapshotCount frozen.",
+        "SENDING -> COMPLETED : every BroadcastRecipient is CREATED or SKIPPED and no EMAIL delivery is still retryable.",
+        "SENDING -> PARTIALLY_FAILED : at least one delivery reached FAILED/BOUNCED. Still terminal; admin sees the breakdown and may resend individually.",
+        "SCHEDULED|EXPANDING|SENDING -> CANCELED : explicit cancel. Already-created in-app rows are NOT retracted (they were delivered); pending emails go CANCELED.",
+        "* -> CANCELED : owning event is deleted/canceled and the broadcast is still pending."
+      ]
+    },
+    {
+      "entity": "NotificationOutbox",
+      "states": [
+        "PENDING",
+        "CLAIMED",
+        "EXPANDED",
+        "FAILED",
+        "SKIPPED"
+      ],
+      "transitions": [
+        "(created inside the domain transaction) -> PENDING",
+        "PENDING -> CLAIMED : lease taken by outbox-drain cron.",
+        "CLAIMED -> EXPANDED : Notification + Delivery rows created. Terminal.",
+        "CLAIMED -> PENDING : lease expired or transient error; attemptCount += 1, availableAt = now + backoff.",
+        "CLAIMED -> FAILED : attemptCount >= 5 or payload fails schema validation (should be impossible — validated at write — so this pages an admin).",
+        "PENDING -> SKIPPED : superseded by a newer row with the same coalesceKey, or the underlying entity no longer justifies the notification (e.g. DEPOSIT_REQUIRED whose hold was already paid before the drain ran, EVENT_CANCELED already sent). Terminal."
+      ]
+    },
+    {
+      "entity": "Notification read state",
+      "states": [
+        "UNREAD",
+        "READ",
+        "ARCHIVED",
+        "PURGED"
+      ],
+      "transitions": [
+        "UNREAD -> READ : PATCH /notifications/:id/read, opening the detail view, or read-all.",
+        "UNREAD|READ -> ARCHIVED : user archives.",
+        "ARCHIVED -> UNREAD : a CRITICAL row whose underlying deadline is still in the future is re-surfaced on next inbox load (lazy).",
+        "READ|ARCHIVED -> PURGED : retention sweep (row deleted)."
+      ]
+    }
+  ],
+  "businessRules": [
+    "ENQUEUE IS TRANSACTIONAL. Every domain service writes its NotificationOutbox row inside the same Prisma `$transaction` as the state mutation. If the application insert rolls back, no notification exists. Corollary: never call Resend synchronously inside a request handler — a slow provider must not slow down or fail an application submit.",
+    "EFFECTIVELY-ONCE VIA dedupeKey. Every Notification carries a deterministic `dedupeKey`; inserts use `createMany({ skipDuplicates: true })`. Key recipes: `APPLICATION_RECEIVED:{applicationId}`, `DEPOSIT_REQUIRED:{depositHoldId}`, `DEPOSIT_CONFIRMED:{depositHoldId}`, `DEPOSIT_HOLD_EXPIRED:{depositHoldId}`, `REBID_ROLLED_BACK:{bidHistoryId}`, `DEADLINE_EXTENDED:{eventId}:{recipientId}:{extensionSeq}`, `SELECTION_FINALIZED:{eventId}:{applicationId}:{finalizationSeq}`, `BROADCAST:{broadcastId}:{recipientId}`. A retried cron, a double-clicked button, and a duplicated webhook all converge on one row.",
+    "CHANNEL ROUTING ORDER (evaluated per recipient per channel, in this exact order, at dispatch time not enqueue time): (1) recipient account active? (2) feature flag for the type on? (3) priority == CRITICAL → send regardless of preference, but still honor SuppressionScope.ALL; (4) category mandatory? → ignore per-category opt-out; (5) UserNotificationSettings.emailGloballyEnabled; (6) NotificationPreference[category].emailEnabled; (7) category == MARKETING → require marketingConsentAt non-null and not withdrawn; (8) EmailSuppression lookup by address; (9) quiet hours (marketing only). Every negative outcome writes a SKIPPED delivery with a skipReason — never a silent drop.",
+    "MANDATORY CATEGORIES (cannot be opted out of on any channel): APPLICATION, DEPOSIT, RESULT, EVENT_CHANGE, ACCOUNT. Optional: MESSAGE, PARTNER_OPS, ANNOUNCEMENT, MARKETING. Rationale: DEPOSIT_REQUIRED has a money-losing deadline attached; a user who opted out and lost their slot is a support and trust disaster.",
+    "CRITICAL priority set: DEPOSIT_REQUIRED, DEPOSIT_HOLD_EXPIRED, REBID_ROLLED_BACK, EVENT_CANCELED, SELECTION_FINALIZED_SELECTED. These always go to both IN_APP and EMAIL.",
+    "QUIET HOURS apply to MARKETING and ANNOUNCEMENT only, 21:00–08:00 KST, and require nightMarketingConsentAt to send within that window. Non-marketing notifications are never delayed — a deposit window that opens at 23:50 must notify at 23:50.",
+    "ALL USER-FACING TIMES ARE RENDERED IN Asia/Seoul BY THE SERVER, never by the client and never as a raw ISO string. Formatter contract: same-day → '오늘 오후 11시 50분', next-day → '내일 오전 0시 10분', otherwise → '8월 3일(일) 오후 11시 50분'. Korea has no DST, but the boundary case 'expires 00:10 tomorrow' rendered as 'today' is the actual bug to guard — always compute the day label from the KST calendar date, not from a millisecond delta.",
+    "EMAILS CONTAIN ABSOLUTE DEADLINES, NEVER LIVE COUNTDOWNS. Email body says '2026년 7월 27일(월) 오후 11시 50분까지 결제해 주세요 (한국시간)'. Only the in-app card renders a ticking countdown, computed client-side from `payload.holdExpiresAt` (ISO UTC) — and the client clamps at 00:00 and re-fetches rather than going negative.",
+    "NO-LEAK PAYLOAD WHITELIST. Each NotificationType has a zod schema in packages/shared enumerating exactly which fields may appear. For every user-facing BID type the schema forbids: cutoffAmount, rank, myRank, competitorAmount, amountDistribution, selectedCount-with-amounts. `applicantCount` and `capacity` ARE allowed (the competition ratio is already public). `myAmount` IS allowed (it's the user's own). Template activation additionally validates that every {{var}} is in allowedVariables — a leak requires defeating both gates.",
+    "SELECTION_FINALIZED_NOT_SELECTED COPY IS AMOUNT-FREE. It may say '아쉽게도 이번에는 선정되지 않았어요' and may state the user's OWN applied amount, but must not state the cutoff, the winning range, how close they were, or their rank. Explicitly banned phrasings are unit-tested against the seeded template ('아깝게 {{n}}등', '{{n}}원만 더').",
+    "VISIBILITY GUARD AT RENDER TIME. Even though rank/cutoff are absent from MVP payloads, the renderer calls `VisibilityGuard.assertAllowed(eventVisibilitySettings, referencedVariables)` before producing output. When the product later flips `showCutoffAmount` or `showMyRank` per event, the only change needed is adding those fields to the payload schema and the template's allowedVariables — the guard already gates them per event. Guard is bypassed only for recipientRole in (PARTNER-owner, ADMIN).",
+    "PARTNER MESSAGES ARE THE REAL LEAK VECTOR — free text can say '현재 1위는 50만원입니다'. Mitigations, all applied: (a) partner→applicant broadcasts on an event whose mode is BID and whose status is OPEN run a lexical scanner (won-amount patterns \\d{1,3}(,\\d{3})*원 / 만원, plus keywords 커트라인, 컷, 최고가, 1위, 등수, 순위, 상위) and are set to AUTO_FLAGGED → PENDING_REVIEW rather than sent; (b) the compose UI shows a standing warning '신청 금액·순위·커트라인은 안내할 수 없어요'; (c) sent messages are retained and admin-searchable; (d) repeated BLOCKED decisions feed partner moderation in the Admin context. After the deadline (event CLOSED/FINALIZED) the scanner drops to warn-only, since amounts are no longer competitively sensitive.",
+    "PARTNER RECIPIENT PREVIEW RETURNS A COUNT, NOT A LIST. The messaging screen never exposes applicant emails. Partners see identities and amounts only on their own ranked-list screen (a different context, different authorization), and the messaging context never joins to email addresses in any response DTO.",
+    "PARTNERS MAY NOT SEND MARKETING. Their broadcasts are always category=EVENT_CHANGE, always include IN_APP, and are rate-limited to 5 per event per rolling 24h and 20 per partner per 24h (429 with a Korean message and the reset time in KST).",
+    "ADMIN BROADCAST TO ALL_USERS REQUIRES A TYPED CONFIRMATION echoing the estimated recipient count, and is written to NotificationAuditLog before expansion starts. estimatedRecipients is recomputed at expansion; if it differs by >20% from the confirmed number the broadcast pauses and requires re-confirmation (guards against a segment filter that silently broke).",
+    "SOFT-CLOSE COALESCING. DEADLINE_EXTENDED uses coalesceKey `DEADLINE_EXTENDED:{eventId}` and availableAt = now + 120s. If the deadline is extended eight times in twenty minutes, the drain collapses the pending rows to the single newest payload — applicants get in-app updates at most every 2 minutes and, for EMAIL specifically, at most one per event per 30 minutes with the CURRENT deadline (an additional per-(eventId, recipientId, channel) throttle row). The email says '마감이 연장되었어요. 현재 마감: 오후 10시 45분 (한국시간)' — never 'extended by N minutes', which is meaningless after coalescing.",
+    "DEADLINE_EXTENDED IS NOT SENT TO A USER WHOSE OWN BID CAUSED THE EXTENSION at that instant — they already got REBID_ACCEPTED which states the new deadline. (Suppressed via `payload.triggeredByUserId` compared against recipientId during expansion.)",
+    "REBID FLOW COPY, three distinct types: REBID_ACCEPTED ('입찰 금액을 {{myAmount}}원으로 올렸어요'), REBID_DEPOSIT_SHORTFALL ('추가 예약금 {{shortfallAmount}}원을 {{deadlineKst}}까지 결제해 주세요. 결제하지 않으면 이전 금액으로 되돌아가요.'), REBID_ROLLED_BACK ('추가 예약금이 확인되지 않아 신청 금액이 {{previousAmount}}원으로 되돌아갔어요. 신청 자체는 그대로 유효해요.'). The rollback message must reassure that the application survives — otherwise users cancel in a panic.",
+    "DEPOSIT_REMINDER fires once per hold at max(holdCreatedAt + 1min, holdExpiresAt - 3min), only if still unpaid, only if windowMinutes >= 5 (a 3-minute window gets no reminder — the initial notice is enough). dedupeKey `DEPOSIT_REMINDER:{depositHoldId}`.",
+    "SUPERSESSION. Before creating a Notification the drain checks a small supersession table of rules: EVENT_CANCELED cancels pending DEPOSIT_REQUIRED/DEPOSIT_REMINDER/DEADLINE_EXTENDED for that event; DEPOSIT_CONFIRMED cancels a pending DEPOSIT_REMINDER for the same hold; SELECTION_FINALIZED_* cancels everything pending for that application. Cancellation flips the outbox row to SKIPPED and any PENDING delivery to CANCELED. This is what stops a user receiving '결제해 주세요' ten seconds after '행사가 취소되었어요'.",
+    "INSTANT vs BID COPY DIVERGES AT THE TYPE LEVEL, not with an if-branch inside one template. INSTANT success is APPLICATION_CONFIRMED_INSTANT ('예약이 확정되었어요!'); BID success is only APPLICATION_RECEIVED ('신청이 접수되었어요. 결과는 마감 후 안내드려요.'). Never tell a BID applicant anything that reads like confirmation.",
+    "OVERBOOKING IS NOT AN ERROR CONDITION FOR NOTIFICATIONS. If the partner's final-list edit removes someone who previously received APPLICATION_CONFIRMED_INSTANT, we send SELECTION_REVISED_BY_PARTNER with apologetic copy and a refund notice — we do not retract or delete the original notification. The inbox is an append-only record of what the user was told.",
+    "RESEND BATCHING. The dispatch cron groups up to 100 deliveries per Resend batch call, but sets a per-delivery Idempotency-Key. Partial batch failures are mapped back per index; an ambiguous whole-batch timeout leaves rows in SENDING, and the retry sweep re-sends with the SAME idempotency key so Resend dedupes rather than double-mailing.",
+    "BACKOFF AND CAP: attempts [1m, 5m, 15m, 60m, 6h], maxAttempts 5. A delivery older than 24h is FAILED regardless of attempt count — a 'you must pay in 10 minutes' email arriving 26 hours late is worse than no email.",
+    "LIST-UNSUBSCRIBE HEADERS on every non-CRITICAL email: `List-Unsubscribe: <https://dibs.kr/unsubscribe?t=TOKEN>, <mailto:unsubscribe@dibs.kr?subject=TOKEN>` plus `List-Unsubscribe-Post: List-Unsubscribe=One-Click`. CRITICAL transactional mail omits marketing unsubscribe but still carries a footer link to 알림 설정.",
+    "UNSUBSCRIBE TOKENS ARE HMAC-SIGNED, SCOPED, AND EXPIRING (180d), and the landing page is idempotent and non-enumerable: an invalid, expired, or already-used token all render the same neutral Korean page. A valid token grants ONLY the ability to reduce that user's notifications — never to read their data.",
+    "SUPPRESSION IS ADDRESS-KEYED AND OUTLIVES ACCOUNTS. Scope ALL blocks even CRITICAL mail (legal/deliverability requirement after a spam complaint) — in that case the in-app notification still lands and the app shows a persistent banner '이메일 발송이 중단된 상태예요. 알림 설정에서 확인해 주세요.'",
+    "RETENTION: Notification rows 12 months, then purged. NotificationDelivery 12 months with `toAddress` anonymized at 6 months. ProviderWebhookEvent payload nulled at 90 days, row kept for dedupe. Broadcast + BroadcastRecipient kept 24 months (audit). NotificationAuditLog 5 years.",
+    "CRON AUTH: every /cron/* route requires the `Authorization: Bearer $CRON_SECRET` header (Vercel Cron injects it). Never rely on IP allowlisting; these routes create and send email and are the highest-value target on the platform.",
+    "RATE LIMIT ON READ ENDPOINTS: /notifications/unread-count is polled by every open tab. 60 req/min/user, Cache-Control private max-age=10, and the SSE stream is preferred. Exceeding the limit degrades to a 200 with a stale count rather than a 429 (a badge is not worth an error toast).",
+    "SELF-NOTIFICATION SUPPRESSION: a partner who applies to their own event (if allowed by the Events context) does not receive PARTNER_EVENT_MESSAGE from themselves; a user's own action never generates a notification to themselves except the confirmations listed above."
+  ],
+  "edgeCases": [
+    "CRON OVERLAP / DOUBLE-SEND: two Vercel Cron invocations run concurrently (or a slow one overruns the next tick). Handled by lease-based claiming (`status='CLAIMED', claimedUntil=now()+2min ... FOR UPDATE SKIP LOCKED`) plus the dedupeKey unique index. Never rely on 'cron runs once' — Vercel does not guarantee it.",
+    "INVOCATION KILLED MID-BATCH: rows sit in SENDING with an expired lockedUntil. retry-sweep re-queues them; the unchanged Idempotency-Key means Resend suppresses the duplicate if the first call actually landed. The user might still see a duplicate if the provider's idempotency window has lapsed — accepted, and preferable to a lost deposit notice.",
+    "WEBHOOK ARRIVES BEFORE THE DELIVERY ROW IS COMMITTED (Resend is fast, our transaction is slow): the webhook can't find providerMessageId. Store the ProviderWebhookEvent unprocessed and let a reconciliation pass retry for 15 minutes before logging an orphan. Never 500 back to Resend for this — it triggers provider-side retry storms.",
+    "WEBHOOK REPLAY / FORGED WEBHOOK: unsigned or bad-signature requests are rejected before JSON parsing; replays hit the unique (provider, providerEventId) and return 200 with no side effects. Critically, a forged 'complained' event would suppress a user's email — signature verification is not optional.",
+    "DOUBLE-SUBMIT ON APPLY: user double-clicks 신청. The Applications context dedupes the application; even if two outbox rows are written, `APPLICATION_RECEIVED:{applicationId}` collapses them. If two distinct applications somehow exist, that's an Applications-context bug and the user correctly gets two notices.",
+    "SOFT-CLOSE NOTIFICATION STORM: a sniper raises their bid every 60 seconds in the final window, extending the deadline each time. Without coalescing, 300 applicants x 20 extensions = 6,000 emails. Coalescing (2-minute collapse, 30-minute per-recipient email throttle) caps it. Additional guard: an absolute cap of 10 DEADLINE_EXTENDED emails per event lifetime, after which only in-app updates continue and the email says '마감 시간이 계속 조정되고 있어요. 앱에서 확인해 주세요.'",
+    "EXTENSION-THEN-NO-EXTENSION RACE: the coalesced email is sent 2 minutes after the last extension, by which time another extension already happened — the email states a deadline that is already stale. Mitigation: render the deadline from a FRESH read of the event at dispatch time, not from the frozen payload, for this one type. If the event has since closed, downgrade to '마감되었어요' or skip.",
+    "DEPOSIT EXPIRY vs PAYMENT RACE: the sweeper marks the hold expired at T while the user's payment commits at T-1ms. Both DEPOSIT_HOLD_EXPIRED and DEPOSIT_CONFIRMED get enqueued. Resolution: the drain re-reads the hold's authoritative status before rendering and SKIPs whichever contradicts it; the ordering guarantee comes from the DB row, not from outbox insertion order. Additionally, DEPOSIT_HOLD_EXPIRED enqueues with availableAt = now + 30s to give the confirm path time to win.",
+    "DEPOSIT WINDOW SHORTER THAN EMAIL LATENCY: an event configured with windowMinutes = 2 means the email may arrive with 40 seconds left. Rule: enforce a minimum windowMinutes of 5 at event creation (Events context), and if a sub-5-minute window ever exists, skip the email entirely (skipReason WINDOW_TOO_SHORT) and rely on the in-app modal — a useless-by-arrival email generates support load and spam complaints.",
+    "REBID RACE AT THE INSTANT OF ROLLBACK: user pays the shortfall at the same moment the rollback sweeper fires. Same re-read-before-render rule; REBID_ROLLED_BACK is suppressed if the bid's current amount equals the raised amount. A wrongly-sent rollback notice is uniquely damaging because the user may then re-raise and pay twice.",
+    "USER RAISES, ROLLS BACK, RAISES AGAIN TO THE SAME AMOUNT: three notifications with distinct bidHistoryId dedupeKeys — correct, they are genuinely three events. But add a per-user throttle of 10 REBID_* emails per event per day to stop a user self-spamming (and burning our Resend quota) by raising 1원 at a time.",
+    "MICRO-RAISE SPAM AS A DENIAL-OF-SERVICE ON OUR EMAIL QUOTA: a user raises 500 times to generate 500 emails. Covered by the per-user per-event throttle above plus a global per-user cap of 50 emails/day (excluding CRITICAL); overflow becomes in-app-only with skipReason RATE_LIMITED.",
+    "NOT-SELECTED NOTIFICATION LEAKS THE CUTOFF BY IMPLICATION: if we send SELECTED at 10:00 and NOT_SELECTED at 10:05, a user who compares timestamps with a friend learns nothing about amounts — fine. But if we batch NOT_SELECTED in rank order, timing itself becomes a rank oracle. Mitigation: shuffle the recipient ordering within a finalization batch and dispatch all results within one cron tick where possible.",
+    "EVENT CANCELED WHILE A PARTNER BROADCAST IS MID-EXPANSION: expansion checks event status each chunk and aborts to CANCELED, so half the applicants don't get '내일 뵙겠습니다' for a canceled event.",
+    "PARTNER LOSES APPROVAL (admin revokes) BETWEEN COMPOSE AND SEND: expansion re-checks `partner.approvalStatus === APPROVED` every chunk; on failure the broadcast goes BLOCKED and the partner gets a 쪽지.",
+    "PARTNER CHANGES THE STATUS FILTER TO REACH USERS WHO CANCELED: allowed statuses are validated server-side against a whitelist; CANCELED and EXPIRED applicants are excluded by default and can only be targeted by ADMIN. Otherwise 쪽지 becomes a re-marketing channel to people who left.",
+    "APPLICANT CANCELS BETWEEN EXPANSION AND DELIVERY: they still receive the message (BroadcastRecipient was snapshotted). Accepted and documented — `applicationStatusAtSend` records why. Reverse case (applies after expansion started) means they miss it; the partner's UI states '발송 시점 기준 신청자에게 전송돼요'.",
+    "TIMEZONE: a partner in a non-KST locale sets scheduledAt via a browser datetime picker. The API accepts ONLY ISO-8601 with an explicit offset, and the UI always shows 'KST' next to the field; a naive local string is rejected 422. Midnight-boundary labels ('오늘'/'내일') are computed from the KST calendar date to avoid '오늘 오전 0시 10분' meaning tomorrow.",
+    "LEAP/EDGE FORMATTING: 오후 12시 vs 오전 12시 confusion. Use '낮 12시' and '밤 12시' in Korean copy for the two noon/midnight cases; a deposit deadline of '오전 12시' is genuinely ambiguous to many readers.",
+    "USER CHANGES THEIR GOOGLE EMAIL MID-FLOW: deliveries snapshot toAddress at dispatch, so a pending email goes to the address current at dispatch time, not at enqueue time — correct. Suppressions keyed on the OLD address do not follow them, which is intended.",
+    "TWO ACCOUNTS SHARE ONE MAILBOX (personal + partner Google accounts aliasing to the same inbox): they are separate users with separate preferences but one address. A suppression on that address silently kills both. The admin suppression console must show all userIds mapping to an address so support can explain it.",
+    "UNSUBSCRIBE TOKEN ENUMERATION: an attacker brute-forces tokens to mass-unsubscribe users. HMAC-SHA256 over a server secret makes forgery infeasible; additionally rate-limit /unsubscribe to 10/min/IP and log failures. Never include userId in plaintext in the URL.",
+    "GMAIL PREFETCHES ONE-CLICK LINKS / SECURITY SCANNERS FOLLOW LINKS: never put a state-changing GET behind an emailed link. GET /unsubscribe only renders a confirm page; the mutation is POST (and the RFC 8058 POST is the only auto-fired one, which is intentional and idempotent).",
+    "EMAIL CLIENT CLIPPING: Gmail clips at ~102KB. Keep templates lean and put the deadline and CTA in the first viewport; never rely on content below a long footer.",
+    "SPAM FOLDER FOR THE ONE EMAIL THAT MATTERS: a DEPOSIT_REQUIRED landing in spam costs the user their slot. Mitigations: dedicated authenticated sending domain (SPF/DKIM/DMARC), transactional and marketing sent from DIFFERENT subdomains so a marketing complaint doesn't poison transactional reputation, no link shorteners, and the in-app path is always sufficient on its own.",
+    "MASS-SEND HITS THE 60s FUNCTION LIMIT: never loop 50,000 recipients in one invocation. Chunked expansion (2,000/pass) with a 45s wall-clock guard and a persisted cursor. A 50k broadcast completes over ~25 cron ticks; the admin UI shows progress rather than pretending it's instant.",
+    "POSTGRES CONNECTION EXHAUSTION: many concurrent serverless invocations plus cron. Use Neon's pooled connection string for the API and a small explicit pool for cron routes; batch writes with createMany rather than per-recipient inserts.",
+    "ADMIN ACCIDENTALLY BROADCASTS TO ALL_USERS WITH A DRAFT BODY: typed-count confirmation + mandatory test-send-to-self before the send button enables + a 60-second CANCEL window during which status stays EXPANDING and no email has been dispatched (in-app rows are also withheld until the window passes).",
+    "NOTIFICATION FOR A DELETED EVENT: deep link 404s. Renderer stores a snapshot `eventTitle` in the payload so the inbox card still reads sensibly, and the detail view shows '종료되었거나 삭제된 행사예요'.",
+    "READ-ALL RACE: user taps 모두 읽음 while three new notifications arrive. Bounded by `createdAt <= beforeCursor` so the new ones stay unread rather than being silently swallowed.",
+    "XSS VIA PARTNER-AUTHORED 쪽지: bodyKo is stored raw but rendered as text (React escapes by default) and, for email, HTML-escaped then passed through a limited linkifier with an allowlist of schemes (https only) — no javascript:, no data:. deepLinkPath from a message is always ignored (partners cannot set deep links)."
+  ],
+  "terms": [
+    {
+      "technical": "Notification (in-app, system-generated)",
+      "userFriendlyKo": "알림"
+    },
+    {
+      "technical": "Message / DirectMessage (human-authored)",
+      "userFriendlyKo": "쪽지"
+    },
+    {
+      "technical": "Notification inbox",
+      "userFriendlyKo": "알림함 / 쪽지함"
+    },
+    {
+      "technical": "Unread",
+      "userFriendlyKo": "읽지 않음"
+    },
+    {
+      "technical": "Mark all as read",
+      "userFriendlyKo": "모두 읽음"
+    },
+    {
+      "technical": "Archive",
+      "userFriendlyKo": "보관하기"
+    },
+    {
+      "technical": "Notification preferences",
+      "userFriendlyKo": "알림 설정"
+    },
+    {
+      "technical": "Email notifications",
+      "userFriendlyKo": "이메일 받기"
+    },
+    {
+      "technical": "Mandatory notification",
+      "userFriendlyKo": "필수 알림 (끌 수 없어요)"
+    },
+    {
+      "technical": "Marketing / promotional",
+      "userFriendlyKo": "혜택·소식 알림"
+    },
+    {
+      "technical": "Unsubscribe",
+      "userFriendlyKo": "수신 거부"
+    },
+    {
+      "technical": "Quiet hours (night marketing)",
+      "userFriendlyKo": "야간 광고 수신 (오후 9시~오전 8시)"
+    },
+    {
+      "technical": "APPLICATION_RECEIVED",
+      "userFriendlyKo": "신청이 접수되었어요"
+    },
+    {
+      "technical": "APPLICATION_CONFIRMED_INSTANT",
+      "userFriendlyKo": "예약이 확정되었어요!"
+    },
+    {
+      "technical": "DEPOSIT_REQUIRED",
+      "userFriendlyKo": "예약금 결제가 필요해요"
+    },
+    {
+      "technical": "DEPOSIT_REMINDER",
+      "userFriendlyKo": "곧 결제 시간이 끝나요"
+    },
+    {
+      "technical": "DEPOSIT_CONFIRMED",
+      "userFriendlyKo": "예약금 결제가 확인되었어요"
+    },
+    {
+      "technical": "DEPOSIT_HOLD_EXPIRED",
+      "userFriendlyKo": "결제 시간이 지나 신청이 취소되었어요"
+    },
+    {
+      "technical": "Deposit hold window",
+      "userFriendlyKo": "결제 대기 시간"
+    },
+    {
+      "technical": "Deposit",
+      "userFriendlyKo": "예약금"
+    },
+    {
+      "technical": "REBID_ACCEPTED",
+      "userFriendlyKo": "신청 금액이 변경되었어요"
+    },
+    {
+      "technical": "REBID_DEPOSIT_SHORTFALL",
+      "userFriendlyKo": "추가 예약금 결제가 필요해요"
+    },
+    {
+      "technical": "REBID_ROLLED_BACK",
+      "userFriendlyKo": "신청 금액이 이전 금액으로 되돌아갔어요"
+    },
+    {
+      "technical": "DEADLINE_EXTENDED (soft close)",
+      "userFriendlyKo": "마감 시간이 연장되었어요"
+    },
+    {
+      "technical": "SELECTION_FINALIZED_SELECTED",
+      "userFriendlyKo": "축하해요! 선정되었어요"
+    },
+    {
+      "technical": "SELECTION_FINALIZED_NOT_SELECTED",
+      "userFriendlyKo": "아쉽게도 이번에는 선정되지 않았어요"
+    },
+    {
+      "technical": "SELECTION_REVISED_BY_PARTNER",
+      "userFriendlyKo": "선정 결과가 변경되었어요"
+    },
+    {
+      "technical": "EVENT_CANCELED",
+      "userFriendlyKo": "행사가 취소되었어요"
+    },
+    {
+      "technical": "EVENT_CLOSED_CAPACITY_REACHED",
+      "userFriendlyKo": "정원이 모두 찼어요"
+    },
+    {
+      "technical": "DEPOSIT_REFUND_SCHEDULED",
+      "userFriendlyKo": "예약금 환불이 예정되어 있어요"
+    },
+    {
+      "technical": "PARTNER_EVENT_MESSAGE",
+      "userFriendlyKo": "주최자가 보낸 쪽지"
+    },
+    {
+      "technical": "ADMIN_ANNOUNCEMENT",
+      "userFriendlyKo": "딥스 공지"
+    },
+    {
+      "technical": "Broadcast (admin)",
+      "userFriendlyKo": "단체 발송"
+    },
+    {
+      "technical": "Partner → applicants message",
+      "userFriendlyKo": "신청자에게 쪽지 보내기"
+    },
+    {
+      "technical": "Audience / segment",
+      "userFriendlyKo": "받는 분"
+    },
+    {
+      "technical": "Recipient count",
+      "userFriendlyKo": "받는 분 000명"
+    },
+    {
+      "technical": "Delivery failed / bounced",
+      "userFriendlyKo": "이메일 발송에 실패했어요"
+    },
+    {
+      "technical": "Sender (partner)",
+      "userFriendlyKo": "주최자"
+    },
+    {
+      "technical": "Admin sender label",
+      "userFriendlyKo": "딥스 운영팀"
+    },
+    {
+      "technical": "Competition ratio (in notification copy)",
+      "userFriendlyKo": "정원 10명 / 신청 47명 (4.7:1)"
+    },
+    {
+      "technical": "KST time suffix in emails",
+      "userFriendlyKo": "(한국시간)"
+    }
+  ],
+  "openQuestions": [
+    "Email template authoring: React Email components checked into `packages/shared` (type-safe, previewable in CI, requires a deploy to change copy) vs DB-stored HTML editable by 운영자 (no deploy, but XSS and breakage risk)? My recommendation is React Email for layout + DB-stored copy strings for text, but this is a real operations-vs-safety tradeoff that needs a product call.",
+    "Open/click tracking: enabling it means embedding a tracking pixel and rewriting links, which under PIPA arguably requires disclosure and possibly consent. Do we want deliverability analytics enough to take that on for MVP? Default proposal: OFF for transactional, OFF entirely in MVP.",
+    "Sending domain strategy: do we have a domain yet, and can we get separate subdomains (e.g. mail.dibs.kr for transactional, news.dibs.kr for marketing) with independent DKIM? This materially affects whether a marketing complaint can kill deposit emails.",
+    "Resend plan limits: what is our monthly volume ceiling and per-second rate limit? A single 50k ALL_USERS broadcast plus a hot BID event's deposit traffic could exceed a starter tier. The dispatch cron needs a configured tokens-per-minute budget.",
+    "Is KakaoTalk 알림톡 in scope later? Korean users overwhelmingly expect it for time-critical deposit deadlines, and email open rates for this demographic are poor. If yes, NotificationChannel should get KAKAO_ALIMTALK now and templates need pre-approval lead time (Kakao reviews each template).",
+    "Should partners receive per-application notifications in real time (PARTNER_NEW_APPLICATION) or only a digest? A popular INSTANT event could fire hundreds. Proposal: digest every 30 minutes plus an immediate notice at 80% and 100% capacity — needs confirmation.",
+    "When the deposit feature flag is OFF, is APPLICATION_RECEIVED alone sufficient for BID mode, or does the user need an explicit '결과는 마감 후 안내드려요' follow-up as the deadline approaches? A reminder-before-deadline type could help re-bidding but also feels like nagging.",
+    "Retention: 12 months for notifications was my assumption. Is there a legal or business retention requirement for 쪽지 between partners and users (e.g. dispute evidence for a no-show)? That would argue for 3–5 years on PARTNER_MESSAGE specifically.",
+    "Who is legally the sender of a partner→applicant email — Dibs or the partner business? This affects the From/Reply-To, the footer's business registration info (전자상거래법 표시 의무), and who owns spam liability. Proposal: From is Dibs, Reply-To is the partner's business email, footer names both.",
+    "Can a user reply to a 쪽지? Currently the model is send-only (no thread). If two-way is needed (likely for '몇 시에 도착하면 되나요'), we need a MessageThread entity and a moderation/abuse story, which roughly doubles this context.",
+    "Should SELECTION_FINALIZED_NOT_SELECTED be sent at all, or is silence kinder? Catchtable-style products usually do notify. If we notify, do we include a '다음 행사 보러가기' CTA — and does that count as marketing requiring consent? My reading is no (it's transactional context), but worth a legal check.",
+    "Do we need an in-app 'notification center' badge count that includes 쪽지 from partners of events the user already attended (post-event follow-ups)? That determines whether partners can message applicants of a CLOSED event indefinitely, which is a re-marketing surface we may want to time-box (e.g. 30 days after the service date).",
+    "Admin segment builder scope: the SEGMENT audience kind currently sketches region/category/lastActiveAfter/hasAppliedSince. Is that the actual MVP need, or is ALL_USERS + ALL_PARTNERS + EVENT_APPLICANTS enough? Building a real segment engine is a week of work I would rather defer.",
+    "Failure escalation: when the dispatch cron fails repeatedly or the outbox backlog exceeds a threshold, who gets paged and how? There is no notification channel for the notification system itself. Proposal: a Slack/Discord webhook plus a /admin/notifications/health endpoint, but the on-call story needs an owner."
+  ]
+}

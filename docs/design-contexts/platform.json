@@ -1,0 +1,1189 @@
+{
+  "context": "BOUNDED CONTEXT: Platform / Infra / Deployment for \"Dibs\" (딥스).\n\nThis context owns NO business rules about bidding, ranking, or deposits. It owns the *runtime substrate* that the other contexts (Identity, Catalog/Event, Application/Bid, DepositHold, Notification, Search) plug into: monorepo layout, the NestJS-on-Vercel serverless adapter, Prisma/Neon connection strategy, blob storage, transactional outbox + Resend delivery, Vercel Cron sweepers, SSE/polling for 경쟁률, config/feature flags, env vars, CI/CD, and the dev workflow.\n\n=====================================================================\n1. TURBOREPO LAYOUT (concrete)\n=====================================================================\ndibs/\n  turbo.json\n  pnpm-workspace.yaml            # pnpm@9, node 20.x pinned via \"engines\" + .nvmrc\n  package.json                   # private, workspaces: apps/*, packages/*\n  .github/workflows/ci.yml\n  vercel.json                    # ONLY in apps/web and apps/api (see below)\n  apps/\n    web/                         # Next.js 15 App Router, Vercel project \"dibs-web\"\n      app/\n        (public)/                # 홈, 이벤트 목록/상세, 파트너/매장\n        (auth)/login/\n        (user)/my/               # 내 신청 내역\n        (partner)/partner/       # 매장/이벤트 관리, 신청자 목록, 최종 확정 명단\n        (admin)/admin/           # 승인, 쪽지 발송, 크론 대시보드, 플래그\n        api/                     # ⚠️ ONLY Next-native routes: /api/auth/callback (cookie set),\n                                 #    /api/blob/upload (Vercel Blob client-token handler),\n                                 #    /api/revalidate. Everything else proxies to apps/api.\n      components/ui/             # shadcn/ui\n      lib/{api-client.ts,sse.ts,auth.ts,kst.ts}\n      next.config.ts             # rewrites: /bff/:path* -> ${API_ORIGIN}/:path*\n    api/                         # NestJS 11, Vercel project \"dibs-api\"\n      api/index.ts               # ⭐ THE single Vercel serverless entry (see §2)\n      src/\n        main.ts                  # local-only bootstrap (listen 4000)\n        app.module.ts\n        bootstrap.ts             # createNestServer(): shared by main.ts + api/index.ts\n        common/\n          prisma/{prisma.module.ts,prisma.service.ts}\n          config/{env.schema.ts,config.module.ts}   # zod-validated process.env\n          feature-flags/{flags.service.ts,flags.controller.ts}\n          idempotency/{idempotency.guard.ts,idempotency.service.ts}\n          guards/{jwt.guard.ts,roles.guard.ts,cron.guard.ts,rate-limit.guard.ts}\n          interceptors/{logging.interceptor.ts,serialize.interceptor.ts}\n          filters/all-exceptions.filter.ts\n          time/clock.service.ts  # ⭐ single source of \"now\"; KST helpers\n          outbox/{outbox.service.ts,outbox.module.ts}\n        modules/\n          auth/ identity/ venue/ event/ application/ bid/\n          deposit/ ranking/ notification/ search/ admin/\n          uploads/uploads.controller.ts        # issues Blob client tokens, records BlobAsset\n          realtime/ratio.controller.ts         # GET ratio + SSE stream\n          ops/\n            health.controller.ts\n            cron/\n              cron.module.ts\n              cron.controller.ts               # all /cron/* endpoints\n              jobs/expire-deposit-holds.job.ts\n              jobs/close-instant-events.job.ts\n              jobs/finalize-bid-rankings.job.ts\n              jobs/dispatch-outbox.job.ts\n              jobs/refresh-ratio-snapshots.job.ts\n              jobs/reap-blob-orphans.job.ts\n              jobs/purge-expired-data.job.ts\n      prisma/\n        schema.prisma            # ⭐ SINGLE schema for the whole platform, lives here\n        migrations/\n        seed.ts\n      vercel.json                # builds api/index.ts, crons[], maxDuration, regions:[\"icn1\"]\n      test/ (e2e, jest + testcontainers-postgres OR neon branch)\n  packages/\n    shared/                      # @dibs/shared — types, zod DTOs, enums, KST utils\n      src/{enums,dto,constants,time,errors}/index.ts\n      package.json               # \"exports\": \"./src/index.ts\", NOT prebuilt (tsx/transpile)\n    db/                          # @dibs/db — re-exports generated PrismaClient + singleton\n      src/client.ts\n    config/                      # @dibs/config — eslint, tsconfig, tailwind presets\n    emails/                      # @dibs/emails — react-email templates rendered by Resend\n\nturbo.json pipeline:\n  \"db:generate\" (no cache, outputs node_modules/.prisma) -> dependsOn of \"build\" and \"dev\"\n  \"build\": dependsOn [\"^build\",\"db:generate\"], outputs [\".next/**\",\"dist/**\"]\n  \"lint\",\"typecheck\",\"test\": dependsOn [\"^build\"]\n  Vercel: both projects use `turbo run build --filter=web...` / `--filter=api...` with\n  Remote Caching enabled (TURBO_TOKEN/TURBO_TEAM env on Vercel) and Ignored Build Step\n  = `npx turbo-ignore` so untouched apps skip redeploy.\n\nTwo Vercel projects, one repo, one Git remote. Root Directory = apps/web and apps/api\nrespectively. Custom domains: dibs.kr (web), api.dibs.kr (api). Cookies scoped to\n.dibs.kr so the JWT cookie is shared (SameSite=Lax, Secure, HttpOnly, Domain=.dibs.kr).\n\n=====================================================================\n2. NESTJS AS A VERCEL SERVERLESS FUNCTION\n=====================================================================\napps/api/api/index.ts (the only function; catch-all route):\n\n  import { VercelRequest, VercelResponse } from '@vercel/node';\n  import { createNestServer } from '../src/bootstrap';\n  let cached: any;                       // module scope => survives warm invocations\n  export default async function handler(req: VercelRequest, res: VercelResponse) {\n    if (!cached) cached = await createNestServer();   // Express instance\n    return cached(req, res);\n  }\n\nbootstrap.ts uses `NestFactory.create(AppModule, new ExpressAdapter(expressApp))`,\n`app.init()` (NOT listen), `app.enableShutdownHooks()` is DISABLED on Vercel\n(no SIGTERM contract), global ValidationPipe with the shared zod pipe, global prefix\n'' (path routing is done by vercel.json rewrite `{\"source\":\"/(.*)\",\"destination\":\"/api\"}`).\n\nCold-start mitigation (concrete, in priority order):\n  a. Keep the function lean: `@nestjs/swagger` only loaded when NODE_ENV!=='production';\n     no `@nestjs/schedule`, no bull, no ioredis, no class-transformer-heavy graphs.\n  b. Lazy modules for rarely used code: `LazyModuleLoader` for admin broadcast + CSV export.\n  c. Prisma: `binaryTargets` unused — use `driverAdapters` preview + @prisma/adapter-neon\n     (HTTP/WS) so the query engine is WASM/JS and the bundle stays small; alternatively\n     engineType=\"binary\" pinned to rhel-openssl-3.0.x. Choose the adapter path (§3).\n  d. `includeFiles`/`outputFileTracingIncludes` in vercel.json for schema.prisma + wasm.\n  e. Region pinned to icn1 (Seoul) — same region as the Neon project, else every query\n     pays trans-Pacific RTT. This is the single biggest latency lever.\n  f. Fluid compute ON (Vercel) so one instance serves concurrent requests and the Nest\n     bootstrap amortizes; combined with the module-scope cache this makes cold starts rare.\n  g. A 4th cron `*/5 * * * *` GET /health/warm is a *fallback* only; do not rely on it.\n  h. maxDuration: 60s for /cron/*, 15s for everything else (declared per-route via\n     `export const config` is not available in Nest — so set function-level maxDuration=60\n     in vercel.json and enforce a soft 10s budget inside each job with ClockService).\n\nIdempotency + double-submit: global IdempotencyGuard on all POST/PATCH under\n/applications, /bids, /deposits. Client sends `Idempotency-Key` (uuid v4). Guard does\n`INSERT INTO \"IdempotencyKey\" ... ON CONFLICT DO NOTHING`; 0 rows affected => either\nreplay the stored response (if completed) or return 409 REQUEST_IN_FLIGHT. This is the\ninfra-level answer to double-tap on 신청하기 and is cheaper than any lock.\n\n=====================================================================\n3. PRISMA + VERCEL POSTGRES (NEON) POOLING\n=====================================================================\nThree URLs, all set in Vercel env:\n  DATABASE_URL        = neon POOLED (…-pooler.ap-southeast-1…/neondb?sslmode=require)\n                        + `?pgbouncer=true&connection_limit=1&connect_timeout=10&pool_timeout=10`\n  DIRECT_URL          = neon UNPOOLED — used by `datasource db { directUrl = env(\"DIRECT_URL\") }`\n                        for `prisma migrate deploy` and introspection ONLY.\n  DATABASE_URL_UNPOOLED = same as DIRECT_URL, used by the seed script and by any job that\n                        needs advisory locks (pgbouncer transaction mode drops session state).\n\nRules that follow from pgbouncer *transaction* pooling:\n  - `connection_limit=1` per serverless instance. Never raise it; instance count is the\n    scaling axis, not pool size.\n  - NO prepared-statement reliance, NO `SET LOCAL` outside a transaction, NO\n    `pg_advisory_lock` (session-scoped). If a job truly needs mutual exclusion use\n    `pg_advisory_xact_lock(hashtext('cron:expire-deposit-holds'))` INSIDE the tx — that is\n    transaction-scoped and pgbouncer-safe — or the CronJobRun row-lock pattern in §Rules.\n  - `prisma.$transaction([...])` interactive transactions: keep <5s, `timeout: 8000`,\n    `maxWait: 5000`, `isolationLevel: ReadCommitted` (default). The INSTANT capacity\n    statement is a single conditional UPDATE and needs no transaction at all.\n  - PrismaService is a module-scope singleton with `globalThis.__prisma` guard so HMR in\n    dev and warm invocations in prod reuse one client.\n  - Preferred: Prisma driver adapter `@prisma/adapter-neon` over WebSocket for\n    transactions + `neon()` HTTP for single statements. If ops prefers zero-preview-feature\n    risk for MVP, fall back to plain pgbouncer URL — decision recorded in Open Questions.\n  - Migrations run in CI (GitHub Actions) against DIRECT_URL *before* the Vercel promote,\n    never in a Vercel build step (build steps run concurrently and would race).\n\n=====================================================================\n4. VERCEL BLOB (images)\n=====================================================================\nClient-token upload flow (never proxy bytes through the Nest function — 4.5MB body limit):\n  1. Browser POST /bff/uploads/blob-token { kind, contentType, sizeBytes }\n  2. Nest validates role+quota, creates BlobAsset(status=PENDING, pathname=\n     `${kind}/${ownerId}/${ulid()}.${ext}`), returns a `handleUpload` client token with\n     `allowedContentTypes:['image/jpeg','image/png','image/webp']`, `maximumSizeInBytes`,\n     `addRandomSuffix:false`, `tokenPayload:{blobAssetId}`.\n  3. Browser `upload()` direct to Blob.\n  4. Blob calls `onUploadCompleted` webhook -> /uploads/blob-callback -> BlobAsset.status\n     = READY, url stored. (On localhost the callback cannot reach you; dev uses\n     `VERCEL_BLOB_DEV_TUNNEL` or a manual POST — documented in the dev workflow.)\n  5. Orphan reaper cron deletes BlobAsset rows stuck PENDING > 24h and their blobs.\nAccess: `access:'public'` (menu/venue photos are public anyway); business-registration\ndocuments (사업자등록증) go to a SEPARATE store with `access:'private'` + signed URLs, or\nif unavailable on the plan, to Blob with an unguessable pathname + no listing — flagged\nas an Open Question because it is PII-adjacent.\nImages served through `next/image` with `remotePatterns:[{hostname:'*.public.blob.vercel-storage.com'}]`.\n\n=====================================================================\n5. RESEND + TRANSACTIONAL OUTBOX\n=====================================================================\nNo notification is ever sent inline in a request. Domain code writes an OutboxEvent row\nin the SAME transaction as the state change. `dispatch-outbox` cron (every minute) claims\na batch with `FOR UPDATE SKIP LOCKED`, fans out to (a) in-app 쪽지/알림 rows and\n(b) Resend `batch.send` (max 100 per call), records EmailDelivery rows, and marks the\noutbox row SENT. Resend webhook (`/webhooks/resend`, svix-signature verified) updates\nEmailDelivery status to DELIVERED/BOUNCED/COMPLAINED; a bounce twice => User.emailOptOut.\nIdempotency toward Resend: pass the OutboxEvent.id as the Resend `idempotencyKey` header\nso a retried batch does not double-send.\nTemplates live in packages/emails (react-email); rendering happens in the API function,\nnot in Resend, so copy is versioned in git. All emails Korean, sender\n\"딥스 <noreply@dibs.kr>\", reply-to help@dibs.kr, footer with 수신거부 link.\n\n=====================================================================\n6. VERCEL CRON\n=====================================================================\napps/api/vercel.json:\n  \"crons\": [\n    {\"path\":\"/cron/expire-deposit-holds\",  \"schedule\":\"* * * * *\"},\n    {\"path\":\"/cron/close-instant-events\",  \"schedule\":\"* * * * *\"},\n    {\"path\":\"/cron/finalize-bid-rankings\", \"schedule\":\"* * * * *\"},\n    {\"path\":\"/cron/dispatch-outbox\",       \"schedule\":\"* * * * *\"},\n    {\"path\":\"/cron/refresh-ratio-snapshots\",\"schedule\":\"* * * * *\"},\n    {\"path\":\"/cron/reap-blob-orphans\",     \"schedule\":\"17 4 * * *\"},\n    {\"path\":\"/cron/purge-expired-data\",    \"schedule\":\"40 4 * * *\"}\n  ]\nNOTE: Vercel cron schedules are UTC and minute-level crons require Pro. \"17 4 * * *\" UTC\n= 13:17 KST. Cron is at-least-once and best-effort — it can skip a minute under load,\nso every job must be catch-up-shaped (process everything overdue, not \"the last minute\")\nand must be safely re-runnable. Lazy expiry-on-read is the correctness backstop; cron is\nthe liveness mechanism.\nAuth: Vercel sends `Authorization: Bearer ${CRON_SECRET}`. CronGuard does a\ntiming-safe compare AND (in production) additionally requires `x-vercel-cron` header\npresent OR the request to come from the same deployment. Endpoints are also callable by\nADMIN with a JWT for manual re-run from the ops dashboard.\n\n=====================================================================\n7. LIVE 경쟁률 (SSE + POLLING)\n=====================================================================\nTwo surfaces, one data source (EventRatioSnapshot, a denormalized read model):\n  GET /events/:id/ratio          -> {capacity, applicantCount, ratio, calculatedAt}\n                                    Cache-Control: public, s-maxage=5, stale-while-revalidate=25\n  GET /events/:id/ratio/stream   -> text/event-stream, Nest returns an Observable via\n                                    @Sse(); interval 5s; the handler self-terminates with a\n                                    `complete` event at 55s and sends `retry: 3000` so the\n                                    browser EventSource reconnects. This bounds function\n                                    duration on serverless and turns SSE into \"polling with\n                                    a nicer API\" — acceptable and cheap.\nClient (lib/sse.ts): use SSE when `document.visibilityState==='visible'` and the event is\nOPEN; otherwise fall back to 15s polling; back off to 60s when the tab is hidden; stop\nentirely when the event is CLOSED/FINALIZED. Hard cap: if `navigator.connection.saveData`\nor 3 consecutive stream errors, permanently downgrade to polling.\nSnapshot freshness: written synchronously (best-effort, non-blocking) on each successful\napplication AND recomputed authoritatively every minute by refresh-ratio-snapshots for\nevents whose `updatedAt` is stale. Only `applicantCount` and `capacity` ever leave the\nserver — amounts, ranks, cutoffs never appear in this payload (§Edge cases).\n\n=====================================================================\n8. ENV VARS (zod-validated at boot; boot fails loudly on missing)\n=====================================================================\nShared: NODE_ENV, APP_ENV(dev|preview|production), NEXT_PUBLIC_APP_URL, API_ORIGIN,\n  TZ=UTC (server always UTC; KST only at the presentation edge)\nDB: DATABASE_URL, DIRECT_URL, DATABASE_URL_UNPOOLED\nAuth: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_CALLBACK_URL, JWT_SECRET,\n  JWT_ACCESS_TTL=15m, JWT_REFRESH_TTL=30d, COOKIE_DOMAIN=.dibs.kr\nBlob: BLOB_READ_WRITE_TOKEN, BLOB_PRIVATE_RW_TOKEN(optional)\nEmail: RESEND_API_KEY, RESEND_WEBHOOK_SECRET, EMAIL_FROM, EMAIL_REPLY_TO,\n  EMAIL_SANDBOX_TO (preview/dev: rewrite every recipient to this address)\nCron: CRON_SECRET, CRON_BATCH_SIZE=200, CRON_TIME_BUDGET_MS=45000\nFlags: DEPOSIT_HOLD_ENABLED=false, SOFT_CLOSE_ENABLED=true, SSE_ENABLED=true,\n  MAINTENANCE_MODE=false, SEARCH_PROVIDER=postgres\nBuild/CI: TURBO_TOKEN, TURBO_TEAM, SENTRY_DSN, SENTRY_AUTH_TOKEN\nVercel-provided: VERCEL_ENV, VERCEL_GIT_COMMIT_SHA, VERCEL_URL, VERCEL_REGION\nRule: any variable read by apps/web in the browser MUST be NEXT_PUBLIC_ and must never\ncontain a secret. env.schema.ts has two schemas (serverEnv, publicEnv) and CI fails if a\nnon-public key is referenced from a 'use client' file (custom eslint rule).\n\n=====================================================================\n9. CI/CD + DEV WORKFLOW\n=====================================================================\nCI (GitHub Actions, on PR): pnpm install --frozen-lockfile -> turbo run lint typecheck\ntest build (remote cache) -> `prisma migrate diff --exit-code` guard that fails the PR if\nschema.prisma changed without a migration -> e2e against an ephemeral Neon branch created\nper PR (`neonctl branches create pr-${{github.event.number}}`), destroyed on close.\nDeploy: Vercel Git integration. Preview per PR (points at that PR's Neon branch via\nVercel env-per-branch). Production deploy is gated: a `migrate` job runs\n`prisma migrate deploy` against DIRECT_URL, then `vercel deploy --prod --prebuilt`.\nMigrations must be expand/contract (add nullable column -> backfill -> switch code ->\ndrop in a later release) because old and new function instances coexist during rollout.\nRollback: `vercel rollback` for code; migrations are never auto-rolled-back — forward-fix.\nLocal dev: `pnpm dev` -> turbo runs web(3000) + api(4000). DB options: (a) `docker compose\nup postgres` with DATABASE_URL=DIRECT_URL=localhost (no pgbouncer locally — accept the\ndifference, but run one pre-merge CI pass against a real Neon branch), or (b) a personal\nNeon branch. Crons locally: `pnpm cron:tick` shell script that curls every /cron/* with\nCRON_SECRET every 10s. Emails locally: RESEND_API_KEY unset => EmailTransport falls back\nto a `ConsoleTransport` that writes .eml files to apps/api/.mail/. Blob locally: real\nVercel Blob dev store (there is no local emulator) with pathname prefix `dev/${user}/`.\nSeed: `pnpm db:seed` creates 운영자 1, 파트너 3 (1 pending approval), 이용자 20, and\n6 events covering INSTANT/BID × deposit on/off × soft-close on/off.\nObservability: Sentry (@sentry/nextjs + @sentry/nestjs) with tracesSampleRate 0.1;\nstructured JSON logs via pino with requestId (from `x-vercel-id`), userId, eventId;\nVercel Log Drain optional. `/health` returns {status, commitSha, dbLatencyMs, flags}.",
+  "summary": "Implementation-ready Platform/Infra/Deployment design for Dibs: a two-project Turborepo (apps/web Next.js 15, apps/api NestJS) on Vercel with a single cached Express-adapter serverless entry, Prisma against a Neon pooled connection (connection_limit=1, directUrl for migrations), Vercel Blob client-token uploads, a transactional outbox drained into Resend, seven idempotent catch-up Vercel Cron sweepers guarded by CRON_SECRET and a CronJobRun lease, and a self-terminating 55-second SSE stream (with polling fallback) that exposes only 경쟁률 — plus infra entities for idempotency keys, feature flags, cron runs, outbox, email delivery, blob assets, audit log, and rate limiting.",
+  "entities": [
+    {
+      "name": "CronJobRun",
+      "description": "One row per attempted execution of a Vercel Cron job. Doubles as the distributed lease that prevents two concurrent invocations of the same job (Vercel can double-fire) and as the ops audit trail shown on the admin dashboard.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "jobName",
+          "type": "CronJobName",
+          "notes": "Indexed with startedAt DESC."
+        },
+        {
+          "name": "status",
+          "type": "CronRunStatus",
+          "notes": "RUNNING | SUCCEEDED | FAILED | SKIPPED_LOCKED | TIMED_OUT"
+        },
+        {
+          "name": "startedAt",
+          "type": "DateTime @default(now())",
+          "notes": "UTC always."
+        },
+        {
+          "name": "finishedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "leaseExpiresAt",
+          "type": "DateTime",
+          "notes": "startedAt + 5min. A new invocation may steal the lease only if now() > leaseExpiresAt, covering a function killed mid-run."
+        },
+        {
+          "name": "scannedCount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "affectedCount",
+          "type": "Int @default(0)",
+          "notes": "e.g. number of ApplicationDepositHold rows expired."
+        },
+        {
+          "name": "hasMore",
+          "type": "Boolean @default(false)",
+          "notes": "True when the batch cap was hit; ops dashboard surfaces sustained backlog."
+        },
+        {
+          "name": "durationMs",
+          "type": "Int?"
+        },
+        {
+          "name": "errorMessage",
+          "type": "String?",
+          "notes": "@db.Text, truncated to 4000 chars."
+        },
+        {
+          "name": "triggeredBy",
+          "type": "CronTriggerSource",
+          "notes": "VERCEL_CRON | ADMIN_MANUAL | LOCAL_DEV"
+        },
+        {
+          "name": "deploymentSha",
+          "type": "String?",
+          "notes": "VERCEL_GIT_COMMIT_SHA — tells you which code version ran."
+        },
+        {
+          "name": "payload",
+          "type": "Json?",
+          "notes": "Job-specific counters, e.g. {expired: 12, slotsReturned: 12, notified: 12}."
+        }
+      ],
+      "relations": [
+        "Standalone. Referenced logically by OutboxEvent.producedByCronRunId (nullable, no FK enforced to keep deletes cheap)."
+      ]
+    },
+    {
+      "name": "OutboxEvent",
+      "description": "Transactional outbox. Every domain state change that must produce a 쪽지/알림/email writes exactly one row inside the same DB transaction. The dispatch-outbox cron drains it. This is the ONLY sanctioned way to trigger a side effect from a domain transaction.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": "Also used as the Resend idempotencyKey."
+        },
+        {
+          "name": "eventType",
+          "type": "OutboxEventType",
+          "notes": "Mirrors the notification triggers: APPLICATION_SUBMITTED, DEPOSIT_REQUIRED, DEPOSIT_CONFIRMED, HOLD_EXPIRED, REBID_ROLLED_BACK, SELECTED, NOT_SELECTED, EVENT_CANCELED, DEADLINE_EXTENDED, PARTNER_APPROVED, ADMIN_BROADCAST."
+        },
+        {
+          "name": "aggregateType",
+          "type": "String",
+          "notes": "'Event' | 'Application' | 'User' | 'Partner'."
+        },
+        {
+          "name": "aggregateId",
+          "type": "String"
+        },
+        {
+          "name": "dedupeKey",
+          "type": "String @unique",
+          "notes": "e.g. `HOLD_EXPIRED:${applicationId}:${holdAttempt}`. Guarantees at-most-once semantics per business fact even if the producing code runs twice."
+        },
+        {
+          "name": "payload",
+          "type": "Json",
+          "notes": "Fully denormalized snapshot (recipient ids, event title, amounts) so rendering never re-reads mutable state and never leaks post-hoc information."
+        },
+        {
+          "name": "status",
+          "type": "OutboxStatus",
+          "notes": "PENDING | CLAIMED | SENT | FAILED | DEAD"
+        },
+        {
+          "name": "availableAt",
+          "type": "DateTime @default(now())",
+          "notes": "Exponential backoff target: 1m, 5m, 15m, 1h, 6h."
+        },
+        {
+          "name": "attemptCount",
+          "type": "Int @default(0)",
+          "notes": "DEAD at 6."
+        },
+        {
+          "name": "claimedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "sentAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "lastError",
+          "type": "String?"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "1..n EmailDelivery (one outbox event can fan out to many recipients in a broadcast).",
+        "Logical link to Notification/쪽지 rows owned by the Notification context."
+      ]
+    },
+    {
+      "name": "EmailDelivery",
+      "description": "Per-recipient email attempt and its Resend lifecycle. Enables 'did the 마감 안내 mail actually land' support questions and drives bounce-based opt-out.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "outboxEventId",
+          "type": "String",
+          "notes": "FK, indexed."
+        },
+        {
+          "name": "userId",
+          "type": "String?",
+          "notes": "Null for emails to non-account addresses."
+        },
+        {
+          "name": "toEmail",
+          "type": "String",
+          "notes": "In preview/dev this is rewritten to EMAIL_SANDBOX_TO and originalToEmail keeps the truth."
+        },
+        {
+          "name": "originalToEmail",
+          "type": "String?"
+        },
+        {
+          "name": "templateKey",
+          "type": "String",
+          "notes": "e.g. 'deposit-required.ko'."
+        },
+        {
+          "name": "subject",
+          "type": "String"
+        },
+        {
+          "name": "providerMessageId",
+          "type": "String? @unique",
+          "notes": "Resend id; unique so webhook replays are no-ops."
+        },
+        {
+          "name": "status",
+          "type": "EmailDeliveryStatus",
+          "notes": "QUEUED | SENT | DELIVERED | BOUNCED | COMPLAINED | FAILED | SUPPRESSED"
+        },
+        {
+          "name": "suppressedReason",
+          "type": "String?",
+          "notes": "'user_opt_out' | 'hard_bounce_history' | 'sandbox_blocked'."
+        },
+        {
+          "name": "sentAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "lastEventAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "belongsTo OutboxEvent",
+        "belongsTo User (optional)"
+      ]
+    },
+    {
+      "name": "IdempotencyKey",
+      "description": "Infra-level double-submit protection for every mutating consumer action (신청하기, 재입찰, 예약금 결제). Solves the double-tap and the retry-after-timeout problem without any lock.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "String",
+          "notes": "Client-supplied UUID v4."
+        },
+        {
+          "name": "userId",
+          "type": "String",
+          "notes": "Part of the composite PK so a key from user A cannot shadow user B."
+        },
+        {
+          "name": "endpoint",
+          "type": "String",
+          "notes": "`${method} ${routePattern}`."
+        },
+        {
+          "name": "requestHash",
+          "type": "String",
+          "notes": "sha256 of the canonicalized body. Same key + different body => 422 IDEMPOTENCY_KEY_REUSED."
+        },
+        {
+          "name": "status",
+          "type": "IdempotencyStatus",
+          "notes": "IN_FLIGHT | COMPLETED | FAILED"
+        },
+        {
+          "name": "responseStatus",
+          "type": "Int?"
+        },
+        {
+          "name": "responseBody",
+          "type": "Json?",
+          "notes": "Replayed verbatim on a repeat call. Never store secrets here."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        },
+        {
+          "name": "expiresAt",
+          "type": "DateTime",
+          "notes": "createdAt + 24h; purged by purge-expired-data."
+        }
+      ],
+      "relations": [
+        "@@id([userId, key]); @@index([expiresAt])"
+      ]
+    },
+    {
+      "name": "FeatureFlag",
+      "description": "DB-backed runtime flags so 운영자 can flip behaviour without a redeploy. Env vars provide the boot-time default; the DB row, when present, wins. Read through a 30-second in-memory cache keyed by the module-scope singleton.",
+      "fields": [
+        {
+          "name": "key",
+          "type": "String @id",
+          "notes": "'DEPOSIT_HOLD_ENABLED', 'SOFT_CLOSE_ENABLED', 'SSE_ENABLED', 'MAINTENANCE_MODE', 'SHOW_CUTOFF_AMOUNT_ALLOWED', 'SIGNUP_OPEN'."
+        },
+        {
+          "name": "enabled",
+          "type": "Boolean"
+        },
+        {
+          "name": "rolloutPercent",
+          "type": "Int @default(100)",
+          "notes": "Bucketed by sha256(userId+key)%100. Used for gradual SSE rollout."
+        },
+        {
+          "name": "scope",
+          "type": "FlagScope",
+          "notes": "GLOBAL | EVENT | PARTNER"
+        },
+        {
+          "name": "scopeId",
+          "type": "String?",
+          "notes": "Null for GLOBAL. Lets ops disable SSE for one pathological event."
+        },
+        {
+          "name": "description",
+          "type": "String"
+        },
+        {
+          "name": "updatedByUserId",
+          "type": "String?"
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt"
+        }
+      ],
+      "relations": [
+        "@@unique([key, scope, scopeId])"
+      ]
+    },
+    {
+      "name": "BlobAsset",
+      "description": "Registry row for every object in Vercel Blob. The DB is the source of truth for ownership and lifecycle; Blob itself has no ACL model we can query.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "kind",
+          "type": "BlobAssetKind",
+          "notes": "VENUE_PHOTO | EVENT_COVER | EVENT_GALLERY | PARTNER_DOCUMENT | USER_AVATAR"
+        },
+        {
+          "name": "visibility",
+          "type": "BlobVisibility",
+          "notes": "PUBLIC | PRIVATE. PARTNER_DOCUMENT is always PRIVATE."
+        },
+        {
+          "name": "ownerUserId",
+          "type": "String"
+        },
+        {
+          "name": "venueId",
+          "type": "String?"
+        },
+        {
+          "name": "eventId",
+          "type": "String?"
+        },
+        {
+          "name": "pathname",
+          "type": "String @unique",
+          "notes": "`${kind}/${ownerUserId}/${ulid}.${ext}` — addRandomSuffix:false so we control it."
+        },
+        {
+          "name": "url",
+          "type": "String?",
+          "notes": "Filled by the onUploadCompleted callback."
+        },
+        {
+          "name": "contentType",
+          "type": "String"
+        },
+        {
+          "name": "sizeBytes",
+          "type": "Int"
+        },
+        {
+          "name": "width",
+          "type": "Int?"
+        },
+        {
+          "name": "height",
+          "type": "Int?"
+        },
+        {
+          "name": "status",
+          "type": "BlobAssetStatus",
+          "notes": "PENDING | READY | ORPHANED | DELETED"
+        },
+        {
+          "name": "sortOrder",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        },
+        {
+          "name": "readyAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "deletedAt",
+          "type": "DateTime?",
+          "notes": "Soft delete; the blob object is removed by reap-blob-orphans 7 days later so an accidental partner delete is recoverable."
+        }
+      ],
+      "relations": [
+        "belongsTo User (owner)",
+        "optional belongsTo Venue",
+        "optional belongsTo Event",
+        "@@index([status, createdAt])"
+      ]
+    },
+    {
+      "name": "EventRatioSnapshot",
+      "description": "Denormalized read model backing the public 경쟁률 display and the SSE stream. Exists so the hot public endpoint never touches Application rows (which contain amounts) — an information-leak firewall as much as a performance one.",
+      "fields": [
+        {
+          "name": "eventId",
+          "type": "String @id"
+        },
+        {
+          "name": "capacity",
+          "type": "Int",
+          "notes": "정원."
+        },
+        {
+          "name": "applicantCount",
+          "type": "Int",
+          "notes": "BID: count of applications valid for ranking. INSTANT: claimedCount. Definition owned by the Application context; this table only caches it."
+        },
+        {
+          "name": "ratioX100",
+          "type": "Int",
+          "notes": "round(applicantCount*100/capacity). Integer avoids float drift; UI renders 4.7:1."
+        },
+        {
+          "name": "status",
+          "type": "String",
+          "notes": "Mirror of Event.status so the client knows when to stop streaming."
+        },
+        {
+          "name": "applicationEndAt",
+          "type": "DateTime",
+          "notes": "Mirrored so a soft-close extension propagates to the polling client without a second query."
+        },
+        {
+          "name": "calculatedAt",
+          "type": "DateTime",
+          "notes": "Sent to the client; the UI shows '방금 전 기준'."
+        },
+        {
+          "name": "version",
+          "type": "Int @default(0)",
+          "notes": "Monotonic; used as the SSE `id:` so a reconnecting EventSource can skip an unchanged frame."
+        }
+      ],
+      "relations": [
+        "1:1 Event (FK, onDelete: Cascade)",
+        "@@index([calculatedAt])"
+      ]
+    },
+    {
+      "name": "AuditLog",
+      "description": "Append-only record of privileged actions. Required because 파트너 can override pure ranking on the final-list screen and 운영자 can flip flags — both are disputes waiting to happen.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "actorUserId",
+          "type": "String?",
+          "notes": "Null for SYSTEM/cron actions."
+        },
+        {
+          "name": "actorRole",
+          "type": "UserRole",
+          "notes": "Shared enum: ADMIN | PARTNER | USER | SYSTEM."
+        },
+        {
+          "name": "action",
+          "type": "AuditAction"
+        },
+        {
+          "name": "targetType",
+          "type": "String"
+        },
+        {
+          "name": "targetId",
+          "type": "String"
+        },
+        {
+          "name": "before",
+          "type": "Json?",
+          "notes": "Redacted: never store raw email/phone; store hashes."
+        },
+        {
+          "name": "after",
+          "type": "Json?"
+        },
+        {
+          "name": "ipHash",
+          "type": "String?",
+          "notes": "sha256(ip + IP_SALT). Raw IP is never persisted (개인정보 minimization)."
+        },
+        {
+          "name": "userAgent",
+          "type": "String?"
+        },
+        {
+          "name": "requestId",
+          "type": "String?",
+          "notes": "From x-vercel-id; ties the row to Vercel logs and Sentry."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "optional belongsTo User (actor)",
+        "@@index([targetType, targetId, createdAt])"
+      ]
+    },
+    {
+      "name": "RateLimitCounter",
+      "description": "Postgres-backed fixed-window rate limiter. No Redis in the MVP stack, and Vercel's built-in limiter is edge-only; this covers per-user application/re-bid spam and per-IP login attempts. Cheap because it is one upsert.",
+      "fields": [
+        {
+          "name": "bucketKey",
+          "type": "String",
+          "notes": "`${scope}:${subject}:${windowStartEpoch}` e.g. 'bid:user_123:1753600020'."
+        },
+        {
+          "name": "scope",
+          "type": "String",
+          "notes": "'apply' | 'rebid' | 'login' | 'sse' | 'upload-token' | 'partner-message'."
+        },
+        {
+          "name": "count",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "windowStartAt",
+          "type": "DateTime"
+        },
+        {
+          "name": "expiresAt",
+          "type": "DateTime"
+        }
+      ],
+      "relations": [
+        "@@id([bucketKey]); @@index([expiresAt])"
+      ]
+    },
+    {
+      "name": "SystemAnnouncement",
+      "description": "Ops-controlled banner (점검 안내 / 공지) rendered by apps/web from a cached endpoint. Lets 운영자 communicate during a Neon incident without a deploy.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "level",
+          "type": "AnnouncementLevel",
+          "notes": "INFO | WARNING | MAINTENANCE"
+        },
+        {
+          "name": "messageKo",
+          "type": "String",
+          "notes": "Only Korean in MVP."
+        },
+        {
+          "name": "startsAt",
+          "type": "DateTime"
+        },
+        {
+          "name": "endsAt",
+          "type": "DateTime"
+        },
+        {
+          "name": "dismissible",
+          "type": "Boolean @default(true)"
+        },
+        {
+          "name": "createdByUserId",
+          "type": "String"
+        }
+      ],
+      "relations": [
+        "belongsTo User (creator)"
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "name": "CronJobName",
+      "values": [
+        "EXPIRE_DEPOSIT_HOLDS",
+        "CLOSE_INSTANT_EVENTS",
+        "FINALIZE_BID_RANKINGS",
+        "DISPATCH_OUTBOX",
+        "REFRESH_RATIO_SNAPSHOTS",
+        "REAP_BLOB_ORPHANS",
+        "PURGE_EXPIRED_DATA",
+        "WARM_UP"
+      ]
+    },
+    {
+      "name": "CronRunStatus",
+      "values": [
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "SKIPPED_LOCKED",
+        "TIMED_OUT",
+        "PARTIAL"
+      ]
+    },
+    {
+      "name": "CronTriggerSource",
+      "values": [
+        "VERCEL_CRON",
+        "ADMIN_MANUAL",
+        "LOCAL_DEV"
+      ]
+    },
+    {
+      "name": "OutboxStatus",
+      "values": [
+        "PENDING",
+        "CLAIMED",
+        "SENT",
+        "FAILED",
+        "DEAD"
+      ]
+    },
+    {
+      "name": "OutboxEventType",
+      "values": [
+        "APPLICATION_SUBMITTED",
+        "DEPOSIT_REQUIRED",
+        "DEPOSIT_CONFIRMED",
+        "HOLD_EXPIRED",
+        "REBID_ROLLED_BACK",
+        "SELECTED",
+        "NOT_SELECTED",
+        "EVENT_CANCELED",
+        "DEADLINE_EXTENDED",
+        "PARTNER_APPROVED",
+        "PARTNER_REJECTED",
+        "ADMIN_BROADCAST",
+        "PARTNER_MESSAGE"
+      ]
+    },
+    {
+      "name": "EmailDeliveryStatus",
+      "values": [
+        "QUEUED",
+        "SENT",
+        "DELIVERED",
+        "BOUNCED",
+        "COMPLAINED",
+        "FAILED",
+        "SUPPRESSED"
+      ]
+    },
+    {
+      "name": "IdempotencyStatus",
+      "values": [
+        "IN_FLIGHT",
+        "COMPLETED",
+        "FAILED"
+      ]
+    },
+    {
+      "name": "FlagScope",
+      "values": [
+        "GLOBAL",
+        "EVENT",
+        "PARTNER"
+      ]
+    },
+    {
+      "name": "BlobAssetKind",
+      "values": [
+        "VENUE_PHOTO",
+        "EVENT_COVER",
+        "EVENT_GALLERY",
+        "PARTNER_DOCUMENT",
+        "USER_AVATAR"
+      ]
+    },
+    {
+      "name": "BlobAssetStatus",
+      "values": [
+        "PENDING",
+        "READY",
+        "ORPHANED",
+        "DELETED"
+      ]
+    },
+    {
+      "name": "BlobVisibility",
+      "values": [
+        "PUBLIC",
+        "PRIVATE"
+      ]
+    },
+    {
+      "name": "AuditAction",
+      "values": [
+        "PARTNER_APPROVED",
+        "PARTNER_REJECTED",
+        "EVENT_CANCELED",
+        "FINAL_LIST_OVERRIDDEN",
+        "DEADLINE_EXTENDED",
+        "FEATURE_FLAG_CHANGED",
+        "CRON_MANUALLY_TRIGGERED",
+        "BROADCAST_SENT",
+        "USER_SUSPENDED",
+        "BLOB_DELETED",
+        "DATA_EXPORTED"
+      ]
+    },
+    {
+      "name": "AnnouncementLevel",
+      "values": [
+        "INFO",
+        "WARNING",
+        "MAINTENANCE"
+      ]
+    },
+    {
+      "name": "AppEnvironment",
+      "values": [
+        "DEVELOPMENT",
+        "PREVIEW",
+        "PRODUCTION"
+      ]
+    }
+  ],
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/health",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "Liveness. Returns {status:'ok', commitSha, region, uptimeHint}. No DB access so it never fails because Neon is cold. Cache-Control: no-store."
+    },
+    {
+      "method": "GET",
+      "path": "/health/ready",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "Readiness. Executes SELECT 1 and reports dbLatencyMs, pendingOutboxCount, oldestPendingOutboxAgeSec, lastSuccessfulRun per CronJobName. Returns 503 if any cron has not succeeded in 15 minutes. This is what an uptime monitor should watch."
+    },
+    {
+      "method": "GET",
+      "path": "/health/warm",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Cheap warm-up ping hit every 5 minutes; touches Prisma with SELECT 1 to keep the Neon compute and the Nest instance hot. CRON_SECRET required so it cannot be used as a free keep-alive by third parties."
+    },
+    {
+      "method": "GET",
+      "path": "/version",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "{commitSha, builtAt, appEnv}. Used by the web app to detect a stale client and prompt 새로고침 after a deploy."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/expire-deposit-holds",
+      "roles": [
+        "CRON",
+        "ADMIN"
+      ],
+      "description": "Sweeper for the deposit-hold window. Claims a CronJobRun lease, then loops batches of CRON_BATCH_SIZE (200) of holds where status=PENDING AND expiresAt <= now(), expiring each inside its own short transaction (INSTANT: decrement claimedCount with a floor of 0; BID: mark excluded from ranking) and writing an OutboxEvent with dedupeKey HOLD_EXPIRED:{holdId}. No-ops entirely when DEPOSIT_HOLD_ENABLED is false, but still records a SKIPPED run so the dashboard shows the flag state."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/close-instant-events",
+      "roles": [
+        "CRON",
+        "ADMIN"
+      ],
+      "description": "Transitions INSTANT events past applicationEndAt (or at capacity) to CLOSED and emits closure notifications. Catch-up shaped: selects all overdue events, not just the last minute."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/finalize-bid-rankings",
+      "roles": [
+        "CRON",
+        "ADMIN"
+      ],
+      "description": "For BID events where now() >= applicationEndAt + depositWindowMinutes (and no soft-close extension is pending), materializes the ranked list (amount DESC, lastBidAt ASC) and moves the event to REVIEW so the partner can edit. Idempotent via an event-level status guard inside the transaction."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/dispatch-outbox",
+      "roles": [
+        "CRON",
+        "ADMIN"
+      ],
+      "description": "Claims up to 200 PENDING OutboxEvents with SELECT ... FOR UPDATE SKIP LOCKED, creates in-app 알림 rows plus Resend batches of 100, records EmailDelivery rows, marks SENT. Retries with exponential backoff via availableAt; DEAD at attemptCount 6."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/refresh-ratio-snapshots",
+      "roles": [
+        "CRON",
+        "ADMIN"
+      ],
+      "description": "Recomputes EventRatioSnapshot for OPEN events whose calculatedAt is older than 60s, in one grouped aggregate query. Guarantees the public 경쟁률 self-heals even if an inline snapshot write was lost."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/reap-blob-orphans",
+      "roles": [
+        "CRON",
+        "ADMIN"
+      ],
+      "description": "Daily 13:17 KST. Deletes Blob objects for BlobAsset rows PENDING>24h or DELETED>7d; also lists the Blob store and flags objects with no BlobAsset row as ORPHANED (never auto-deletes unknown objects — reports them)."
+    },
+    {
+      "method": "POST",
+      "path": "/cron/purge-expired-data",
+      "roles": [
+        "CRON",
+        "ADMIN"
+      ],
+      "description": "Daily 13:40 KST. Deletes IdempotencyKey and RateLimitCounter rows past expiresAt, CronJobRun rows older than 90 days, SENT OutboxEvents older than 30 days. Bounded to 10k deletes per table per run."
+    },
+    {
+      "method": "GET",
+      "path": "/events/:eventId/ratio",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "Public 경쟁률 only: {capacity, applicantCount, ratioX100, status, applicationEndAt, calculatedAt}. Never returns amounts, ranks, or cutoff. Cache-Control: public, s-maxage=5, stale-while-revalidate=25."
+    },
+    {
+      "method": "GET",
+      "path": "/events/:eventId/ratio/stream",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "SSE (text/event-stream). Emits a `ratio` frame every 5s and a terminal `bye` frame at 55s with retry:3000 so the browser reconnects — bounding serverless function duration. Emits a `closed` frame and terminates immediately if the event leaves OPEN. Rate-limited to 1 concurrent stream per IP per event; returns 503 with a Retry-After when SSE_ENABLED is off, and the client falls back to polling."
+    },
+    {
+      "method": "POST",
+      "path": "/uploads/blob-token",
+      "roles": [
+        "PARTNER",
+        "ADMIN",
+        "USER"
+      ],
+      "description": "Body {kind, contentType, sizeBytes, venueId?, eventId?}. Validates role/ownership/quota, creates a PENDING BlobAsset, returns a Vercel Blob client upload token restricted to that exact pathname, allowed MIME types and maximumSizeInBytes (5MB images, 10MB documents). USER may only request USER_AVATAR."
+    },
+    {
+      "method": "POST",
+      "path": "/uploads/blob-callback",
+      "roles": [
+        "BLOB_WEBHOOK"
+      ],
+      "description": "Vercel Blob onUploadCompleted callback. Verifies the token payload signature, flips BlobAsset to READY, stores url and dimensions. Idempotent on pathname."
+    },
+    {
+      "method": "DELETE",
+      "path": "/uploads/:blobAssetId",
+      "roles": [
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Soft-deletes (status=DELETED, deletedAt=now). Owner-scoped for PARTNER. Actual object removal happens 7 days later in reap-blob-orphans. Writes an AuditLog row."
+    },
+    {
+      "method": "POST",
+      "path": "/webhooks/resend",
+      "roles": [
+        "RESEND_WEBHOOK"
+      ],
+      "description": "Svix-signed webhook. Maps email.delivered/bounced/complained to EmailDeliveryStatus by providerMessageId. Two hard bounces set User.emailOptOut and future sends become SUPPRESSED. Returns 200 even for unknown ids so Resend stops retrying."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/ops/cron-runs",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Paginated CronJobRun list with filters (jobName, status, date range) and a per-job summary card: last success, consecutive failures, backlog size. Backs the 운영 대시보드."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/ops/outbox",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Lists FAILED/DEAD OutboxEvents with lastError; supports drill-down into EmailDelivery children."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/ops/outbox/:id/retry",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Resets a DEAD/FAILED outbox row to PENDING with attemptCount=0 and availableAt=now. Audited."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/feature-flags",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Effective flag values (env default merged with DB override), with scope rows."
+    },
+    {
+      "method": "PATCH",
+      "path": "/admin/feature-flags/:key",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Upserts a FeatureFlag override {enabled, rolloutPercent, scope, scopeId}. Takes effect within 30s (cache TTL). Writes AuditLog FEATURE_FLAG_CHANGED. Cannot enable DEPOSIT_HOLD_ENABLED unless PG integration readiness flag is set (guard rail for the MVP)."
+    },
+    {
+      "method": "GET",
+      "path": "/system/announcements",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "Active SystemAnnouncement rows for the banner. s-maxage=30."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/system/announcements",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Creates a 점검/공지 banner."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/ops/config",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Redacted runtime config snapshot: appEnv, region, commitSha, DB host (host only, no credentials), which optional integrations are configured (booleans only). Never returns secret values."
+    }
+  ],
+  "stateMachines": [
+    {
+      "entity": "CronJobRun",
+      "states": [
+        "RUNNING",
+        "SUCCEEDED",
+        "PARTIAL",
+        "FAILED",
+        "TIMED_OUT",
+        "SKIPPED_LOCKED"
+      ],
+      "transitions": [
+        "(invocation arrives) -> attempt lease: INSERT CronJobRun(status=RUNNING, leaseExpiresAt=now+5m) only if no RUNNING row for this jobName with leaseExpiresAt > now(); done as a single INSERT ... SELECT ... WHERE NOT EXISTS so it is atomic under pgbouncer",
+        "lease not acquired -> write SKIPPED_LOCKED row and return 200 (never 5xx, or Vercel retries and amplifies)",
+        "RUNNING -> SUCCEEDED when the work queue drained within CRON_TIME_BUDGET_MS",
+        "RUNNING -> PARTIAL when the batch cap or time budget was hit with work remaining (hasMore=true); the next minute's tick continues",
+        "RUNNING -> FAILED on an unhandled exception; errorMessage stored, Sentry captured, still returns 200",
+        "RUNNING -> TIMED_OUT reclaimed by a later invocation when now() > leaseExpiresAt and finishedAt is null (the function was killed by the platform)"
+      ]
+    },
+    {
+      "entity": "OutboxEvent",
+      "states": [
+        "PENDING",
+        "CLAIMED",
+        "SENT",
+        "FAILED",
+        "DEAD"
+      ],
+      "transitions": [
+        "(domain tx commits) -> PENDING with availableAt=now, dedupeKey unique",
+        "PENDING -> CLAIMED by dispatch-outbox via SELECT ... WHERE status='PENDING' AND availableAt<=now() ORDER BY createdAt LIMIT 200 FOR UPDATE SKIP LOCKED",
+        "CLAIMED -> SENT after in-app rows written and Resend accepted the batch",
+        "CLAIMED -> FAILED on provider error: attemptCount++, availableAt = now + backoff[attemptCount], status back to PENDING (FAILED is a terminal-ish label only used when the row is being inspected)",
+        "CLAIMED -> PENDING (stuck-claim recovery) when claimedAt < now - 10m — covers a function killed between claim and send; safe because Resend idempotencyKey = OutboxEvent.id prevents a duplicate email",
+        "FAILED/PENDING -> DEAD at attemptCount >= 6; surfaced on the admin dashboard, retryable manually",
+        "DEAD -> PENDING via POST /admin/ops/outbox/:id/retry"
+      ]
+    },
+    {
+      "entity": "BlobAsset",
+      "states": [
+        "PENDING",
+        "READY",
+        "ORPHANED",
+        "DELETED"
+      ],
+      "transitions": [
+        "POST /uploads/blob-token -> PENDING",
+        "Blob onUploadCompleted callback -> READY (idempotent on pathname)",
+        "PENDING for > 24h with no callback -> ORPHANED by reap-blob-orphans, then the object is deleted from Blob and the row is DELETED",
+        "READY -> DELETED (soft) on owner/admin delete; object removal deferred 7 days",
+        "DELETED + deletedAt < now-7d -> object removed from Blob store, row retained for audit"
+      ]
+    },
+    {
+      "entity": "IdempotencyKey",
+      "states": [
+        "IN_FLIGHT",
+        "COMPLETED",
+        "FAILED"
+      ],
+      "transitions": [
+        "INSERT ON CONFLICT DO NOTHING succeeds -> IN_FLIGHT, request proceeds",
+        "INSERT conflicts and existing.status=IN_FLIGHT -> respond 409 REQUEST_IN_FLIGHT with Retry-After: 2 (the user's second tap on 신청하기)",
+        "INSERT conflicts and existing.status=COMPLETED and requestHash matches -> replay stored responseStatus/responseBody verbatim",
+        "INSERT conflicts and requestHash differs -> 422 IDEMPOTENCY_KEY_REUSED",
+        "IN_FLIGHT -> COMPLETED with the serialized response after the handler commits",
+        "IN_FLIGHT -> FAILED on 5xx (the row is then deletable so a genuine retry can proceed)",
+        "IN_FLIGHT older than 60s with no terminal state (function killed) -> treated as FAILED by the next request and overwritten"
+      ]
+    },
+    {
+      "entity": "Deployment (release process)",
+      "states": [
+        "CI_GREEN",
+        "MIGRATED",
+        "PROMOTED",
+        "ROLLED_BACK"
+      ],
+      "transitions": [
+        "PR merged to main -> CI runs lint/typecheck/test/build + migrate-diff guard -> CI_GREEN",
+        "CI_GREEN -> MIGRATED: `prisma migrate deploy` against DIRECT_URL. Expand-only migrations required; a destructive migration must carry a `-- SAFETY: contract` comment and a linked prior release",
+        "MIGRATED -> PROMOTED: `vercel deploy --prod --prebuilt` for api then web (api first, because web's rewrites depend on new API routes)",
+        "PROMOTED -> ROLLED_BACK: `vercel rollback` restores the previous code. DB is never rolled back; the expand/contract discipline is what makes this safe",
+        "Any state -> MAINTENANCE_MODE flag on: web shows 점검 안내, API returns 503 for mutating routes while GET /events and /health stay up"
+      ]
+    }
+  ],
+  "businessRules": [
+    "Every serverless invocation reuses a module-scope cached Nest Express instance; the app is created with app.init(), never app.listen(), and never inside the request handler body.",
+    "Exactly one Vercel function per API project (api/index.ts) with a catch-all rewrite. Adding more entry files multiplies cold starts and duplicates the Nest bootstrap.",
+    "apps/api region is pinned to icn1 and the Neon project must be in the nearest matching region. A region mismatch is treated as a release blocker, not a tuning item.",
+    "DATABASE_URL always carries pgbouncer=true&connection_limit=1. No code may open a second PrismaClient. Session-scoped Postgres features (session advisory locks, SET without LOCAL, LISTEN/NOTIFY) are forbidden.",
+    "Migrations run only from CI against DIRECT_URL, never from a Vercel build command, and must be expand/contract because old and new function instances serve traffic simultaneously during a rollout.",
+    "Server processes run with TZ=UTC. All DateTime columns are UTC. KST (Asia/Seoul, UTC+9, no DST) conversion happens exactly twice: when parsing partner-entered datetimes (packages/shared/time/kstToUtc) and when rendering to the user. No business logic compares a local-formatted string.",
+    "Every cron endpoint: verifies CRON_SECRET with timingSafeEqual, acquires a CronJobRun lease, is catch-up shaped (processes all overdue work, never 'the last minute'), is bounded by CRON_BATCH_SIZE=200 rows and CRON_TIME_BUDGET_MS=45000, and returns HTTP 200 even on internal failure so Vercel does not retry-storm.",
+    "Cron is a liveness mechanism, not a correctness mechanism. Every time-sensitive read path (event detail, application detail, ranking view) performs lazy expiry-on-read inside the same transaction, so a skipped cron minute is invisible to users.",
+    "Any side effect that must survive a crash (email, 쪽지, push) goes through OutboxEvent inside the producing transaction. Calling Resend directly from a request handler is prohibited by lint rule (no-restricted-imports on 'resend' outside modules/notification/transport).",
+    "OutboxEvent.dedupeKey is mandatory and must encode the business fact, not a timestamp — this is what makes at-least-once cron delivery behave as at-most-once notification.",
+    "Resend batch sends carry the OutboxEvent.id as idempotencyKey so a re-claimed row cannot double-send.",
+    "In preview and development every outbound email recipient is rewritten to EMAIL_SANDBOX_TO. A preview deployment must never be able to email a real 이용자.",
+    "Image bytes never pass through the API function (4.5MB request body cap). All uploads use Vercel Blob client tokens scoped to a single server-generated pathname with an explicit MIME allowlist and size cap.",
+    "BlobAsset rows are created before the upload and confirmed by the callback. An object with no READY row is garbage and is reaped; an object referenced by a row is never deleted without a soft-delete grace period of 7 days.",
+    "The public ratio endpoint reads ONLY EventRatioSnapshot. It is structurally incapable of returning an amount, a rank, or a cutoff, because those columns do not exist in that table.",
+    "SSE handlers self-terminate at 55 seconds with retry:3000. No serverless handler may hold a connection open indefinitely.",
+    "Rate limits (Postgres fixed window): 신청 5/min/user, 재입찰 10/min/user, login 10/min/IP, upload-token 30/hour/user, SSE connect 6/min/IP, partner broadcast 3/hour/event. Exceeded => 429 with Retry-After and a Korean message.",
+    "All mutating consumer endpoints require an Idempotency-Key header; the gateway rejects the request with 400 if it is absent. The web client generates one per user intent (not per retry).",
+    "Feature flags resolve as: DB row (most specific scope wins: EVENT > PARTNER > GLOBAL) else env var else hardcoded default. Cache TTL 30s. DEPOSIT_HOLD_ENABLED defaults to false in every environment for MVP.",
+    "MAINTENANCE_MODE=true makes all POST/PATCH/DELETE return 503 with a Korean 점검 안내 body while GETs and /health continue to serve, so users can still read but not create inconsistent state during a Neon maintenance window.",
+    "AuditLog is written for every ADMIN action and for the partner's final-list override. Raw IP addresses are never stored — only sha256(ip+IP_SALT).",
+    "turbo-ignore gates each Vercel project's build so a web-only PR does not redeploy the API and vice versa. Remote cache is enabled in CI and on Vercel with the same TURBO_TEAM.",
+    "packages/shared exports enums by name only (UserRole, EventMode, EventStatus, ApplicationStatus, DepositHoldStatus, OutboxEventType...). No context redefines an enum locally; the Prisma enum and the TS enum are generated from the same source of truth in schema.prisma and re-exported through @dibs/shared.",
+    "Boot fails fast: env.schema.ts validates process.env with zod at module load. A missing CRON_SECRET, JWT_SECRET, DATABASE_URL or RESEND_API_KEY in production aborts the bootstrap rather than degrading silently.",
+    "Secrets never reach the browser. A CI eslint rule forbids referencing any non-NEXT_PUBLIC_ env var from a file containing 'use client' or under app/**/page.tsx client boundaries."
+  ],
+  "edgeCases": [
+    "Vercel Cron double-fires or overlaps when a run exceeds 60s: the CronJobRun lease (INSERT ... WHERE NOT EXISTS on a live RUNNING row) makes the second invocation a SKIPPED_LOCKED no-op instead of double-expiring holds.",
+    "Cron silently skips a minute (documented Vercel best-effort behaviour) right at a popular event's deadline: catch-up-shaped queries plus lazy expiry-on-read mean the deadline is still honoured on the next tick or on the next user read, whichever comes first.",
+    "Function killed between OutboxEvent CLAIMED and the Resend call: the 10-minute stuck-claim recovery returns it to PENDING, and the Resend idempotencyKey prevents a duplicate 예약금 안내 email.",
+    "Resend webhook arrives before the EmailDelivery row is committed (fast provider, slow tx): the webhook handler upserts by providerMessageId and tolerates a missing row by storing a pending-webhook record replayed on the next dispatch run.",
+    "Neon compute is suspended (scale-to-zero) and the first query after idle takes 2-5s: /health does not touch the DB so monitoring stays green; the warm cron and a Neon 'suspend after 5 min' setting bound the blast radius; user-facing requests get a 10s connect_timeout and a Korean '잠시 후 다시 시도해 주세요' rather than a raw Prisma error.",
+    "pgbouncer transaction pooling silently breaks a session advisory lock someone adds later: the lint rule bans pg_advisory_lock and only allows pg_advisory_xact_lock; the CI e2e suite runs against a pooled URL specifically to catch this class of bug, since local docker Postgres would not.",
+    "connection_limit>1 accidentally introduced via a copied URL: a startup assertion parses DATABASE_URL and refuses to boot in production if pgbouncer=true is missing or connection_limit != 1.",
+    "Double-tap on 신청하기 over a flaky mobile network: the Idempotency-Key row makes the second POST either a 409 IN_FLIGHT or an exact replay of the first response, so the user never creates two applications and never sees a confusing 'already applied' error.",
+    "Client retries after a 504 where the server actually committed: the COMPLETED idempotency row replays the original 201 with the same applicationId, so the UI converges on the truth.",
+    "Deadline sniping plus soft close plus cached ratio: the ratio payload includes applicationEndAt, and the SSE `extended` frame is emitted immediately when soft close fires, so a sniper watching a 5-second-stale cache cannot rely on the old deadline. The authoritative deadline check always happens server-side inside the transaction, never against a cached value.",
+    "Soft-close extension racing the finalize-bid-rankings cron: finalize re-reads applicationEndAt inside the transaction and aborts (leaving the event OPEN) if it was extended after the job started. The event-status guard makes this a no-op rather than a partial finalization.",
+    "KST midnight and month boundaries: a partner in Seoul entering '2026-08-01 00:00' must not become 2026-07-31T15:00Z-off-by-one. All partner datetime inputs are sent as ISO-8601 with explicit +09:00 offset from the browser, never as a naive local string; the API rejects a naive datetime with 400.",
+    "Cron schedules are UTC, so a 'daily 4am cleanup' written as 0 4 * * * actually runs at 13:00 KST. Every cron entry carries a comment with its KST time, and a CI test asserts the mapping to stop a future maintainer from breaking it.",
+    "Information leakage through timing/side channels: the ratio endpoint's cache is per-event, not per-user; error messages for 'you are outbid' do not exist; the SSE stream never varies its payload by viewer identity; and the ranked list endpoint is role-gated at the controller AND re-checks event ownership in the service (defence in depth against an IDOR in a partner-scoped route).",
+    "Information leakage through Vercel preview deployments: preview URLs are protected by Vercel Deployment Protection (SSO), preview DB is a Neon branch with anonymized seed data, and NEXT_PUBLIC_APP_URL differs so OAuth callbacks cannot be reused against production.",
+    "Leakage through the API error body: the global exception filter maps Prisma errors to opaque codes; a unique-constraint violation on a bid never echoes the conflicting amount.",
+    "Abusive SSE fan-out: one client opening hundreds of streams against a hot event would multiply function invocations. Per-IP concurrent-stream limit, a global SSE_ENABLED kill switch, and an EVENT-scoped flag let ops downgrade a single viral event to polling without a deploy.",
+    "Blob upload token replay: tokens are single-pathname, short-TTL, and the pathname is server-generated with a ULID, so a leaked token can only overwrite the one object it was minted for, and the callback flips the row to READY exactly once.",
+    "Malicious upload content-type spoofing: allowedContentTypes is enforced by Blob, and the callback additionally sniffs magic bytes for images; a mismatch marks the asset ORPHANED and schedules deletion.",
+    "사업자등록증 stored in a public Blob store would be a PII exposure: PARTNER_DOCUMENT is forced to visibility=PRIVATE and, if a private store is unavailable, upload is blocked rather than silently downgraded to public.",
+    "Deploy during a live deadline: expand/contract migrations plus api-before-web ordering mean an in-flight 신청 request against the old instance still commits validly. Destructive migrations are forbidden within a deploy window that overlaps any event whose applicationEndAt is within 30 minutes — CI checks this against the production DB and warns.",
+    "Stale web client after a deploy calling a removed endpoint: /version polling triggers a '새로운 버전이 있어요. 새로고침 해주세요' toast; removed endpoints are kept as 410 Gone shims for one release cycle.",
+    "Cron endpoint discovered and hammered by a scanner: CRON_SECRET compared with timingSafeEqual, no timing oracle, response is a constant-shape 401 with no hint, and the route is additionally rate-limited by IP.",
+    "Admin manually triggers a cron while the scheduled one is running: the lease turns it into SKIPPED_LOCKED and the UI says '이미 실행 중입니다'.",
+    "Outbox backlog explosion after an ADMIN broadcast to 50k users: broadcasts are expanded into recipient chunks of 500 as separate OutboxEvent rows (not one giant row), dispatch is capped at 200 rows/minute, and /health/ready reports the backlog so ops can see the drain ETA. A broadcast never blocks transactional mail because transactional events are ordered ahead by a priority column on the claim query.",
+    "Resend rate/quota exhaustion mid-batch: the transport treats 429 as retryable with backoff and never marks the outbox row SENT; in-app 쪽지 delivery is written first and separately so users still get notified even when email is degraded.",
+    "Clock skew between the Vercel function and Postgres: all deadline and expiry comparisons use now() evaluated by Postgres inside the transaction (ClockService.dbNow()), never the Node process clock, so two instances cannot disagree about whether a deadline has passed.",
+    "Prisma driver-adapter preview feature changes behaviour on a minor bump: Prisma and @prisma/adapter-neon versions are pinned exactly (no caret), and a renovate PR must pass the pooled-URL e2e suite before merge."
+  ],
+  "terms": [
+    {
+      "technical": "Competition ratio",
+      "userFriendlyKo": "경쟁률 (예: 정원 10명 / 신청 47명 · 4.7 대 1)"
+    },
+    {
+      "technical": "Capacity",
+      "userFriendlyKo": "정원 (모집 인원)"
+    },
+    {
+      "technical": "Application deadline",
+      "userFriendlyKo": "신청 마감 시간"
+    },
+    {
+      "technical": "Soft close / deadline extended",
+      "userFriendlyKo": "마감 시간이 연장되었어요"
+    },
+    {
+      "technical": "Deposit hold",
+      "userFriendlyKo": "예약금 (신청을 확정하려면 예약금을 걸어 주세요)"
+    },
+    {
+      "technical": "Deposit window expired",
+      "userFriendlyKo": "예약금 입금 시간이 지나 신청이 취소되었어요"
+    },
+    {
+      "technical": "Maintenance mode",
+      "userFriendlyKo": "지금은 서비스 점검 중이에요. 잠시 후 다시 이용해 주세요"
+    },
+    {
+      "technical": "Rate limited (429)",
+      "userFriendlyKo": "요청이 너무 빨라요. 잠시 후 다시 시도해 주세요"
+    },
+    {
+      "technical": "Duplicate submit blocked (idempotency)",
+      "userFriendlyKo": "이미 처리 중이에요. 잠시만 기다려 주세요"
+    },
+    {
+      "technical": "Stale client version",
+      "userFriendlyKo": "새로운 버전이 있어요. 새로고침 해 주세요"
+    },
+    {
+      "technical": "Live updating",
+      "userFriendlyKo": "실시간 업데이트 중 · 방금 전 기준"
+    },
+    {
+      "technical": "Connection lost (SSE reconnecting)",
+      "userFriendlyKo": "연결이 끊겼어요. 다시 연결하는 중이에요"
+    },
+    {
+      "technical": "Image upload failed",
+      "userFriendlyKo": "사진 등록에 실패했어요. 5MB 이하 JPG·PNG·WEBP만 올릴 수 있어요"
+    },
+    {
+      "technical": "Email unsubscribe",
+      "userFriendlyKo": "이메일 수신 거부"
+    },
+    {
+      "technical": "In-app message / notification",
+      "userFriendlyKo": "쪽지 / 알림"
+    },
+    {
+      "technical": "Server error (500)",
+      "userFriendlyKo": "일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요"
+    },
+    {
+      "technical": "Database waking up / timeout",
+      "userFriendlyKo": "서버가 응답하지 않아요. 잠시 후 다시 시도해 주세요"
+    },
+    {
+      "technical": "Service announcement banner",
+      "userFriendlyKo": "공지사항"
+    },
+    {
+      "technical": "Final confirmed list",
+      "userFriendlyKo": "최종 확정 명단"
+    },
+    {
+      "technical": "Business registration document upload",
+      "userFriendlyKo": "사업자등록증 등록 (담당자만 확인할 수 있어요)"
+    }
+  ],
+  "openQuestions": [
+    "Prisma driver adapters (@prisma/adapter-neon, preview) vs plain pgbouncer connection string: the adapter gives smaller cold-start bundles and native Neon WS transactions but is a preview feature. Which risk do we accept for MVP? Recommendation: ship MVP on the plain pooled URL, spike the adapter behind a branch, and switch after the pooled-URL e2e suite is green.",
+    "Vercel plan: minute-level cron (* * * * *) requires Pro. Are we on Pro from day one? If we are on Hobby, the finest schedule is daily and the entire deposit-hold expiry model must lean on lazy expiry-on-read plus an external scheduler (e.g. GitHub Actions cron or Upstash QStash). This changes the design materially — needs an answer before the first sprint.",
+    "Fluid compute and per-function maxDuration=60s: confirm the plan's limits. If maxDuration caps at 10s, the cron time budget and batch size must drop to ~8s / 50 rows and the SSE stream must self-terminate at ~9s, which makes polling the better default.",
+    "Neon region: is the project provisioned in ap-southeast-1 (Singapore) or is an ap-northeast (Seoul) option available? Singapore adds roughly 70-90ms RTT per query from icn1 and would push us toward fewer, larger queries.",
+    "Private Blob store availability on our plan for 사업자등록증. If private access is not available, do we (a) block document upload in MVP and collect the document by email, or (b) accept an unguessable public pathname? Recommendation: (a) — this is PII and a public URL is a real exposure.",
+    "Do we need a real queue (Upstash QStash / Inngest) for the outbox, or is a 1-minute Postgres poll acceptable? A 1-minute worst-case delay on 예약금 안내 inside a 10-minute window is a 10% latency tax on the user's decision time. If the deposit window shrinks below 5 minutes, we need push-based dispatch.",
+    "Rate limiting in Postgres vs Upstash Redis: the Postgres upsert adds one write to every request. At what RPS do we accept that? Threshold suggestion — move to Upstash above ~50 RPS sustained.",
+    "Search: Postgres full-text + pg_trgm for 매장/이벤트 검색, or a managed service? Korean tokenization in Postgres is poor without an extension Neon may not offer. Needs a decision from the Search context, but the infra answer (extension availability on Neon) belongs here.",
+    "Log retention and PII: Vercel log retention on our plan, and whether we need a Log Drain (Axiom/Datadog) for the 90-day audit expectation. Also confirm whether 개인정보 in logs must be masked at source (recommendation: yes, pino redact paths for email/phone/name).",
+    "Analytics/monitoring budget: Sentry paid tier vs free quota given expected error volume at launch.",
+    "Do preview deployments get their own Neon branch per PR (costs branch-hours) or one shared 'preview' branch? Per-PR is much safer for migration testing; confirm budget.",
+    "Domain and email deliverability: is dibs.kr registered and can we set SPF/DKIM/DMARC for Resend? Korean ISPs (Naver, Daum, Kakao) are aggressive about unauthenticated mail — without DMARC alignment a large share of 알림 email will silently disappear.",
+    "Data retention policy for 신청 내역 and AuditLog under 개인정보보호법 — how long do we keep an expired applicant's record, and does that require a separate anonymization job in purge-expired-data?",
+    "Who owns the on-call rotation and what is the alerting channel (Slack webhook from /health/ready failures)? The cron dashboard is useless if nobody is paged when a sweeper has been failing for an hour during a deadline."
+  ]
+}

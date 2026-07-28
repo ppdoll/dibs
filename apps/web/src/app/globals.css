@@ -1,0 +1,122 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 4%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 4%;
+    --primary: 349 89% 55%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 5% 96%;
+    --secondary-foreground: 240 6% 10%;
+    --muted: 240 5% 96%;
+    --muted-foreground: 240 4% 46%;
+    --accent: 240 5% 96%;
+    --accent-foreground: 240 6% 10%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 6% 90%;
+    --input: 240 6% 90%;
+    --ring: 349 89% 55%;
+    --radius: 0.75rem;
+
+    /*
+     * 한글 글꼴 스택.
+     *
+     * 외부에서 웹폰트를 받아오지 않는다 — Pretendard 한 벌이 1MB 를 넘고,
+     * 첫 화면에서 그걸 기다리면 마감 카운트다운이 늦게 뜬다. 사용자 기기에
+     * 이미 깔려 있으면 쓰고, 없으면 OS 기본 한글 글꼴로 떨어진다.
+     * (Pretendard → 안드로이드 → iOS/macOS → 윈도우 순)
+     */
+    --font-sans: 'Pretendard Variable', Pretendard, -apple-system, BlinkMacSystemFont,
+      system-ui, 'Apple SD Gothic Neo', 'Noto Sans KR', 'Malgun Gothic', 'Segoe UI', Roboto,
+      'Helvetica Neue', sans-serif;
+  }
+
+  .dark {
+    --background: 240 10% 4%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 6%;
+    --card-foreground: 0 0% 98%;
+    --primary: 349 89% 60%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 4% 16%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 4% 16%;
+    --muted-foreground: 240 5% 65%;
+    --accent: 240 4% 16%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 63% 31%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 4% 16%;
+    --input: 240 4% 16%;
+    --ring: 349 89% 60%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    font-family: var(--font-sans);
+    /* 아이폰에서 가로로 눕혔다 세울 때 글자가 커지는 것을 막는다. */
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    word-break: keep-all; /* 한글 줄바꿈을 어절 단위로 */
+    overflow-wrap: break-word; /* 긴 URL·영문은 그래도 잘라 준다 */
+    /* 탭할 때 파란 사각형이 번쩍이는 것을 없앤다. 앱처럼 보이려면 필수. */
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* 숫자를 등폭으로. 카운트다운이 초마다 좌우로 흔들리지 않는다. */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* 키보드 사용자에게만 포커스 링을 보여준다. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  /* 움직임을 줄여 달라고 설정한 사용자에게는 애니메이션을 걷어낸다. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer utilities {
+  /* 가로 스크롤 칩 줄에서 스크롤바를 감춘다. 모바일 앱에는 스크롤바가 없다. */
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* 아이폰 홈 인디케이터 영역 회피. 하단 고정 요소에 쓴다. */
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .pt-safe {
+    padding-top: env(safe-area-inset-top);
+  }
+
+  /*
+   * line-clamp 는 Tailwind 3.4 기본 유틸이라 여기서 다시 정의하지 않는다.
+   * 카드 제목은 `line-clamp-2`, 설명은 `line-clamp-3` 을 그대로 쓰면 된다.
+   */
+}

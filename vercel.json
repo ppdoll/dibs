@@ -1,0 +1,6 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "echo '[Dibs] skipping install — root is not deployable'",
+  "buildCommand": "printf '\\n============================================================\\n[Dibs] 저장소 루트는 배포 대상이 아닙니다.\\n\\n이 모노레포는 Vercel 프로젝트 2개로 나뉩니다:\\n  - dibs-web : Root Directory = apps/web\\n  - dibs-api : Root Directory = apps/api\\n\\n지금 이 빌드는 Root Directory 가 루트로 남아 있어서 실패했습니다.\\n프로젝트 Settings > Build and Deployment > Root Directory 를 위 값으로 바꾸세요.\\n(그러면 각 앱의 vercel.json 이 대신 읽힙니다. 이 파일은 무시됩니다.)\\n\\n전체 절차: docs/DEPLOY.md\\n============================================================\\n\\n' && exit 1"
+}

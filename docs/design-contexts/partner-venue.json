@@ -1,0 +1,1853 @@
+{
+  "context": "Bounded Context: **Partner & Venue** (파트너/매장) of the Dibs (딥스) platform.\n\nOwns: partner onboarding & admin approval, business (사업자) registration & verification, venue/facility profiles with multi-image galleries on Vercel Blob, category taxonomy, region/location data, business hours & special (holiday) hours, contact info, and the moderation/verification audit trail. Also owns the read models that power venue/partner search & discovery.\n\nDoes NOT own (referenced only by id + shared enum name): Account/Auth (Identity context — `Account.id`, `AccountRole`), ReservationEvent + Application + BidHistory + DepositHold (Event context — a `ReservationEvent` holds `venueId`), Notification/Message (Notification context), Review/Rating (future).\n\nHard invariant enforced here that the Event context depends on: **a `ReservationEvent` may only be created/published under a `Venue` whose `status = ACTIVE` and whose owning `Business.verificationStatus = VERIFIED` and owning `PartnerProfile.approvalStatus = APPROVED`.** This context exposes `GET /internal/venues/:id/eligibility` for that check.\n\nStack alignment: Prisma + Vercel Postgres (Neon), NestJS on Vercel serverless (`apps/api`), Next.js 15 App Router (`apps/web`), zod DTOs in `packages/shared`. All timestamps stored as `DateTime` (UTC, `timestamptz`); all *dates without time* (special hours) stored as `@db.Date` interpreted in `Asia/Seoul`; all wall-clock times (business hours) stored as `\"HH:mm\"` strings interpreted in `Asia/Seoul`. Never store a KST-local `DateTime`.\n\nNaming: English PascalCase models, camelCase fields, shared enums referenced by name. Ids are `cuid()` strings.",
+  "summary": "Design of the Partner & Venue context: PartnerProfile → Business → Venue(1:N) → VenueImage/BusinessHour/SpecialHour, plus Category/Region taxonomies and a VerificationLog audit trail. Three independent approval state machines (partner approval, business verification, venue publication) gate the ability to run reservation events. Images use direct-to-Blob client uploads with a signed ticket + register-after-upload handshake and an orphan sweeper cron; ordering uses a full-array reorder inside one transaction with `sortOrder` unique-deferred, and exactly one cover image is enforced by a partial unique index. Adversarial handling covers 사업자등록번호 checksum + squatting, re-verification on sensitive-field edits, KST/midnight-crossing business hours, double-submit idempotency, blob URL leakage of private registration certificates, optimistic-lock races on concurrent partner edits, and venue delete/hide while live events are running.",
+  "entities": [
+    {
+      "name": "PartnerProfile",
+      "description": "파트너 계정의 비즈니스 프로필. 1 Account(role=PARTNER) : 1 PartnerProfile. 가입 시 자동 생성(PENDING)되며 운영자 승인 전에는 사업자/매장 등록만 가능하고 이벤트 생성은 불가.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "accountId",
+          "type": "String @unique",
+          "notes": "FK → Account.id (Identity context). Account.role must be PARTNER. Enforced at app layer + FK."
+        },
+        {
+          "name": "displayName",
+          "type": "String @db.VarChar(50)",
+          "notes": "담당자 이름. Prefilled from Google profile, editable."
+        },
+        {
+          "name": "contactEmail",
+          "type": "String @db.VarChar(255)",
+          "notes": "Defaults to the Google account email. May differ (운영 담당자 메일). Resend sends partner-facing mail here, not to Account.email."
+        },
+        {
+          "name": "contactPhone",
+          "type": "String? @db.VarChar(20)",
+          "notes": "Stored digits-only normalized KR mobile (01012345678). Required before submitting partner approval."
+        },
+        {
+          "name": "approvalStatus",
+          "type": "PartnerApprovalStatus @default(DRAFT)",
+          "notes": "DRAFT → PENDING → APPROVED/REJECTED → SUSPENDED. See state machine."
+        },
+        {
+          "name": "approvalRequestedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "approvedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "approvedByAccountId",
+          "type": "String?",
+          "notes": "Admin account id."
+        },
+        {
+          "name": "rejectedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "rejectionReason",
+          "type": "String? @db.VarChar(500)",
+          "notes": "Shown verbatim to the partner. Never free-form HTML."
+        },
+        {
+          "name": "suspendedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "suspensionReason",
+          "type": "String? @db.VarChar(500)"
+        },
+        {
+          "name": "termsAgreedAt",
+          "type": "DateTime",
+          "notes": "파트너 이용약관 동의 시각."
+        },
+        {
+          "name": "termsVersion",
+          "type": "String @db.VarChar(20)",
+          "notes": "e.g. \"2026-01-01\". Re-consent required when bumped."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt"
+        }
+      ],
+      "relations": [
+        "businesses Business[]",
+        "verificationLogs VerificationLog[] (polymorphic by targetType=PARTNER)",
+        "@@index([approvalStatus, approvalRequestedAt]) — admin approval queue"
+      ]
+    },
+    {
+      "name": "Business",
+      "description": "사업자 단위 (브랜드/법인). 한 파트너가 여러 사업자를 가질 수 있고(프랜차이즈 본부 등), 사업자 하나가 여러 매장을 가진다. 사업자등록번호 검증의 주체.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "partnerId",
+          "type": "String",
+          "notes": "FK → PartnerProfile.id, onDelete: Restrict."
+        },
+        {
+          "name": "name",
+          "type": "String @db.VarChar(60)",
+          "notes": "상호(브랜드명). Public."
+        },
+        {
+          "name": "legalName",
+          "type": "String @db.VarChar(60)",
+          "notes": "사업자등록증상 상호. Admin-visible only."
+        },
+        {
+          "name": "businessRegistrationNumber",
+          "type": "String @db.VarChar(10)",
+          "notes": "사업자등록번호, digits only, no hyphens. Modulus-10 KR checksum validated in zod. Partial-unique across non-deleted rows."
+        },
+        {
+          "name": "businessType",
+          "type": "BusinessType",
+          "notes": "개인/법인/간이/면세 등."
+        },
+        {
+          "name": "representativeName",
+          "type": "String @db.VarChar(30)",
+          "notes": "대표자명. Admin-visible only (PII)."
+        },
+        {
+          "name": "registrationDocBlobPathname",
+          "type": "String? @db.VarChar(500)",
+          "notes": "사업자등록증 스캔본. Vercel Blob with access:'private' (or a random unguessable pathname + no public listing). NEVER returned to non-admin/non-owner. API returns a short-lived signed URL, not the raw blob URL."
+        },
+        {
+          "name": "verificationStatus",
+          "type": "BusinessVerificationStatus @default(UNSUBMITTED)"
+        },
+        {
+          "name": "verificationSubmittedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "verifiedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "verifiedByAccountId",
+          "type": "String?"
+        },
+        {
+          "name": "verificationRejectionReason",
+          "type": "String? @db.VarChar(500)"
+        },
+        {
+          "name": "contactEmail",
+          "type": "String @db.VarChar(255)"
+        },
+        {
+          "name": "contactPhone",
+          "type": "String @db.VarChar(20)"
+        },
+        {
+          "name": "postalCode",
+          "type": "String? @db.VarChar(5)"
+        },
+        {
+          "name": "roadAddress",
+          "type": "String? @db.VarChar(255)",
+          "notes": "사업장 소재지 (본사). Distinct from venue address."
+        },
+        {
+          "name": "detailAddress",
+          "type": "String? @db.VarChar(255)"
+        },
+        {
+          "name": "settlementBankCode",
+          "type": "String? @db.VarChar(10)",
+          "notes": "정산 계좌 — modeled now, unused while DEPOSIT_HOLD_ENABLED=false. Encrypted at rest (pgcrypto or app-level AES-GCM)."
+        },
+        {
+          "name": "settlementAccountNumberEnc",
+          "type": "Bytes?",
+          "notes": "Encrypted. Never returned by any endpoint; only last-4 exposed."
+        },
+        {
+          "name": "settlementAccountHolder",
+          "type": "String? @db.VarChar(30)"
+        },
+        {
+          "name": "deletedAt",
+          "type": "DateTime?",
+          "notes": "Soft delete. Blocked while any non-archived Venue exists."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt"
+        }
+      ],
+      "relations": [
+        "partner PartnerProfile @relation(fields:[partnerId])",
+        "venues Venue[]",
+        "@@index([partnerId])",
+        "@@index([verificationStatus, verificationSubmittedAt])",
+        "Partial unique index (raw SQL migration): CREATE UNIQUE INDEX business_brn_unique ON \"Business\"(\"businessRegistrationNumber\") WHERE \"deletedAt\" IS NULL AND \"verificationStatus\" <> 'REJECTED';"
+      ]
+    },
+    {
+      "name": "Venue",
+      "description": "실제 매장/공간. 예약 이벤트(ReservationEvent)가 걸리는 대상. 검색/디스커버리의 1차 엔티티.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "businessId",
+          "type": "String",
+          "notes": "FK → Business.id, onDelete: Restrict."
+        },
+        {
+          "name": "name",
+          "type": "String @db.VarChar(60)",
+          "notes": "매장명. Unique per business (case/whitespace-normalized)."
+        },
+        {
+          "name": "slug",
+          "type": "String @unique @db.VarChar(80)",
+          "notes": "URL용. Generated from romanized name + 6-char suffix; immutable after first publish (old slug kept in VenueSlugHistory for 301)."
+        },
+        {
+          "name": "summary",
+          "type": "String? @db.VarChar(60)",
+          "notes": "한 줄 소개. Shown on search cards."
+        },
+        {
+          "name": "description",
+          "type": "String? @db.Text",
+          "notes": "매장 소개. Max 5000 chars, plain text or a constrained markdown subset. Sanitized server-side; no raw HTML."
+        },
+        {
+          "name": "status",
+          "type": "VenueStatus @default(DRAFT)"
+        },
+        {
+          "name": "primaryCategoryId",
+          "type": "String",
+          "notes": "FK → Category.id. Must be a leaf category."
+        },
+        {
+          "name": "regionCode",
+          "type": "String @db.VarChar(10)",
+          "notes": "FK → Region.code (법정동코드 10자리). Denormalized sido/sigungu below for cheap filtering."
+        },
+        {
+          "name": "sido",
+          "type": "String @db.VarChar(20)",
+          "notes": "e.g. \"서울특별시\". Denormalized from Region for filter facets."
+        },
+        {
+          "name": "sigungu",
+          "type": "String @db.VarChar(30)",
+          "notes": "e.g. \"강남구\"."
+        },
+        {
+          "name": "postalCode",
+          "type": "String @db.VarChar(5)"
+        },
+        {
+          "name": "roadAddress",
+          "type": "String @db.VarChar(255)",
+          "notes": "도로명주소. From Kakao/Juso address search widget — never free typed."
+        },
+        {
+          "name": "detailAddress",
+          "type": "String? @db.VarChar(255)",
+          "notes": "상세주소 (층/호). Free text."
+        },
+        {
+          "name": "latitude",
+          "type": "Decimal? @db.Decimal(9,6)"
+        },
+        {
+          "name": "longitude",
+          "type": "Decimal? @db.Decimal(9,6)",
+          "notes": "Filled from the address geocode. Nullable so a save never fails on geocoder downtime; backfilled by cron."
+        },
+        {
+          "name": "phone",
+          "type": "String @db.VarChar(20)",
+          "notes": "매장 대표번호. Public."
+        },
+        {
+          "name": "websiteUrl",
+          "type": "String? @db.VarChar(500)",
+          "notes": "http/https only, no javascript:. rel=nofollow noopener on render."
+        },
+        {
+          "name": "instagramHandle",
+          "type": "String? @db.VarChar(40)"
+        },
+        {
+          "name": "seatCount",
+          "type": "Int?",
+          "notes": "좌석 수 — informational only. Explicitly NOT the event 정원(capacity); ReservationEvent.capacity is independent."
+        },
+        {
+          "name": "reservationNotice",
+          "type": "String? @db.Text",
+          "notes": "예약 시 안내사항 (주차/노쇼/반려동물 등). Copied as the default into new events by the Event context."
+        },
+        {
+          "name": "coverImageId",
+          "type": "String?",
+          "notes": "FK → VenueImage.id. Redundant with VenueImage.isCover; kept for a single-join card query. Kept consistent in the same transaction."
+        },
+        {
+          "name": "timezone",
+          "type": "String @default(\"Asia/Seoul\") @db.VarChar(40)",
+          "notes": "Future-proofing only; MVP is always Asia/Seoul."
+        },
+        {
+          "name": "searchText",
+          "type": "String? @db.Text",
+          "notes": "Denormalized name + summary + category names + sigungu, maintained on write. Indexed with pg_trgm GIN for Korean partial matching (tsvector Korean stemming is unreliable without an extension)."
+        },
+        {
+          "name": "imageCount",
+          "type": "Int @default(0)",
+          "notes": "Denormalized; maintained in the same tx as image add/delete. Used by the publish gate."
+        },
+        {
+          "name": "openEventCount",
+          "type": "Int @default(0)",
+          "notes": "Denormalized cache written by the Event context via an internal endpoint / same-DB tx. Used for the '진행중인 이벤트 있는 매장' filter and sort. Repaired nightly by cron."
+        },
+        {
+          "name": "lastEventEndsAt",
+          "type": "DateTime?",
+          "notes": "Cache used to decide whether hide/delete is safe."
+        },
+        {
+          "name": "version",
+          "type": "Int @default(0)",
+          "notes": "Optimistic lock. Every PATCH sends the version it read; mismatch → 409."
+        },
+        {
+          "name": "submittedForReviewAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "publishedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "hiddenAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "suspendedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "suspensionReason",
+          "type": "String? @db.VarChar(500)"
+        },
+        {
+          "name": "deletedAt",
+          "type": "DateTime?",
+          "notes": "Soft delete → status ARCHIVED."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt"
+        }
+      ],
+      "relations": [
+        "business Business @relation(fields:[businessId])",
+        "primaryCategory Category @relation(\"VenuePrimaryCategory\")",
+        "categories VenueCategoryLink[]",
+        "images VenueImage[]",
+        "businessHours BusinessHour[]",
+        "specialHours VenueSpecialHour[]",
+        "slugHistory VenueSlugHistory[]",
+        "@@unique([businessId, name])",
+        "@@index([status, sido, sigungu])",
+        "@@index([status, primaryCategoryId])",
+        "@@index([status, openEventCount])",
+        "@@index([businessId])"
+      ]
+    },
+    {
+      "name": "VenueImage",
+      "description": "매장 이미지. Vercel Blob에 직접 업로드(client upload) 후 API에 등록하는 2단계 핸드셰이크.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "venueId",
+          "type": "String",
+          "notes": "FK → Venue.id, onDelete: Cascade."
+        },
+        {
+          "name": "blobUrl",
+          "type": "String @db.VarChar(500)",
+          "notes": "Public Vercel Blob URL (immutable, content-addressed by random suffix)."
+        },
+        {
+          "name": "blobPathname",
+          "type": "String @unique @db.VarChar(500)",
+          "notes": "e.g. venues/<venueId>/<uuid>.webp. Used for del() and for the orphan sweeper."
+        },
+        {
+          "name": "mimeType",
+          "type": "String @db.VarChar(50)",
+          "notes": "Allowlist: image/jpeg, image/png, image/webp, image/avif. Verified by magic bytes server-side on register, not by the client-declared type."
+        },
+        {
+          "name": "byteSize",
+          "type": "Int",
+          "notes": "Max 10MB per image, enforced both in the upload token and re-checked at register."
+        },
+        {
+          "name": "width",
+          "type": "Int"
+        },
+        {
+          "name": "height",
+          "type": "Int",
+          "notes": "Min 640x480. Rejected below that at register time."
+        },
+        {
+          "name": "altText",
+          "type": "String? @db.VarChar(120)",
+          "notes": "대체 텍스트 (접근성)."
+        },
+        {
+          "name": "sortOrder",
+          "type": "Int",
+          "notes": "0-based, dense within a venue. Rewritten wholesale by the reorder endpoint."
+        },
+        {
+          "name": "isCover",
+          "type": "Boolean @default(false)",
+          "notes": "Exactly one true per venue when imageCount>0."
+        },
+        {
+          "name": "status",
+          "type": "VenueImageStatus @default(READY)",
+          "notes": "PENDING (token issued, not yet registered) / READY / QUARANTINED (admin takedown) / DELETING."
+        },
+        {
+          "name": "uploadedByAccountId",
+          "type": "String"
+        },
+        {
+          "name": "quarantineReason",
+          "type": "String? @db.VarChar(500)"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "venue Venue @relation(fields:[venueId], onDelete: Cascade)",
+        "@@unique([venueId, sortOrder], map: \"venue_image_order_uq\") — created DEFERRABLE INITIALLY DEFERRED via raw SQL so a whole-array reshuffle inside one tx doesn't trip mid-update",
+        "Partial unique cover index (raw SQL): CREATE UNIQUE INDEX venue_cover_uq ON \"VenueImage\"(\"venueId\") WHERE \"isCover\" = true;",
+        "@@index([venueId, status, sortOrder])"
+      ]
+    },
+    {
+      "name": "BlobUploadTicket",
+      "description": "클라이언트 직접 업로드 티켓. 발급된 pathname만 등록 가능하게 하여 임의 blob 등록(SSRF/도용)을 차단.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "venueId",
+          "type": "String"
+        },
+        {
+          "name": "issuedToAccountId",
+          "type": "String"
+        },
+        {
+          "name": "blobPathname",
+          "type": "String @unique @db.VarChar(500)",
+          "notes": "Server-generated. Client cannot choose it."
+        },
+        {
+          "name": "maxByteSize",
+          "type": "Int"
+        },
+        {
+          "name": "allowedMimeTypes",
+          "type": "String[]"
+        },
+        {
+          "name": "expiresAt",
+          "type": "DateTime",
+          "notes": "now + 15 min."
+        },
+        {
+          "name": "consumedAt",
+          "type": "DateTime?",
+          "notes": "Set when the VenueImage row is created. Single-use."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "@@index([expiresAt, consumedAt]) — orphan sweeper scan"
+      ]
+    },
+    {
+      "name": "Category",
+      "description": "업종/카테고리 분류 트리 (최대 2단계). 운영자만 관리. 이벤트 검색 필터와 공유되는 마스터 데이터.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "code",
+          "type": "String @unique @db.VarChar(40)",
+          "notes": "Stable machine key, e.g. \"dining.omakase\". Used by the Event context's filters; never renamed."
+        },
+        {
+          "name": "nameKo",
+          "type": "String @db.VarChar(40)",
+          "notes": "e.g. \"오마카세\"."
+        },
+        {
+          "name": "nameEn",
+          "type": "String? @db.VarChar(40)"
+        },
+        {
+          "name": "parentId",
+          "type": "String?",
+          "notes": "Null = top level. Depth is hard-capped at 2."
+        },
+        {
+          "name": "iconKey",
+          "type": "String? @db.VarChar(40)",
+          "notes": "shadcn/lucide icon name for the discovery chips."
+        },
+        {
+          "name": "sortOrder",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "isActive",
+          "type": "Boolean @default(true)",
+          "notes": "Deactivating hides it from pickers/filters but does not orphan existing venues."
+        },
+        {
+          "name": "venueCount",
+          "type": "Int @default(0)",
+          "notes": "Denormalized ACTIVE venue count for facet display; refreshed by nightly cron."
+        }
+      ],
+      "relations": [
+        "parent Category? @relation(\"CategoryTree\", fields:[parentId])",
+        "children Category[] @relation(\"CategoryTree\")",
+        "venueLinks VenueCategoryLink[]",
+        "@@index([parentId, sortOrder])"
+      ]
+    },
+    {
+      "name": "VenueCategoryLink",
+      "description": "매장 ↔ 카테고리 다대다 (대표 1 + 보조 최대 2).",
+      "fields": [
+        {
+          "name": "venueId",
+          "type": "String"
+        },
+        {
+          "name": "categoryId",
+          "type": "String"
+        },
+        {
+          "name": "isPrimary",
+          "type": "Boolean @default(false)",
+          "notes": "Must mirror Venue.primaryCategoryId; both written in one tx."
+        }
+      ],
+      "relations": [
+        "@@id([venueId, categoryId])",
+        "@@index([categoryId])"
+      ]
+    },
+    {
+      "name": "Region",
+      "description": "행정구역 마스터 (법정동 코드 기준). 지역 필터의 소스. 시드 데이터, 운영자만 갱신.",
+      "fields": [
+        {
+          "name": "code",
+          "type": "String @id @db.VarChar(10)",
+          "notes": "법정동코드 10자리."
+        },
+        {
+          "name": "level",
+          "type": "RegionLevel",
+          "notes": "SIDO / SIGUNGU / EUPMYEONDONG."
+        },
+        {
+          "name": "parentCode",
+          "type": "String? @db.VarChar(10)"
+        },
+        {
+          "name": "sido",
+          "type": "String @db.VarChar(20)"
+        },
+        {
+          "name": "sigungu",
+          "type": "String? @db.VarChar(30)"
+        },
+        {
+          "name": "eupmyeondong",
+          "type": "String? @db.VarChar(30)"
+        },
+        {
+          "name": "displayName",
+          "type": "String @db.VarChar(60)",
+          "notes": "\"서울 강남구\" — the label users actually see in filters."
+        },
+        {
+          "name": "isActive",
+          "type": "Boolean @default(true)",
+          "notes": "행정구역 개편 시 false 처리, 기존 매장은 유지."
+        },
+        {
+          "name": "venueCount",
+          "type": "Int @default(0)"
+        }
+      ],
+      "relations": [
+        "parent Region? @relation(\"RegionTree\", fields:[parentCode])",
+        "children Region[] @relation(\"RegionTree\")",
+        "@@index([level, parentCode])"
+      ]
+    },
+    {
+      "name": "BusinessHour",
+      "description": "요일별 정기 영업시간. 매장당 요일 1행(최대 7행). 시간은 'HH:mm' 문자열 + KST 해석.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "venueId",
+          "type": "String"
+        },
+        {
+          "name": "dayOfWeek",
+          "type": "DayOfWeek",
+          "notes": "MON..SUN."
+        },
+        {
+          "name": "isClosed",
+          "type": "Boolean @default(false)",
+          "notes": "정기 휴무일. When true all time fields must be null."
+        },
+        {
+          "name": "opensAt",
+          "type": "String? @db.VarChar(5)",
+          "notes": "\"11:30\". KST wall clock."
+        },
+        {
+          "name": "closesAt",
+          "type": "String? @db.VarChar(5)",
+          "notes": "\"02:00\" is legal and means next-day 02:00 (crossesMidnight). Range allowed 00:00–29:59 form is NOT used; instead closesAt < opensAt implies midnight crossing."
+        },
+        {
+          "name": "breakStartAt",
+          "type": "String? @db.VarChar(5)",
+          "notes": "브레이크타임 시작."
+        },
+        {
+          "name": "breakEndAt",
+          "type": "String? @db.VarChar(5)"
+        },
+        {
+          "name": "lastOrderAt",
+          "type": "String? @db.VarChar(5)",
+          "notes": "라스트오더."
+        }
+      ],
+      "relations": [
+        "venue Venue @relation(fields:[venueId], onDelete: Cascade)",
+        "@@unique([venueId, dayOfWeek])"
+      ]
+    },
+    {
+      "name": "VenueSpecialHour",
+      "description": "특정 날짜의 임시 휴무/단축 영업 (공휴일, 내부 행사). 정기 영업시간을 덮어씀.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "venueId",
+          "type": "String"
+        },
+        {
+          "name": "date",
+          "type": "DateTime @db.Date",
+          "notes": "KST calendar date. Stored as a pure DATE to dodge UTC-offset drift entirely."
+        },
+        {
+          "name": "isClosed",
+          "type": "Boolean @default(true)"
+        },
+        {
+          "name": "opensAt",
+          "type": "String? @db.VarChar(5)"
+        },
+        {
+          "name": "closesAt",
+          "type": "String? @db.VarChar(5)"
+        },
+        {
+          "name": "reason",
+          "type": "String? @db.VarChar(100)",
+          "notes": "e.g. \"설 연휴 휴무\". Public."
+        }
+      ],
+      "relations": [
+        "venue Venue @relation(fields:[venueId], onDelete: Cascade)",
+        "@@unique([venueId, date])",
+        "@@index([date])"
+      ]
+    },
+    {
+      "name": "VenueSlugHistory",
+      "description": "슬러그 변경 이력. 옛 URL 301 리다이렉트용 + 슬러그 재사용(스쿼팅) 방지.",
+      "fields": [
+        {
+          "name": "slug",
+          "type": "String @id @db.VarChar(80)"
+        },
+        {
+          "name": "venueId",
+          "type": "String"
+        },
+        {
+          "name": "retiredAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "@@index([venueId])"
+      ]
+    },
+    {
+      "name": "VerificationLog",
+      "description": "파트너/사업자/매장/이미지의 모든 상태 전이 감사 로그. append-only, 삭제 불가.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "targetType",
+          "type": "VerificationTargetType",
+          "notes": "PARTNER / BUSINESS / VENUE / VENUE_IMAGE."
+        },
+        {
+          "name": "targetId",
+          "type": "String"
+        },
+        {
+          "name": "fromStatus",
+          "type": "String @db.VarChar(40)"
+        },
+        {
+          "name": "toStatus",
+          "type": "String @db.VarChar(40)"
+        },
+        {
+          "name": "actorAccountId",
+          "type": "String",
+          "notes": "Admin or partner or the literal \"system\" for cron transitions."
+        },
+        {
+          "name": "actorRole",
+          "type": "AccountRole",
+          "notes": "Shared enum from Identity context."
+        },
+        {
+          "name": "reason",
+          "type": "String? @db.VarChar(500)",
+          "notes": "Partner-visible."
+        },
+        {
+          "name": "internalMemo",
+          "type": "String? @db.Text",
+          "notes": "Admin-only. NEVER serialized into any partner/user response DTO."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "@@index([targetType, targetId, createdAt])",
+        "@@index([actorAccountId, createdAt])"
+      ]
+    },
+    {
+      "name": "VenueEditSnapshot",
+      "description": "ACTIVE 매장의 민감 필드 수정 시 재심사 대기 스냅샷. 심사 중에도 기존 공개 버전은 유지된다(shadow edit).",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "venueId",
+          "type": "String"
+        },
+        {
+          "name": "payload",
+          "type": "Json",
+          "notes": "Only the sensitive subset: name, roadAddress/detailAddress/regionCode, primaryCategoryId, phone. Non-sensitive fields (description, images, hours) bypass this and go live immediately."
+        },
+        {
+          "name": "status",
+          "type": "EditReviewStatus @default(PENDING)",
+          "notes": "PENDING / APPROVED / REJECTED / WITHDRAWN."
+        },
+        {
+          "name": "submittedByAccountId",
+          "type": "String"
+        },
+        {
+          "name": "reviewedByAccountId",
+          "type": "String?"
+        },
+        {
+          "name": "reviewedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "rejectionReason",
+          "type": "String? @db.VarChar(500)"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "venue Venue @relation(fields:[venueId], onDelete: Cascade)",
+        "Partial unique (raw SQL): only one PENDING snapshot per venue.",
+        "@@index([status, createdAt])"
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "name": "PartnerApprovalStatus",
+      "values": [
+        "DRAFT",
+        "PENDING",
+        "APPROVED",
+        "REJECTED",
+        "SUSPENDED"
+      ]
+    },
+    {
+      "name": "BusinessVerificationStatus",
+      "values": [
+        "UNSUBMITTED",
+        "PENDING",
+        "VERIFIED",
+        "REJECTED",
+        "REVOKED"
+      ]
+    },
+    {
+      "name": "BusinessType",
+      "values": [
+        "INDIVIDUAL",
+        "CORPORATION",
+        "SIMPLIFIED",
+        "TAX_EXEMPT",
+        "NONPROFIT"
+      ]
+    },
+    {
+      "name": "VenueStatus",
+      "values": [
+        "DRAFT",
+        "PENDING_REVIEW",
+        "ACTIVE",
+        "HIDDEN",
+        "SUSPENDED",
+        "ARCHIVED"
+      ]
+    },
+    {
+      "name": "VenueImageStatus",
+      "values": [
+        "PENDING",
+        "READY",
+        "QUARANTINED",
+        "DELETING"
+      ]
+    },
+    {
+      "name": "EditReviewStatus",
+      "values": [
+        "PENDING",
+        "APPROVED",
+        "REJECTED",
+        "WITHDRAWN"
+      ]
+    },
+    {
+      "name": "VerificationTargetType",
+      "values": [
+        "PARTNER",
+        "BUSINESS",
+        "VENUE",
+        "VENUE_IMAGE"
+      ]
+    },
+    {
+      "name": "DayOfWeek",
+      "values": [
+        "MON",
+        "TUE",
+        "WED",
+        "THU",
+        "FRI",
+        "SAT",
+        "SUN"
+      ]
+    },
+    {
+      "name": "RegionLevel",
+      "values": [
+        "SIDO",
+        "SIGUNGU",
+        "EUPMYEONDONG"
+      ]
+    },
+    {
+      "name": "VenueSortKey",
+      "values": [
+        "RELEVANCE",
+        "RECENT",
+        "DEADLINE_SOON",
+        "EVENT_COUNT",
+        "DISTANCE",
+        "NAME"
+      ]
+    },
+    {
+      "name": "AccountRole",
+      "values": [
+        "ADMIN",
+        "PARTNER",
+        "USER"
+      ]
+    }
+  ],
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/partners/apply",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "파트너 승인 신청. DRAFT PartnerProfile을 PENDING으로 전환. Body: displayName, contactEmail, contactPhone, termsVersion. Requires at least one Business in PENDING or VERIFIED. Idempotent: calling while already PENDING returns 200 with the existing state, not a duplicate submission."
+    },
+    {
+      "method": "GET",
+      "path": "/partners/me",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "내 파트너 프로필 + approvalStatus + rejectionReason + 소유 사업자/매장 요약 카운트. The web app gates the entire partner console on this response."
+    },
+    {
+      "method": "PATCH",
+      "path": "/partners/me",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "담당자명/연락처/알림 수신 설정 수정. Editing contactEmail/contactPhone while APPROVED does NOT re-trigger approval."
+    },
+    {
+      "method": "GET",
+      "path": "/partners/me/businesses",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "내 사업자 목록 (verificationStatus 포함). settlementAccountNumber는 마스킹(****1234)."
+    },
+    {
+      "method": "POST",
+      "path": "/businesses",
+      "roles": [
+        "PARTNER"
+      ],
+      "description": "사업자 등록. Body includes businessRegistrationNumber (checksum-validated), legalName, representativeName, businessType, 주소, 연락처. Requires an Idempotency-Key header; duplicate keys within 24h return the original result."
+    },
+    {
+      "method": "GET",
+      "path": "/businesses/:businessId",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ],
+      "description": "사업자 상세. Owner sees own data; ADMIN sees everything incl. internal memos."
+    },
+    {
+      "method": "PATCH",
+      "path": "/businesses/:businessId",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "사업자 정보 수정. Changing businessRegistrationNumber / legalName / representativeName on a VERIFIED business forces verificationStatus back to PENDING and cascades all its ACTIVE venues to HIDDEN (see rules)."
+    },
+    {
+      "method": "POST",
+      "path": "/businesses/:businessId/registration-doc/upload-token",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "사업자등록증 업로드용 private Blob 토큰 발급 (single-use, 15분, PDF/JPEG/PNG, ≤10MB)."
+    },
+    {
+      "method": "POST",
+      "path": "/businesses/:businessId/submit-verification",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "사업자 인증 심사 요청. Requires registrationDocBlobPathname present. UNSUBMITTED|REJECTED → PENDING."
+    },
+    {
+      "method": "DELETE",
+      "path": "/businesses/:businessId",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "사업자 소프트 삭제. 409 if any Venue is not ARCHIVED, or any venue has an event that is not finalized."
+    },
+    {
+      "method": "POST",
+      "path": "/businesses/:businessId/venues",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "매장 생성 (DRAFT). Address must come from the Juso/Kakao search widget payload (roadAddress + regionCode + lat/lng), not free text."
+    },
+    {
+      "method": "GET",
+      "path": "/venues/:idOrSlug",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "매장 상세. PUBLIC/USER only for status=ACTIVE (otherwise 404, never 403 — no existence leak). Owner/ADMIN can read any status via ?preview=true. Response omits legalName, representativeName, 사업자등록번호, settlement fields for non-owner."
+    },
+    {
+      "method": "PATCH",
+      "path": "/venues/:venueId",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "매장 수정. Requires If-Match style body field `version`; mismatch → 409 CONFLICT_STALE_VENUE. If status=ACTIVE and the patch touches sensitive fields (name/address/primaryCategory/phone), a VenueEditSnapshot(PENDING) is created and the live record is untouched; the response says 심사중."
+    },
+    {
+      "method": "POST",
+      "path": "/venues/:venueId/submit-review",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "매장 공개 심사 요청. DRAFT|HIDDEN → PENDING_REVIEW. Publish gate must pass (see rules R-14)."
+    },
+    {
+      "method": "POST",
+      "path": "/venues/:venueId/hide",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ],
+      "description": "매장 노출 중지 (ACTIVE → HIDDEN). 409 if the venue has an OPEN reservation event, unless ?force=true which requires a reason and notifies applicants via the Notification context."
+    },
+    {
+      "method": "POST",
+      "path": "/venues/:venueId/unhide",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "HIDDEN → ACTIVE. No re-review needed if nothing sensitive changed since; otherwise → PENDING_REVIEW."
+    },
+    {
+      "method": "DELETE",
+      "path": "/venues/:venueId",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "매장 삭제 (soft, → ARCHIVED). 409 if any event is OPEN or awaiting finalization, or any deposit hold is unresolved. Slug is retired to VenueSlugHistory and not reusable."
+    },
+    {
+      "method": "POST",
+      "path": "/venues/:venueId/images/upload-token",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "이미지 업로드 티켓 발급. Returns { ticketId, blobPathname, clientToken, expiresAt }. Server chooses the pathname. 409 if the venue already has 20 READY+PENDING images."
+    },
+    {
+      "method": "POST",
+      "path": "/venues/:venueId/images",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "업로드 완료 등록. Body: { ticketId, width, height, byteSize, altText? }. Server HEAD/fetches the blob, verifies magic bytes + size, marks the ticket consumed, appends at sortOrder = max+1, and sets isCover=true if it is the first image. Ticket is single-use → double-submit is naturally idempotent (second call returns the same image)."
+    },
+    {
+      "method": "PATCH",
+      "path": "/venues/:venueId/images/order",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "이미지 순서 일괄 변경. Body: { imageIds: string[] } — must be an exact permutation of the venue's READY image ids, else 400. Applied in one tx against the deferrable unique index."
+    },
+    {
+      "method": "PATCH",
+      "path": "/venues/:venueId/images/:imageId",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "대체 텍스트 수정."
+    },
+    {
+      "method": "POST",
+      "path": "/venues/:venueId/images/:imageId/cover",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "대표 이미지 지정. Clears the previous cover and sets Venue.coverImageId in the same tx."
+    },
+    {
+      "method": "DELETE",
+      "path": "/venues/:venueId/images/:imageId",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "이미지 삭제. 409 if it is the last remaining image and the venue is ACTIVE. Deleting the cover promotes sortOrder=0 to cover. DB row deleted in tx; Blob del() is best-effort after commit, with the orphan sweeper as the safety net."
+    },
+    {
+      "method": "PUT",
+      "path": "/venues/:venueId/business-hours",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "영업시간 일괄 저장 (7일 전체 replace). Validated: HH:mm format, break window inside the open window, lastOrder before close, closesAt<opensAt means 익일 마감."
+    },
+    {
+      "method": "GET",
+      "path": "/venues/:venueId/business-hours",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "영업시간 조회. Includes a computed `todayStatus`: 영업중/브레이크타임/영업종료/휴무일, evaluated in Asia/Seoul at request time."
+    },
+    {
+      "method": "POST",
+      "path": "/venues/:venueId/special-hours",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "임시 휴무/특별 영업일 등록. Upsert on (venueId, date). Only dates from today(KST) up to +180d."
+    },
+    {
+      "method": "DELETE",
+      "path": "/venues/:venueId/special-hours/:date",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "특별 영업일 삭제. :date is YYYY-MM-DD in KST."
+    },
+    {
+      "method": "GET",
+      "path": "/categories",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "카테고리 트리 (isActive만). Cached with s-maxage=3600, stale-while-revalidate."
+    },
+    {
+      "method": "GET",
+      "path": "/regions",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "지역 목록. ?level=SIGUNGU&parentCode=... . Cached like categories."
+    },
+    {
+      "method": "GET",
+      "path": "/search/venues",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "매장 검색. Query: q, regionCode[], categoryCode[], hasOpenEvent, mode(INSTANT|BID, delegated to the Event index), sort(VenueSortKey), lat/lng+radiusKm for DISTANCE, cursor, limit≤30. Only status=ACTIVE. Keyset pagination on (sortKey, id) — never OFFSET."
+    },
+    {
+      "method": "GET",
+      "path": "/search/partners",
+      "roles": [
+        "PUBLIC"
+      ],
+      "description": "파트너/브랜드 검색. Returns Business.name + ACTIVE venue count + cover images. 사업자등록번호/대표자명 are never in the response or searchable."
+    },
+    {
+      "method": "GET",
+      "path": "/venues/:venueId/summary-for-event",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "이벤트 생성 화면용 요약 (매장명, 주소, 대표이미지, reservationNotice 기본값, eligibility). Read-only convenience for the Event context UI."
+    },
+    {
+      "method": "GET",
+      "path": "/internal/venues/:venueId/eligibility",
+      "roles": [
+        "INTERNAL(service token)"
+      ],
+      "description": "이벤트 생성/공개 가능 여부. Returns { eligible, reasons[] } derived from partner APPROVED + business VERIFIED + venue ACTIVE + not SUSPENDED. Called by the Event context."
+    },
+    {
+      "method": "POST",
+      "path": "/internal/venues/:venueId/event-counters",
+      "roles": [
+        "INTERNAL(service token)"
+      ],
+      "description": "openEventCount / lastEventEndsAt 갱신. Called by the Event context on event open/close/cancel."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/partners",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "파트너 승인 대기열. ?status=PENDING&cursor=... sorted by approvalRequestedAt ASC."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/partners/:partnerId/approve",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "파트너 승인. PENDING → APPROVED. Writes VerificationLog and fires the partner-approved notification."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/partners/:partnerId/reject",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "파트너 반려. Requires reason (partner-visible). PENDING → REJECTED; the partner may fix and resubmit."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/partners/:partnerId/suspend",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "파트너 이용 정지. Cascades: all ACTIVE venues → SUSPENDED, and the Event context is notified to close open events."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/partners/:partnerId/reinstate",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "정지 해제 → APPROVED. Venues do NOT auto-return to ACTIVE; the partner must unhide each one."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/businesses",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "사업자 인증 심사 대기열 + 사업자등록번호 중복/유사 후보 표시."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/businesses/:businessId/verify",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "사업자 인증 승인. PENDING → VERIFIED."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/businesses/:businessId/reject",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "사업자 인증 반려. Requires reason."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/businesses/:businessId/revoke",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "인증 취소 (위조 적발 등). VERIFIED → REVOKED, cascades all venues to SUSPENDED."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/businesses/:businessId/registration-doc",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "사업자등록증 열람용 단기 서명 URL(60초) 발급. Every access is written to VerificationLog."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/venues",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "매장 심사/관리 목록. ?status=PENDING_REVIEW."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/venues/:venueId/approve",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "매장 공개 승인. PENDING_REVIEW → ACTIVE, publishedAt set."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/venues/:venueId/reject",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "매장 공개 반려. PENDING_REVIEW → DRAFT with reason."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/venues/:venueId/suspend",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "매장 강제 비공개. Any → SUSPENDED with reason; the Event context cancels open events."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/venue-edits",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "ACTIVE 매장 민감정보 수정 심사 대기열 (VenueEditSnapshot PENDING)."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/venue-edits/:snapshotId/approve",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "수정 승인 → payload를 Venue에 머지, version++."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/venue-edits/:snapshotId/reject",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "수정 반려 (reason 필수)."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/venues/:venueId/images/:imageId/quarantine",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "부적절 이미지 격리. status → QUARANTINED, removed from public responses immediately; if it was the cover, the next image is promoted."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/categories",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "카테고리 생성 (code는 생성 후 불변)."
+    },
+    {
+      "method": "PATCH",
+      "path": "/admin/categories/:categoryId",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "카테고리 이름/정렬/활성화 수정. Deactivating a category with venues returns a warning count, not an error."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/verification-logs",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "감사 로그 조회. ?targetType&targetId&actorAccountId&from&to."
+    },
+    {
+      "method": "POST",
+      "path": "/internal/cron/blob-orphan-sweep",
+      "roles": [
+        "CRON(secret header)"
+      ],
+      "description": "Vercel Cron, hourly. (1) expired unconsumed BlobUploadTickets → Blob del() + row delete; (2) blobs under venues/* with no VenueImage row and older than 24h → del(); (3) VenueImage rows in DELETING → retry del(). All work is chunked (≤200 blobs/run) to stay under the serverless timeout."
+    },
+    {
+      "method": "POST",
+      "path": "/internal/cron/venue-counters-refresh",
+      "roles": [
+        "CRON(secret header)"
+      ],
+      "description": "Vercel Cron, nightly 04:00 KST (19:00 UTC). Recomputes Venue.imageCount/openEventCount and Category.venueCount/Region.venueCount from source of truth, repairing drift."
+    },
+    {
+      "method": "POST",
+      "path": "/internal/cron/geocode-backfill",
+      "roles": [
+        "CRON(secret header)"
+      ],
+      "description": "Vercel Cron, every 15 min. Geocodes venues with null lat/lng (≤50 per run)."
+    }
+  ],
+  "stateMachines": [
+    {
+      "entity": "PartnerProfile.approvalStatus",
+      "states": [
+        "DRAFT",
+        "PENDING",
+        "APPROVED",
+        "REJECTED",
+        "SUSPENDED"
+      ],
+      "transitions": [
+        "DRAFT → PENDING : partner calls POST /partners/apply; requires displayName, contactPhone, termsAgreedAt, and ≥1 Business in PENDING|VERIFIED",
+        "PENDING → APPROVED : admin approve; sets approvedAt/approvedByAccountId; notification `partner-approved`",
+        "PENDING → REJECTED : admin reject with reason; notification `partner-rejected`",
+        "REJECTED → PENDING : partner fixes data and resubmits (no limit, but rate-limited to 1 resubmit / 10 min)",
+        "APPROVED → SUSPENDED : admin suspend; cascades venues ACTIVE→SUSPENDED and signals the Event context",
+        "SUSPENDED → APPROVED : admin reinstate; venues stay SUSPENDED/HIDDEN and must be individually unhidden",
+        "DRAFT → (deleted) : allowed only while no Business exists"
+      ],
+      "notes": "Only APPROVED partners may create/publish ReservationEvents. PENDING partners CAN create businesses and DRAFT venues so onboarding isn't blocked on the admin."
+    },
+    {
+      "entity": "Business.verificationStatus",
+      "states": [
+        "UNSUBMITTED",
+        "PENDING",
+        "VERIFIED",
+        "REJECTED",
+        "REVOKED"
+      ],
+      "transitions": [
+        "UNSUBMITTED → PENDING : submit-verification (requires registration doc uploaded)",
+        "PENDING → VERIFIED : admin verify",
+        "PENDING → REJECTED : admin reject with reason",
+        "REJECTED → PENDING : resubmit after correction",
+        "VERIFIED → PENDING : partner edits businessRegistrationNumber / legalName / representativeName (auto-demotion) → all ACTIVE venues of this business go HIDDEN",
+        "VERIFIED → REVOKED : admin revoke (fraud) → all venues SUSPENDED",
+        "REVOKED → PENDING : admin-only manual reinstatement path"
+      ]
+    },
+    {
+      "entity": "Venue.status",
+      "states": [
+        "DRAFT",
+        "PENDING_REVIEW",
+        "ACTIVE",
+        "HIDDEN",
+        "SUSPENDED",
+        "ARCHIVED"
+      ],
+      "transitions": [
+        "(create) → DRAFT",
+        "DRAFT → PENDING_REVIEW : submit-review; publish gate R-14 must pass",
+        "PENDING_REVIEW → ACTIVE : admin approve (or auto-approve if AUTO_APPROVE_VENUE flag is on and the business is VERIFIED)",
+        "PENDING_REVIEW → DRAFT : admin reject with reason",
+        "ACTIVE → HIDDEN : partner hide (blocked while an OPEN event exists unless force+reason)",
+        "HIDDEN → ACTIVE : partner unhide, if nothing sensitive changed; else → PENDING_REVIEW",
+        "ACTIVE|HIDDEN|PENDING_REVIEW → SUSPENDED : admin suspend, or cascade from partner suspension / business revoke",
+        "SUSPENDED → HIDDEN : admin lifts the suspension (never straight to ACTIVE — the partner must consciously re-publish)",
+        "DRAFT|HIDDEN → ARCHIVED : partner delete (soft); blocked while any event is OPEN or unfinalized",
+        "ARCHIVED → (terminal) : restore is an admin-only support action"
+      ],
+      "notes": "Public search and public venue detail return ONLY ACTIVE. Every other status 404s for anonymous/USER — never 403, to avoid confirming that a venue id exists."
+    },
+    {
+      "entity": "VenueImage.status",
+      "states": [
+        "PENDING",
+        "READY",
+        "QUARANTINED",
+        "DELETING"
+      ],
+      "transitions": [
+        "(upload token issued) → PENDING (BlobUploadTicket row only; VenueImage row is created directly as READY on register)",
+        "PENDING → READY : register endpoint validates magic bytes + dimensions + size",
+        "READY → QUARANTINED : admin takedown; instantly excluded from public DTOs; cover is re-promoted",
+        "READY|QUARANTINED → DELETING : delete requested; row soft-marked then hard-deleted after Blob del() succeeds, or left for the sweeper",
+        "PENDING (ticket expired, never registered) → swept by cron"
+      ]
+    },
+    {
+      "entity": "VenueEditSnapshot.status",
+      "states": [
+        "PENDING",
+        "APPROVED",
+        "REJECTED",
+        "WITHDRAWN"
+      ],
+      "transitions": [
+        "(sensitive PATCH on an ACTIVE venue) → PENDING",
+        "PENDING → APPROVED : admin approve; payload merged into Venue, version++, searchText rebuilt",
+        "PENDING → REJECTED : admin reject with reason; live venue unchanged",
+        "PENDING → WITHDRAWN : partner submits a newer edit (previous PENDING is auto-withdrawn) or cancels"
+      ]
+    }
+  ],
+  "businessRules": [
+    "R-1 Ownership chain: every write path resolves Venue → Business → PartnerProfile → accountId and compares against the JWT subject. Never trust a businessId/partnerId supplied in the body; derive it from the path resource. A NestJS `VenueOwnerGuard` does this in one query and attaches the loaded venue to the request.",
+    "R-2 Event eligibility (the contract with the Event context): a ReservationEvent may be created or published only if PartnerProfile.approvalStatus = APPROVED AND Business.verificationStatus = VERIFIED AND Venue.status = ACTIVE. Evaluated at both create time and publish time — a venue can be suspended between the two.",
+    "R-3 Partners may register businesses and build DRAFT venues while approvalStatus = PENDING. Onboarding is never blocked on the admin queue; only going live is.",
+    "R-4 사업자등록번호 must be exactly 10 digits and pass the Korean NTS modulus checksum, validated in a shared zod refinement in `packages/shared` so web and api agree. Hyphens are stripped before storage and comparison.",
+    "R-5 A 사업자등록번호 is unique across all non-deleted, non-REJECTED businesses. A collision on submit returns 409 BRN_ALREADY_REGISTERED with no information about who owns it; the admin queue shows the collision so a real franchise case can be resolved manually.",
+    "R-6 Editing businessRegistrationNumber, legalName, or representativeName on a VERIFIED business automatically demotes it to PENDING and hides all of its ACTIVE venues. This closes the 'verify with a clean identity, then swap it' attack. The partner is notified with the reason.",
+    "R-7 사업자등록증 scans are private blobs. No endpoint returns the raw blob URL. Admin viewing goes through a 60-second signed URL and every issuance is logged to VerificationLog. Vercel Blob public URLs are unguessable but permanent — treat them as bearer tokens and never put registration docs in the public store.",
+    "R-8 Settlement account fields are encrypted at rest and are write-only over the API: responses return only the bank name and the last 4 digits. They exist now to keep the deposit/refund feature (DEPOSIT_HOLD_ENABLED) modelable without a schema migration later.",
+    "R-9 A venue address must originate from the address-search widget: the client submits { roadAddress, postalCode, regionCode, latitude, longitude, buildingName } as one blob and the server re-validates regionCode against the Region table. Free-typed addresses are rejected — otherwise region filters silently rot.",
+    "R-10 detailAddress (층/호) is the only free-text address field and is never used for geocoding or search matching.",
+    "R-11 A venue has exactly one primary category (must be a leaf) and at most 2 secondary categories. Venue.primaryCategoryId and the VenueCategoryLink row with isPrimary=true are written in the same transaction and are checked by the nightly consistency cron.",
+    "R-12 Image limits: 1–20 images per venue, each ≤10MB, ≥640×480, mime in {jpeg,png,webp,avif} verified by magic bytes server-side on register (a client-declared Content-Type is not evidence). EXIF is not trusted for dimensions.",
+    "R-13 Exactly one cover image while imageCount > 0, enforced by a partial unique index on (venueId) WHERE isCover. The first registered image auto-becomes cover. Deleting or quarantining the cover promotes the lowest sortOrder survivor in the same transaction.",
+    "R-14 Publish gate (submit-review). All must hold: business.verificationStatus ∈ {PENDING, VERIFIED} (VERIFIED required for final approval), name, roadAddress+regionCode, phone, primaryCategoryId present, description ≥ 30 characters, imageCount ≥ 1 with a cover set, and business hours defined for all 7 days (isClosed counts as defined). The endpoint returns the full list of missing items at once, not the first failure.",
+    "R-15 Reordering is a whole-array operation, never a per-item swap. The client PATCHes the complete ordered id array; the server verifies it is an exact permutation of the venue's READY images (same length, same set) and rewrites sortOrder 0..n-1 in one transaction. This makes concurrent drag-and-drop from two tabs last-write-wins instead of corrupting the order.",
+    "R-16 Business hours are KST wall-clock strings, never DateTime. `closesAt <= opensAt` means the venue closes after midnight (e.g. 18:00–02:00) and is rendered as '익일 02:00'. The open/closed computation always evaluates 'now' in Asia/Seoul and, for a midnight-crossing row, also checks the *previous* day's row.",
+    "R-17 VenueSpecialHour completely overrides the BusinessHour row for that KST date, including the midnight-crossing tail (a 휴무 on the 5th kills the 4th's 18:00→02:00 tail as well; documented and shown in the UI preview).",
+    "R-18 Special hours are limited to today(KST) .. +180 days, capped at 200 rows per venue, and past rows are purged by the nightly cron.",
+    "R-19 Sensitive-field edits on an ACTIVE venue (name, address, primaryCategory, phone) go through VenueEditSnapshot and do not change the live record until approved. Everything else (description, images, hours, notice, SNS links) publishes immediately — image moderation is reactive, not gating, because a partner must be able to fix a bad photo during a live event.",
+    "R-20 Only one PENDING VenueEditSnapshot per venue; submitting a new one auto-WITHDRAWs the previous.",
+    "R-21 slug is generated once from the romanized name plus a 6-char base32 suffix and is immutable after first publish. Renaming the venue does not change the URL. Retired slugs go to VenueSlugHistory and are never reissued (prevents another partner from inheriting a competitor's inbound links).",
+    "R-22 Hiding or deleting a venue is blocked (409) while it has an event that is OPEN or past-deadline-but-unfinalized. `force=true` with a reason is allowed for hide only, and triggers `event-canceled` notifications to applicants through the Notification context — the partner is shown the exact applicant count before confirming.",
+    "R-23 Admin suspension of a partner cascades: venues ACTIVE → SUSPENDED, and the Event context is signaled to cancel open events and (once deposits ship) refund all held deposits. Reinstatement never auto-restores; the partner re-publishes deliberately.",
+    "R-24 Every status transition on Partner/Business/Venue/VenueImage writes a VerificationLog row in the same transaction as the status update. If the log write fails the transition fails. `internalMemo` is stripped from every non-ADMIN DTO by a class-serializer group, not by hand-picking fields.",
+    "R-25 Public DTOs for Venue never contain: legalName, representativeName, businessRegistrationNumber, settlement fields, registrationDocBlobPathname, internal memos, admin ids, suspensionReason, or the owning accountId. Enforced by a single `toPublicVenueDto` mapper plus a DTO snapshot test that fails when a new field is added without a classification.",
+    "R-26 Public search returns only Venue.status = ACTIVE. Non-active venues 404 for anonymous/USER rather than 403.",
+    "R-27 Search uses keyset pagination on (sortValue, id) with a hard limit of 30 per page and a max cursor depth; OFFSET pagination is banned because Neon connection budget on serverless makes deep scans expensive.",
+    "R-28 Korean text search uses pg_trgm GIN on Venue.searchText (name + summary + category nameKo + sigungu, lowercased, spaces collapsed). Queries shorter than 2 characters skip the text predicate entirely and fall back to filters only.",
+    "R-29 searchText, imageCount, sido, sigungu are denormalized and MUST be recomputed inside the same transaction as any write that affects them. The nightly cron re-derives and repairs drift rather than relying on perfect discipline.",
+    "R-30 Idempotency: POST /businesses, POST /venues, and POST /partners/apply require an `Idempotency-Key` header. Keys are stored with the response hash for 24h. This is the double-submit defense, not client-side button disabling.",
+    "R-31 Upload tickets are single-use and server-named. Registration only accepts a ticketId; a client can never register an arbitrary blob URL. This blocks both hot-linking someone else's blob and pointing the platform at attacker-controlled storage.",
+    "R-32 Blob deletion is best-effort-after-commit. The DB is the source of truth; the hourly sweeper reconciles storage. Never make a user-facing write depend on a Blob API call succeeding.",
+    "R-33 Rate limits (per account, sliding window in Postgres or Vercel KV): venue create 10/day, image upload-token 100/hour, partner resubmit 1/10min, search 60/min per IP. Exceeding returns 429 with Retry-After.",
+    "R-34 Optimistic locking on Venue via `version`. Every PATCH carries the version it read; the UPDATE is `WHERE id = ? AND version = ?` and a 0-row result becomes 409 CONFLICT_STALE_VENUE with the current record so the UI can show a diff. This is the concurrent-partner-staff-editing defense — deliberately cheap, no locks.",
+    "R-35 All user-visible copy (status labels, rejection templates, validation messages) lives in `packages/shared/src/i18n/ko.ts` keyed by an enum-derived code, so the API returns codes and the web renders Korean. Never return Korean prose from the API for anything the UI needs to style."
+  ],
+  "edgeCases": [
+    "사업자등록번호 스쿼팅: an attacker registers a well-known restaurant's real BRN before the owner does, to hold the name. Mitigation: uniqueness only bites on non-REJECTED rows, admin sees the collision with both submission dates and the uploaded 사업자등록증, and an unverified business auto-expires (PENDING > 30 days with no doc → auto-REJECTED by cron), freeing the number.",
+    "BRN 재사용/폐업 후 재등록: a partner soft-deletes a business to free its BRN, then a second account registers it. The partial unique index excludes deletedAt IS NOT NULL, so this works — deliberately — but the admin queue flags 'this BRN was previously verified under another partner' and requires manual approval.",
+    "인증 후 신원 교체 (bait-and-switch): verify with a legitimate business, then edit legalName/BRN to something else. Blocked by R-6 auto-demotion + venue hiding.",
+    "사업자등록증 유출: Vercel Blob public URLs are permanent unguessable bearer URLs. If a registration doc were ever put in the public store, one leaked URL = permanent PII exposure with no revoke. Hence private store + 60s signed URLs + access logging. Also: the partner's own console must not render the doc from a long-lived URL cached in the Next.js image optimizer.",
+    "이미지 순서 동시 편집: two staff on the same partner account drag-reorder simultaneously. The permutation-check + full rewrite makes this last-write-wins with no duplicate/missing sortOrder. The alternative (per-item PATCH) would deadlock or corrupt against the unique index — hence R-15 plus the DEFERRABLE index so the mid-transaction intermediate states don't violate uniqueness.",
+    "대표 이미지 경합: partner sets image A as cover while an admin quarantines the current cover B. Both run `UPDATE ... SET isCover=false WHERE venueId=? AND isCover=true` then set the new one, inside one transaction on the same row set — the partial unique index guarantees at most one survives; the loser gets a 409 and the UI refetches.",
+    "마지막 이미지 삭제: deleting the only image of an ACTIVE venue would break the publish gate retroactively. Blocked with 409 IMAGE_REQUIRED; the partner must upload a replacement first (add-then-remove, not remove-then-add).",
+    "업로드 티켓 재사용/도용: a leaked clientToken lets someone write one blob at one server-chosen pathname, once, before expiry. Damage is bounded to one 10MB file that only the owning partner can register, and the sweeper deletes it if never registered.",
+    "고아 blob: user uploads to Blob then closes the tab before register. The hourly sweeper deletes unconsumed expired tickets and their blobs. Conversely a DB row whose blob del() failed leaves a paid-for orphan — the sweeper retries DELETING rows.",
+    "블롭 삭제 후 CDN 캐시: a quarantined image may still be served from the CDN/Next image cache for minutes after takedown. For legal-takedown severity, the admin action must also call the Blob del() immediately and the web layer must use `unoptimized` or a cache-busted URL for venue galleries. Documented as an accepted latency window otherwise.",
+    "KST 자정 넘김 영업시간: 18:00–02:00 rows. Naive 'is now between opensAt and closesAt' returns 영업종료 at 01:00. The evaluator must also test yesterday's row when closesAt <= opensAt. Same bug class bites the '오늘 영업하나요' badge on search cards.",
+    "KST vs UTC 날짜 경계: a special-hour date created at 2026-07-27 08:00 KST is 2026-07-26 23:00 UTC. Storing it as DateTime would shift the closure to the wrong day. Hence `@db.Date` and explicit KST formatting; every date-only value crosses the API as a 'YYYY-MM-DD' string, never as an ISO instant.",
+    "서머타임/윤초: Korea has no DST today but the code must not hardcode +09:00 arithmetic; use a tz-aware formatter with 'Asia/Seoul' so a future policy change is a data change.",
+    "Vercel serverless UTC 기본값: the runtime TZ is UTC. Any `new Date().getDay()` in business-hour logic silently uses UTC weekday and is wrong for 00:00–09:00 KST. Ban bare Date locale methods in this context via an ESLint rule; use a single `kstNow()` helper.",
+    "공휴일 대량 등록: partner bulk-adds 365 special-hour rows to make the calendar unreadable. Capped at 200 rows and +180 days.",
+    "심사 대기 중 매장 삭제: partner submits for review, then deletes while the admin is on the approval screen. The approve endpoint must re-read status inside the transaction and return 409 with the current state rather than resurrecting an ARCHIVED venue.",
+    "진행 중 이벤트가 있는 매장 숨김/삭제: blocked; force-hide requires acknowledging the applicant count. The nastiest variant is a BID event past its deadline but before finalization — deposits (once live) are held and applicants are waiting. Delete is hard-blocked there, with no force escape.",
+    "파트너 정지 중 이벤트 마감: a partner is suspended while a BID event's deadline passes, so nobody can finalize the list. Rule: suspension cascades a cancel to open events, but for a past-deadline event an ADMIN can finalize on the partner's behalf (the Event context owns that endpoint; this context only guarantees it can report the ownership chain for a SUSPENDED partner).",
+    "주소 지오코딩 실패: the geocoder is down at save time. Saving must not fail — lat/lng stay null, the venue can still publish, and DISTANCE sort simply excludes null-coordinate venues (documented, with a backfill cron). Silently sorting them to the end would be worse than omitting them.",
+    "행정구역 개편: 시군구 renamed/merged. Region rows go isActive=false but keep their code; existing venues keep the old regionCode and still resolve. A migration script maps old→new codes; the denormalized sido/sigungu on Venue must be re-derived or the facet counts split.",
+    "검색 인젝션/DoS: a 500-character `q` with pathological trigram content. Cap q at 40 chars, strip control characters, and require ≥2 chars before touching the trgm index.",
+    "열거(enumeration)를 통한 정보 유출: probing /venues/:id with random ids to discover unpublished venues. Non-ACTIVE returns 404 for non-owners, and response timing is not branched on existence in a way that is measurable (same query path).",
+    "경쟁사 정찰: a rival partner account browsing another partner's venue page. Public venue DTO carries no applicant counts, no amounts, no event ranking — competition-ratio display is owned by the Event context and is the only competitive signal exposed. This context must never add 'total applications across our venues' to a public partner profile.",
+    "이중 제출: double-clicking 사업자 등록 creates two businesses with the same BRN; the second fails on the unique index with a 409 that the UI would show as an error even though the first succeeded. The Idempotency-Key makes the second call return the first result instead.",
+    "심사 반려 사유에 내부 메모 유출: an admin pastes internal notes into `reason` (partner-visible) instead of `internalMemo`. Mitigation is UI-level (two visually distinct fields, the partner-visible one previewed as 'the partner will see this') plus a template picker for common reasons.",
+    "XSS via 매장 소개/대체 텍스트: description and altText are stored as plain text and rendered as text, never dangerouslySetInnerHTML. websiteUrl/instagramHandle are protocol-allowlisted (http/https only) and rendered with rel=noopener nofollow.",
+    "이미지로 연락처 우회: a partner embeds a phone number/카톡 ID in a venue photo to take reservations off-platform. Not technically preventable; handled by admin quarantine + a rule in the partner terms. Worth an admin report flow.",
+    "카테고리 비활성화 후 검색 필터 불일치: deactivating a category hides it from filters while ACTIVE venues still point to it, making those venues unreachable via category browse. Deactivation returns the affected venue count and the admin UI requires choosing a replacement category or accepting the orphaning.",
+    "캐시된 카테고리/지역 목록 stale: the 1-hour public cache means a newly added category is invisible to some clients for up to an hour; the admin create endpoint issues a `revalidateTag('taxonomy')` so this is normally seconds.",
+    "Neon 연결 고갈: many concurrent serverless invocations each opening a Prisma connection. Use the pooled Neon connection string (PgBouncer) for the app and the direct URL only for migrations; keep transactions short — never hold one open across a Blob API call.",
+    "트랜잭션 안에서 외부 호출: the register-image flow verifies the blob before opening the DB transaction; the Blob HEAD must never happen inside a transaction or a slow storage response holds a Postgres connection for seconds."
+  ],
+  "terms": [
+    {
+      "technical": "PartnerProfile",
+      "userFriendlyKo": "파트너 정보"
+    },
+    {
+      "technical": "Partner approval / APPROVED",
+      "userFriendlyKo": "파트너 승인 완료"
+    },
+    {
+      "technical": "PartnerApprovalStatus.PENDING",
+      "userFriendlyKo": "승인 대기중"
+    },
+    {
+      "technical": "PartnerApprovalStatus.REJECTED",
+      "userFriendlyKo": "승인 반려됨"
+    },
+    {
+      "technical": "PartnerApprovalStatus.SUSPENDED",
+      "userFriendlyKo": "이용 정지"
+    },
+    {
+      "technical": "Business",
+      "userFriendlyKo": "사업자 정보"
+    },
+    {
+      "technical": "businessRegistrationNumber",
+      "userFriendlyKo": "사업자등록번호"
+    },
+    {
+      "technical": "registrationDoc",
+      "userFriendlyKo": "사업자등록증"
+    },
+    {
+      "technical": "legalName",
+      "userFriendlyKo": "사업자등록증상 상호"
+    },
+    {
+      "technical": "representativeName",
+      "userFriendlyKo": "대표자명"
+    },
+    {
+      "technical": "BusinessVerificationStatus.VERIFIED",
+      "userFriendlyKo": "인증 완료"
+    },
+    {
+      "technical": "BusinessVerificationStatus.PENDING",
+      "userFriendlyKo": "인증 심사중"
+    },
+    {
+      "technical": "BusinessVerificationStatus.REVOKED",
+      "userFriendlyKo": "인증 취소됨"
+    },
+    {
+      "technical": "Venue",
+      "userFriendlyKo": "매장"
+    },
+    {
+      "technical": "VenueStatus.DRAFT",
+      "userFriendlyKo": "작성중"
+    },
+    {
+      "technical": "VenueStatus.PENDING_REVIEW",
+      "userFriendlyKo": "공개 심사중"
+    },
+    {
+      "technical": "VenueStatus.ACTIVE",
+      "userFriendlyKo": "공개중"
+    },
+    {
+      "technical": "VenueStatus.HIDDEN",
+      "userFriendlyKo": "비공개"
+    },
+    {
+      "technical": "VenueStatus.SUSPENDED",
+      "userFriendlyKo": "운영자 제재로 중지됨"
+    },
+    {
+      "technical": "VenueStatus.ARCHIVED",
+      "userFriendlyKo": "삭제됨"
+    },
+    {
+      "technical": "summary",
+      "userFriendlyKo": "한 줄 소개"
+    },
+    {
+      "technical": "description",
+      "userFriendlyKo": "매장 소개"
+    },
+    {
+      "technical": "reservationNotice",
+      "userFriendlyKo": "예약 시 안내사항"
+    },
+    {
+      "technical": "coverImage",
+      "userFriendlyKo": "대표 사진"
+    },
+    {
+      "technical": "VenueImage list",
+      "userFriendlyKo": "매장 사진"
+    },
+    {
+      "technical": "altText",
+      "userFriendlyKo": "사진 설명"
+    },
+    {
+      "technical": "sortOrder / reorder",
+      "userFriendlyKo": "사진 순서 변경"
+    },
+    {
+      "technical": "QUARANTINED image",
+      "userFriendlyKo": "운영자에 의해 가려진 사진"
+    },
+    {
+      "technical": "Category",
+      "userFriendlyKo": "업종"
+    },
+    {
+      "technical": "primaryCategory",
+      "userFriendlyKo": "대표 업종"
+    },
+    {
+      "technical": "secondary categories",
+      "userFriendlyKo": "추가 업종"
+    },
+    {
+      "technical": "Region / regionCode",
+      "userFriendlyKo": "지역"
+    },
+    {
+      "technical": "roadAddress",
+      "userFriendlyKo": "도로명 주소"
+    },
+    {
+      "technical": "detailAddress",
+      "userFriendlyKo": "상세 주소"
+    },
+    {
+      "technical": "BusinessHour",
+      "userFriendlyKo": "영업시간"
+    },
+    {
+      "technical": "isClosed (weekly)",
+      "userFriendlyKo": "정기 휴무"
+    },
+    {
+      "technical": "breakStartAt~breakEndAt",
+      "userFriendlyKo": "브레이크타임"
+    },
+    {
+      "technical": "lastOrderAt",
+      "userFriendlyKo": "라스트오더"
+    },
+    {
+      "technical": "crosses midnight",
+      "userFriendlyKo": "익일 마감"
+    },
+    {
+      "technical": "VenueSpecialHour",
+      "userFriendlyKo": "임시 휴무 · 특별 영업일"
+    },
+    {
+      "technical": "todayStatus = OPEN",
+      "userFriendlyKo": "영업중"
+    },
+    {
+      "technical": "todayStatus = BREAK",
+      "userFriendlyKo": "브레이크타임"
+    },
+    {
+      "technical": "todayStatus = CLOSED_TODAY",
+      "userFriendlyKo": "오늘 휴무"
+    },
+    {
+      "technical": "todayStatus = CLOSED_NOW",
+      "userFriendlyKo": "영업 종료"
+    },
+    {
+      "technical": "seatCount",
+      "userFriendlyKo": "좌석 수"
+    },
+    {
+      "technical": "submit-review",
+      "userFriendlyKo": "공개 심사 요청하기"
+    },
+    {
+      "technical": "publish gate missing fields",
+      "userFriendlyKo": "공개하려면 아래 항목을 먼저 입력해 주세요"
+    },
+    {
+      "technical": "VenueEditSnapshot PENDING",
+      "userFriendlyKo": "수정 내용 심사중 (현재는 기존 정보가 노출돼요)"
+    },
+    {
+      "technical": "CONFLICT_STALE_VENUE",
+      "userFriendlyKo": "다른 곳에서 먼저 수정됐어요. 새로고침 후 다시 시도해 주세요"
+    },
+    {
+      "technical": "BRN_ALREADY_REGISTERED",
+      "userFriendlyKo": "이미 등록된 사업자등록번호예요"
+    },
+    {
+      "technical": "force hide with open event",
+      "userFriendlyKo": "진행중인 이벤트가 있어요. 숨기면 신청자에게 취소 안내가 발송돼요"
+    },
+    {
+      "technical": "openEventCount",
+      "userFriendlyKo": "진행중인 이벤트"
+    },
+    {
+      "technical": "settlement account",
+      "userFriendlyKo": "정산 계좌"
+    }
+  ],
+  "openQuestions": [
+    "사업자등록번호 진위확인 API(국세청 홈택스 '사업자등록정보 진위확인' 공공데이터 API)를 MVP에 붙일까요? 붙이면 운영자 수동 심사 부담이 크게 줄지만(상태/과세유형/폐업 여부 자동 판정), 키 발급과 호출 제한 관리가 생깁니다. 지금 설계는 수동 심사 전제이고 자동화는 verificationStatus 전이에 시스템 액터를 추가하는 것만으로 얹을 수 있게 열어뒀습니다.",
+    "매장 공개에 운영자 심사를 실제로 걸까요? (AUTO_APPROVE_VENUE 플래그) 사업자 인증이 이미 끝난 파트너라면 매장은 즉시 공개하고 사후 모더레이션만 하는 편이 온보딩 이탈을 줄입니다. 초기 파트너 수가 적다면 수동 심사가 품질에 유리하고요. 어느 쪽이 기본값인가요?",
+    "한 파트너가 여러 사업자를 갖는 것을 실제로 허용하나요? 프랜차이즈/다점포를 위해 지금은 1:N으로 뒀지만, 1:1로 좁히면 소유권 검증과 정산이 훨씬 단순해집니다.",
+    "파트너 계정에 직원(멀티 유저)이 필요한가요? 현재는 1 Account = 1 PartnerProfile 이라 매장 담당자가 여러 명이면 계정을 공유하게 됩니다. 필요하다면 PartnerMember(accountId, partnerId, role: OWNER|MANAGER|STAFF) 조인 테이블을 지금 넣는 편이 나중에 넣는 것보다 훨씬 쌉니다. 이 결정은 감사 로그의 actorAccountId 의미와 직결됩니다.",
+    "매장 위치가 없는 이벤트(온라인/출장/팝업)도 있나요? 지금은 ReservationEvent가 반드시 Venue를 갖는 전제입니다. 필요하면 Venue.isVirtual 또는 주소 없는 매장 타입을 정의해야 합니다.",
+    "카테고리 분류 체계 초안이 필요합니다 — 다이닝(오마카세/파인다이닝/한식/양식...), 스테이, 클래스/원데이, 공연/전시, 스포츠 정도로 시작할까요? 코드값은 생성 후 불변이라 초기 확정이 중요합니다.",
+    "이미지 리사이즈/최적화를 어디서 하나요? Vercel Blob은 변환을 안 해주므로 (a) next/image 최적화에 맡기기, (b) 업로드 시 클라이언트에서 WebP 변환 후 업로드, (c) 서버 sharp(서버리스 번들 크기 이슈) 중 선택이 필요합니다. 현재 설계는 (b)를 가정하고 원본 1장만 저장합니다.",
+    "매장 상세 페이지에 리뷰/평점이 들어가나요? 들어간다면 Venue에 ratingAvg/reviewCount 비정규화 필드를 지금 예약해두는 게 좋습니다(별도 Review 컨텍스트 소유, 이 컨텍스트는 읽기 캐시만).",
+    "'거리순' 정렬을 MVP에 넣나요? 넣으면 PostGIS 또는 earthdistance 확장이 필요하고 Neon에서 활성화 가능 여부를 확인해야 합니다. 단순 bounding-box 필터 + 앱 레벨 하버사인으로도 초기엔 충분합니다.",
+    "한국어 검색 품질: pg_trgm으로 시작하되, 초성 검색('ㅇㅁㄲㅅ' → 오마카세)이나 영/한 혼용 오타 보정이 요구사항인가요? 요구된다면 초성 인덱스 컬럼을 searchText 옆에 하나 더 두어야 합니다.",
+    "매장 삭제 시 과거 이벤트 이력은 어떻게 보이나요? 이용자의 '내 신청 내역'에서 ARCHIVED 매장명을 그대로 보여줄지, '삭제된 매장'으로 마스킹할지 정책이 필요합니다(현재는 스냅샷 없이 매장명을 조인하는 전제).",
+    "운영자 계정은 시드/초대 전용이라고 했는데, 파트너 승인/제재 권한을 세분화한 운영자 등급이 필요한가요(심사자 vs 슈퍼운영자)? 필요하면 AccountRole만으로는 부족하고 권한 테이블이 필요합니다.",
+    "정산 계좌 정보를 MVP에서 아예 수집하지 않는 선택지도 있습니다(보증금 미출시). 수집하지 않으면 개인정보/암호화 부담이 사라집니다 — 지금 필드를 두되 UI를 감추는 쪽인가요, 스키마에서도 빼는 쪽인가요?"
+  ]
+}

@@ -1,0 +1,1448 @@
+{
+  "context": "Bounded Context: \"Application, Bidding, Deposit & Ranking\" (신청·입찰·예약금·랭킹) for Dibs (딥스).\n\nOwns: the Application aggregate (User × Event × amount), BidHistory (raise-only re-bidding), DepositHold/DepositRefund (예약금, execution deferred behind DEPOSIT_HOLD_ENABLED=false), the BID-mode ranking computation + finalized snapshot, and the INSTANT-mode atomic slot claim.\n\nDoes NOT own: Event/Venue/Partner definition (Event context), Google auth + role approval (Identity context), 쪽지/email delivery (Notification context — this context only emits domain events), search/discovery indexing (Discovery context), payment gateway (future Payment context).\n\nStack assumptions: Vercel serverless (no long-running process, no WebSocket, N concurrent instances), Postgres (Neon) + Prisma, NestJS API, Next.js 15 web, Vercel Cron for sweepers, SSE/polling for live 경쟁률.\n\nTwo clock rules that govern everything in this context:\n1. ALL authoritative timestamps come from the DATABASE clock (`now()` / `transaction_timestamp()` inside the writing transaction), never from the Node process clock. Serverless instances have skew and lastBidAt is a tie-break — app-generated timestamps are an exploitable bug.\n2. All DateTime columns are `timestamptz` stored in UTC; KST (Asia/Seoul, UTC+9, no DST) is a presentation-and-input concern only, converted at the API boundary.",
+  "summary": "Design for the Application/Bidding/Deposit/Ranking context. Core shape: exactly one Application row per (eventId, userId) that lives forever and changes state (so cancel→reapply cannot mint a fresh tie-break clock), with `amount`/`lastBidAt` as the live bid and `settledAmount`/`settledLastBidAt` as the fully-deposited rollback anchor. INSTANT mode claims capacity with one conditional UPDATE on Event.claimedCount and tolerates small overbooking; BID mode is a plain INSERT with no locking and ranks only at finalization (`ORDER BY amount DESC, lastBidAt ASC, id ASC`) at `effectiveDeadlineAt + depositWindowMinutes + grace`. Raises are strictly increasing, update lastBidAt to DB now(), and on percentage deposits open a shortfall hold whose expiry rolls BOTH amount and lastBidAt back to the settled anchor. Soft close extends the deadline only on settled bids and is capped, so raise-and-default cannot filibuster. Visibility is a whitelist serializer: users see 경쟁률 only, never amounts, ranks, or cutoff.",
+  "entities": [
+    {
+      "name": "Application",
+      "description": "신청. The aggregate root of this context. Exactly ONE row per (eventId, userId), created on first apply and NEVER deleted — cancel/expire/re-apply are state transitions on the same row. This single decision enforces 1-application-per-user-per-event and simultaneously kills cancel-then-reapply tie-break gaming, because the row remembers highestAmountEver and its clock history.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": "cuid, not autoincrement — sequential ids would leak application order (a rank oracle)."
+        },
+        {
+          "name": "eventId",
+          "type": "String",
+          "notes": "FK -> Event.id. onDelete: Restrict (events are soft-canceled, never hard-deleted)."
+        },
+        {
+          "name": "userId",
+          "type": "String",
+          "notes": "FK -> User.id."
+        },
+        {
+          "name": "eventMode",
+          "type": "EventMode",
+          "notes": "Denormalized copy of Event.mode at apply time. Lets ranking/sweeper queries and partial indexes avoid a join, and freezes behavior if a partner somehow flips mode."
+        },
+        {
+          "name": "status",
+          "type": "ApplicationStatus",
+          "notes": "See state machine. Default PENDING_DEPOSIT when deposit gate active, otherwise VALID (BID) / CONFIRMED (INSTANT)."
+        },
+        {
+          "name": "amount",
+          "type": "Int",
+          "notes": "신청 금액 in KRW, integer only (no decimals, no Decimal type). 0 <= amount <= 2147483647. INSTANT: always == Event.fixedAmount, copied server-side, client-supplied value is ignored. BID: min <= amount <= max. This is the LIVE amount and may temporarily exceed settledAmount while a raise shortfall is unpaid."
+        },
+        {
+          "name": "lastBidAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "THE TIE-BREAK CLOCK: the instant the applicant REACHED the current `amount`. Set to DB now() on initial apply and on every accepted raise. Restored to settledLastBidAt on rollback. Never client-supplied."
+        },
+        {
+          "name": "firstAppliedAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "Original application instant. Display-only + analytics + abuse forensics. Explicitly NOT the ranking tie-break."
+        },
+        {
+          "name": "settledAmount",
+          "type": "Int",
+          "notes": "Highest amount for which the deposit is fully covered. The rollback target. Equals `amount` whenever depositState is PAID/NOT_REQUIRED."
+        },
+        {
+          "name": "settledLastBidAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "The lastBidAt that corresponded to settledAmount. CRITICAL: rollback restores this too, otherwise a user could raise, deliberately default, and keep a fresher-but-better clock — or rather, keep the raise's clock on the old amount. Rollback must restore the exact (amount, clock) pair."
+        },
+        {
+          "name": "highestAmountEver",
+          "type": "Int",
+          "notes": "Monotonic high-water mark across the row's entire life, including through CANCELED/EXPIRED. Re-apply and raise must satisfy newAmount >= highestAmountEver. Blocks cancel-then-lower."
+        },
+        {
+          "name": "depositState",
+          "type": "DepositState",
+          "notes": "Denormalized state of the currently-open DepositHold (or NOT_REQUIRED). Kept on the row so the sweeper and ranking queries need no join."
+        },
+        {
+          "name": "depositDueAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": "Denormalized dueAt of the open hold. NULL when nothing is pending. Indexed for the sweeper. Also drives the client countdown (server sends remainingSeconds, never lets the client compute from its own clock)."
+        },
+        {
+          "name": "depositRequiredAmount",
+          "type": "Int @default(0)",
+          "notes": "Cumulative deposit required for the current `amount`."
+        },
+        {
+          "name": "depositPaidAmount",
+          "type": "Int @default(0)",
+          "notes": "Cumulative deposit actually paid. shortfall = depositRequiredAmount - depositPaidAmount."
+        },
+        {
+          "name": "rebidCount",
+          "type": "Int @default(0)",
+          "notes": "Accepted raises. Hard cap REBID_MAX_PER_APPLICATION (default 20) as an anti-spam / anti-soft-close-filibuster measure."
+        },
+        {
+          "name": "reapplyCount",
+          "type": "Int @default(0)",
+          "notes": "Times the row was resurrected from CANCELED/EXPIRED. Cap REAPPLY_MAX (default 1) per event."
+        },
+        {
+          "name": "canceledAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": "Last cancel instant."
+        },
+        {
+          "name": "cancelReason",
+          "type": "ApplicationCancelReason?",
+          "notes": "USER_REQUEST / DEPOSIT_TIMEOUT / PARTNER_REJECT / EVENT_CANCELED / ADMIN."
+        },
+        {
+          "name": "slotClaimed",
+          "type": "Boolean @default(false)",
+          "notes": "INSTANT only. True while this application holds a decrement-able unit of Event.claimedCount. Guard flag: the release path is `WHERE id=? AND slotClaimed=true` so a double sweep can never decrement twice."
+        },
+        {
+          "name": "selectionSource",
+          "type": "SelectionSource?",
+          "notes": "Set at final-list confirm: RANKED (inside capacity by pure ranking), PARTNER_ADDED (manual override in), PARTNER_REMOVED (manual override out), INSTANT_CLAIM."
+        },
+        {
+          "name": "finalRank",
+          "type": "Int?",
+          "notes": "Copied from EventRankingEntry.rank at finalization. Partner/Admin visible only."
+        },
+        {
+          "name": "partnerNote",
+          "type": "String? @db.VarChar(500)",
+          "notes": "Partner's private memo on this applicant. Never serialized to the user."
+        },
+        {
+          "name": "version",
+          "type": "Int @default(0)",
+          "notes": "Optimistic concurrency token. Every mutating UPDATE carries `WHERE version = $expected` and bumps it. Protects raise vs. sweeper vs. cancel interleavings without row locks."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now()) @db.Timestamptz(3)",
+          "notes": ""
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt @db.Timestamptz(3)",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "@@unique([eventId, userId]) — the 1-per-user-per-event invariant, enforced by the DB, not by a read-then-write check",
+        "event Event @relation(fields:[eventId], references:[id])",
+        "user User @relation(fields:[userId], references:[id])",
+        "bidHistory BidHistory[]",
+        "depositHolds DepositHold[]",
+        "rankingEntry EventRankingEntry?",
+        "logs ApplicationEventLog[]",
+        "@@index([eventId, status, amount(sort: Desc), lastBidAt(sort: Asc), id]) — the ranking index",
+        "@@index([userId, status, createdAt(sort: Desc)]) — 내 신청 내역",
+        "@@index([status, depositDueAt]) — deposit sweeper",
+        "Raw partial indexes (migration SQL, CONCURRENTLY): (a) app_rank_valid ON \"Application\"(\"eventId\",\"amount\" DESC,\"lastBidAt\" ASC,\"id\") WHERE \"status\"='VALID'; (b) app_deposit_due ON \"Application\"(\"depositDueAt\") WHERE \"depositState\" IN ('PENDING','SHORTFALL_PENDING');"
+      ]
+    },
+    {
+      "name": "BidHistory",
+      "description": "입찰 이력. Append-only ledger of every amount transition, including rollbacks. Immutable: no UPDATE, no DELETE. This is the audit trail that lets Admin adjudicate disputes about who named a number first, and the source of truth if the denormalized Application fields ever drift.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "applicationId",
+          "type": "String",
+          "notes": "FK -> Application.id."
+        },
+        {
+          "name": "eventId",
+          "type": "String",
+          "notes": "Denormalized for per-event forensic queries without a join."
+        },
+        {
+          "name": "userId",
+          "type": "String",
+          "notes": "Denormalized."
+        },
+        {
+          "name": "seq",
+          "type": "Int",
+          "notes": "1-based sequence within the application. @@unique([applicationId, seq]) doubles as a cheap append-race detector: two concurrent raises both computing seq=3 will collide and one aborts."
+        },
+        {
+          "name": "source",
+          "type": "BidSource",
+          "notes": "INITIAL_APPLY | RAISE | ROLLBACK | REAPPLY | ADMIN_ADJUST."
+        },
+        {
+          "name": "previousAmount",
+          "type": "Int?",
+          "notes": "NULL for INITIAL_APPLY."
+        },
+        {
+          "name": "newAmount",
+          "type": "Int",
+          "notes": ""
+        },
+        {
+          "name": "deltaAmount",
+          "type": "Int",
+          "notes": "newAmount - coalesce(previousAmount,0). Negative only for ROLLBACK/ADMIN_ADJUST."
+        },
+        {
+          "name": "bidAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "DB now() at the transition. For source=RAISE this becomes the new Application.lastBidAt. For source=ROLLBACK this is the rollback instant, while the RESTORED lastBidAt is recorded in restoredLastBidAt."
+        },
+        {
+          "name": "restoredLastBidAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": "ROLLBACK only: the settledLastBidAt written back onto the Application."
+        },
+        {
+          "name": "depositRequiredAfter",
+          "type": "Int",
+          "notes": "Deposit required for newAmount at the time of the transition (config is snapshotted, so later partner edits to deposit config don't retroactively invalidate anyone)."
+        },
+        {
+          "name": "depositHoldId",
+          "type": "String?",
+          "notes": "The shortfall hold created by this raise, if any."
+        },
+        {
+          "name": "triggeredSoftClose",
+          "type": "Boolean @default(false)",
+          "notes": "True if this transition extended the event deadline."
+        },
+        {
+          "name": "deadlineBefore",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": "Soft-close audit."
+        },
+        {
+          "name": "deadlineAfter",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": "Soft-close audit."
+        },
+        {
+          "name": "idempotencyKey",
+          "type": "String?",
+          "notes": "Echo of the request key that produced this row."
+        },
+        {
+          "name": "actorType",
+          "type": "ActorType @default(USER)",
+          "notes": "USER | SYSTEM (sweeper rollback) | PARTNER | ADMIN."
+        },
+        {
+          "name": "actorId",
+          "type": "String?",
+          "notes": "NULL for SYSTEM."
+        },
+        {
+          "name": "ipHash",
+          "type": "String?",
+          "notes": "SHA-256(ip + serverSalt). Abuse clustering (sybil raise rings) without storing raw IPs."
+        }
+      ],
+      "relations": [
+        "application Application @relation(fields:[applicationId], references:[id])",
+        "@@unique([applicationId, seq])",
+        "@@index([eventId, bidAt])",
+        "@@index([applicationId, bidAt])"
+      ]
+    },
+    {
+      "name": "DepositHold",
+      "description": "예약금 홀드. One row per deposit obligation. An application has at most ONE open hold at a time (state in PENDING/SHORTFALL_PENDING) but many historical ones. MVP: created and expired by our own timers with NO PG integration — paymentIntentId stays NULL and settlement happens via an internal/admin/stub endpoint. The table shape is deliberately PG-ready.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "applicationId",
+          "type": "String",
+          "notes": "FK -> Application.id."
+        },
+        {
+          "name": "seq",
+          "type": "Int",
+          "notes": "1-based per application. @@unique([applicationId, seq])."
+        },
+        {
+          "name": "reason",
+          "type": "DepositHoldReason",
+          "notes": "INITIAL | RAISE_SHORTFALL | REAPPLY."
+        },
+        {
+          "name": "basisAmount",
+          "type": "Int",
+          "notes": "The 신청 금액 this hold was computed from. Snapshot."
+        },
+        {
+          "name": "depositType",
+          "type": "DepositType",
+          "notes": "Snapshot of Event config: FIXED | PERCENTAGE."
+        },
+        {
+          "name": "depositFixedAmount",
+          "type": "Int?",
+          "notes": "Snapshot."
+        },
+        {
+          "name": "depositPercentBp",
+          "type": "Int?",
+          "notes": "Snapshot, basis points (1000 = 10%). Integer bp avoids float drift; 10% of 33,333 is unambiguous."
+        },
+        {
+          "name": "requiredAmount",
+          "type": "Int",
+          "notes": "CUMULATIVE deposit required at basisAmount. For a shortfall hold, amountDue = requiredAmount - alreadyPaid, stored separately below."
+        },
+        {
+          "name": "amountDue",
+          "type": "Int",
+          "notes": "What THIS hold asks the user to pay now (the incremental shortfall). Always > 0 — a raise whose shortfall is <= 0 creates no hold at all."
+        },
+        {
+          "name": "amountPaid",
+          "type": "Int @default(0)",
+          "notes": "Partial payment is NOT accepted in MVP: a hold settles only when amountPaid >= amountDue. Field exists for future split/partial PG flows."
+        },
+        {
+          "name": "windowMinutes",
+          "type": "Int",
+          "notes": "Snapshot of Event.depositWindowMinutes (default 10). Snapshotted so a partner shortening the window mid-flight cannot retroactively expire a live hold."
+        },
+        {
+          "name": "openedAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "DB now()."
+        },
+        {
+          "name": "dueAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "= openedAt + windowMinutes, computed IN SQL (openedAt + make_interval(mins => $window)), not in Node."
+        },
+        {
+          "name": "state",
+          "type": "DepositHoldState",
+          "notes": "PENDING | PAID | EXPIRED | SUPERSEDED | CANCELED | VOIDED."
+        },
+        {
+          "name": "paidAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": ""
+        },
+        {
+          "name": "resolvedAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": "When it left PENDING for any terminal state."
+        },
+        {
+          "name": "paymentIntentId",
+          "type": "String?",
+          "notes": "Future PG reference. NULL in MVP. @@unique when non-null."
+        },
+        {
+          "name": "paymentMethod",
+          "type": "String?",
+          "notes": "Future. NULL in MVP."
+        },
+        {
+          "name": "featureFlagSnapshot",
+          "type": "Boolean",
+          "notes": "Value of DEPOSIT_HOLD_ENABLED when the hold was created. Lets us reason about rows created during a flag flip."
+        }
+      ],
+      "relations": [
+        "application Application @relation(fields:[applicationId], references:[id])",
+        "refunds DepositRefund[]",
+        "bidHistory BidHistory[] (a hold may be referenced by the raise that created it)",
+        "@@unique([applicationId, seq])",
+        "@@index([state, dueAt]) — sweeper",
+        "Raw partial unique (migration SQL): CREATE UNIQUE INDEX one_open_hold ON \"DepositHold\"(\"applicationId\") WHERE \"state\"='PENDING'; — DB-level guarantee of at-most-one-open-hold, so a double-submit raise cannot open two competing windows."
+      ]
+    },
+    {
+      "name": "DepositRefund",
+      "description": "예약금 환불. Modeled now, executed later. Created for non-selected / canceled-event / admin-reversed applications. In MVP rows are created in REQUESTED state by the finalization job and never leave it (a dashboard shows the queue); when the Payment context lands, a worker drains it.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "depositHoldId",
+          "type": "String",
+          "notes": "FK -> DepositHold.id."
+        },
+        {
+          "name": "applicationId",
+          "type": "String",
+          "notes": "Denormalized for queue queries."
+        },
+        {
+          "name": "userId",
+          "type": "String",
+          "notes": "Denormalized."
+        },
+        {
+          "name": "amount",
+          "type": "Int",
+          "notes": "<= DepositHold.amountPaid. Sum of refunds per hold must not exceed amountPaid (enforced by a CHECK-backed trigger or an app-level invariant test)."
+        },
+        {
+          "name": "reason",
+          "type": "RefundReason",
+          "notes": "NOT_SELECTED | EVENT_CANCELED | PARTNER_REJECTED | ADMIN_REVERSAL | DUPLICATE_PAYMENT | ROLLBACK_OVERPAY."
+        },
+        {
+          "name": "state",
+          "type": "RefundState",
+          "notes": "REQUESTED | PROCESSING | COMPLETED | FAILED | MANUAL_REQUIRED."
+        },
+        {
+          "name": "requestedAt",
+          "type": "DateTime @default(now()) @db.Timestamptz(3)",
+          "notes": ""
+        },
+        {
+          "name": "processedAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": ""
+        },
+        {
+          "name": "providerRefundId",
+          "type": "String?",
+          "notes": "Future PG id. @@unique when non-null — the idempotency anchor for the eventual payout worker."
+        },
+        {
+          "name": "failureCode",
+          "type": "String?",
+          "notes": ""
+        },
+        {
+          "name": "attemptCount",
+          "type": "Int @default(0)",
+          "notes": ""
+        },
+        {
+          "name": "idempotencyKey",
+          "type": "String",
+          "notes": "Deterministic: `refund:{depositHoldId}:{reason}`. @@unique. Guarantees the finalization job re-running never double-refunds."
+        }
+      ],
+      "relations": [
+        "hold DepositHold @relation(fields:[depositHoldId], references:[id])",
+        "@@unique([idempotencyKey])",
+        "@@index([state, requestedAt])"
+      ]
+    },
+    {
+      "name": "EventRankingEntry",
+      "description": "순위 스냅샷. The FROZEN ranking, materialized once at rankingFinalizeAt. Ranking is never recomputed on read after finalization — a live ORDER BY would silently change if any row mutated, and partners would see the list shuffle under them mid-review. Before finalization, partner-facing 'current standings' are computed live and clearly labeled 잠정 (provisional).",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "eventId",
+          "type": "String",
+          "notes": ""
+        },
+        {
+          "name": "applicationId",
+          "type": "String",
+          "notes": "@@unique([eventId, applicationId])."
+        },
+        {
+          "name": "rank",
+          "type": "Int",
+          "notes": "1-based, dense over VALID applications only. @@unique([eventId, rank])."
+        },
+        {
+          "name": "amount",
+          "type": "Int",
+          "notes": "Snapshot of the settled amount at finalization."
+        },
+        {
+          "name": "lastBidAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "Snapshot of the tie-break clock used."
+        },
+        {
+          "name": "withinCapacity",
+          "type": "Boolean",
+          "notes": "rank <= Event.capacity. The pure-ranking recommendation, before partner override."
+        },
+        {
+          "name": "capacitySnapshot",
+          "type": "Int",
+          "notes": "Event.capacity at finalization — partners can edit capacity later; the snapshot preserves what the recommendation was based on."
+        },
+        {
+          "name": "finalizedAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "Same value for every row of an event (single transaction)."
+        },
+        {
+          "name": "rankingVersion",
+          "type": "Int @default(1)",
+          "notes": "Bumped only by an Admin re-finalization. Old rows are kept with the old version, never deleted, so disputes are reconstructable."
+        }
+      ],
+      "relations": [
+        "application Application @relation(fields:[applicationId], references:[id])",
+        "@@unique([eventId, applicationId, rankingVersion])",
+        "@@unique([eventId, rank, rankingVersion])",
+        "@@index([eventId, rank])"
+      ]
+    },
+    {
+      "name": "ApplicationIdempotencyKey",
+      "description": "멱등성 키. Protects every non-GET endpoint in this context from double-submit (impatient double-tap, mobile network retry, Vercel edge retry). Insert-first pattern, not check-then-act.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "userId",
+          "type": "String",
+          "notes": "Keys are scoped per user so a key guessed by another user is useless."
+        },
+        {
+          "name": "key",
+          "type": "String @db.VarChar(64)",
+          "notes": "Client-generated UUIDv4 in the `Idempotency-Key` header. @@unique([userId, key])."
+        },
+        {
+          "name": "endpoint",
+          "type": "String @db.VarChar(120)",
+          "notes": "e.g. POST /events/:id/applications. Same key + different endpoint = 422 (client bug), not a silent replay."
+        },
+        {
+          "name": "requestHash",
+          "type": "String @db.Char(64)",
+          "notes": "SHA-256 of the canonicalized body. Same key + different body = 422 IDEMPOTENCY_KEY_REUSED. Prevents a retry from quietly applying a different amount."
+        },
+        {
+          "name": "state",
+          "type": "IdempotencyState",
+          "notes": "IN_PROGRESS | COMPLETED | FAILED."
+        },
+        {
+          "name": "responseStatus",
+          "type": "Int?",
+          "notes": ""
+        },
+        {
+          "name": "responseBody",
+          "type": "Json?",
+          "notes": "Replayed verbatim on a repeat with the same key+hash."
+        },
+        {
+          "name": "applicationId",
+          "type": "String?",
+          "notes": "Convenience link."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now()) @db.Timestamptz(3)",
+          "notes": ""
+        },
+        {
+          "name": "expiresAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "createdAt + 24h. A daily cron deletes expired rows (this table must not grow unbounded)."
+        }
+      ],
+      "relations": [
+        "@@unique([userId, key])",
+        "@@index([expiresAt])"
+      ]
+    },
+    {
+      "name": "ApplicationEventLog",
+      "description": "신청 감사 로그. Append-only record of every status transition, for support (\"왜 제 신청이 만료됐나요?\") and for proving to a partner that overbooking came from an accepted race, not a bug.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())",
+          "notes": ""
+        },
+        {
+          "name": "applicationId",
+          "type": "String",
+          "notes": ""
+        },
+        {
+          "name": "fromStatus",
+          "type": "ApplicationStatus?",
+          "notes": "NULL on creation."
+        },
+        {
+          "name": "toStatus",
+          "type": "ApplicationStatus",
+          "notes": ""
+        },
+        {
+          "name": "trigger",
+          "type": "String @db.VarChar(60)",
+          "notes": "apply | raise | deposit_paid | hold_expired | rollback | cancel | reapply | finalize | partner_include | partner_exclude | event_canceled | admin_override."
+        },
+        {
+          "name": "actorType",
+          "type": "ActorType",
+          "notes": "USER | PARTNER | ADMIN | SYSTEM."
+        },
+        {
+          "name": "actorId",
+          "type": "String?",
+          "notes": ""
+        },
+        {
+          "name": "metadata",
+          "type": "Json?",
+          "notes": "{ amountBefore, amountAfter, holdId, cronRunId, ... }"
+        },
+        {
+          "name": "occurredAt",
+          "type": "DateTime @default(now()) @db.Timestamptz(3)",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "application Application @relation(fields:[applicationId], references:[id])",
+        "@@index([applicationId, occurredAt])"
+      ]
+    },
+    {
+      "name": "Event (외부 소유 — 본 컨텍스트가 요구하는 필드 계약)",
+      "description": "Owned by the Event context. Listed here as an explicit interface contract: this context READS all of these and WRITES only claimedCount, deadlineAt (soft close), softCloseExtensionCount, and rankingState/rankingFinalizeAt. Any change to these fields by the Event context must be coordinated.",
+      "fields": [
+        {
+          "name": "mode",
+          "type": "EventMode",
+          "notes": "INSTANT | BID. Immutable once the application period has started (must be enforced in the Event context, or every invariant here becomes negotiable)."
+        },
+        {
+          "name": "capacity",
+          "type": "Int",
+          "notes": "정원. Used as the conditional bound for INSTANT and the cut line for BID."
+        },
+        {
+          "name": "claimedCount",
+          "type": "Int @default(0)",
+          "notes": "INSTANT ONLY. Mutated exclusively by the single atomic conditional UPDATE described in businessRules. Meaningless (always 0) for BID events."
+        },
+        {
+          "name": "fixedAmount",
+          "type": "Int?",
+          "notes": "INSTANT only. Server-authoritative price."
+        },
+        {
+          "name": "minAmount",
+          "type": "Int?",
+          "notes": "BID only. >= 0."
+        },
+        {
+          "name": "maxAmount",
+          "type": "Int?",
+          "notes": "BID only. <= 2147483647. min == max is legal (fixed-price BID)."
+        },
+        {
+          "name": "startAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "신청 시작."
+        },
+        {
+          "name": "deadlineAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "신청 마감. MUTATED by soft close."
+        },
+        {
+          "name": "originalDeadlineAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "Immutable copy so the UI can show '원래 마감 20:00 → 연장 20:12'."
+        },
+        {
+          "name": "absoluteDeadlineAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "Hard ceiling that soft close can never cross. Default originalDeadlineAt + 2h."
+        },
+        {
+          "name": "softCloseEnabled",
+          "type": "Boolean @default(false)",
+          "notes": ""
+        },
+        {
+          "name": "softCloseWindowMinutes",
+          "type": "Int @default(5)",
+          "notes": "N."
+        },
+        {
+          "name": "softCloseExtensionCount",
+          "type": "Int @default(0)",
+          "notes": "Incremented per extension."
+        },
+        {
+          "name": "softCloseMaxExtensions",
+          "type": "Int @default(6)",
+          "notes": "Anti-filibuster cap."
+        },
+        {
+          "name": "depositRequired",
+          "type": "Boolean @default(false)",
+          "notes": "Effective gate = depositRequired AND DEPOSIT_HOLD_ENABLED."
+        },
+        {
+          "name": "depositType",
+          "type": "DepositType?",
+          "notes": "FIXED | PERCENTAGE."
+        },
+        {
+          "name": "depositFixedAmount",
+          "type": "Int?",
+          "notes": ""
+        },
+        {
+          "name": "depositPercentBp",
+          "type": "Int?",
+          "notes": "Basis points."
+        },
+        {
+          "name": "depositWindowMinutes",
+          "type": "Int @default(10)",
+          "notes": ""
+        },
+        {
+          "name": "rankingState",
+          "type": "RankingState @default(NOT_APPLICABLE)",
+          "notes": "NOT_APPLICABLE (INSTANT) | PENDING | FINALIZING | FINALIZED | CONFIRMED."
+        },
+        {
+          "name": "rankingFinalizeAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": "= deadlineAt + depositWindowMinutes + FINALIZE_GRACE_MINUTES(1). RECOMPUTED on every soft-close extension. The cron's only selector."
+        },
+        {
+          "name": "visibilityConfig",
+          "type": "Json",
+          "notes": "{ showCompetitionRatio: true, showCutoffAmount: false, showMyRank: false, showAmountDistribution: false, showApplicantCountBreakdown: false }. All non-ratio flags false in MVP; the serializer reads this, so loosening later is a config change, not a code change."
+        }
+      ],
+      "relations": [
+        "applications Application[]",
+        "rankingEntries EventRankingEntry[]"
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "name": "EventMode",
+      "values": [
+        "INSTANT",
+        "BID"
+      ]
+    },
+    {
+      "name": "ApplicationStatus",
+      "values": [
+        "PENDING_DEPOSIT",
+        "VALID",
+        "CONFIRMED",
+        "NOT_SELECTED",
+        "EXPIRED",
+        "CANCELED",
+        "REJECTED",
+        "EVENT_CANCELED"
+      ]
+    },
+    {
+      "name": "DepositState",
+      "values": [
+        "NOT_REQUIRED",
+        "PENDING",
+        "PAID",
+        "SHORTFALL_PENDING",
+        "EXPIRED",
+        "REFUND_REQUESTED",
+        "REFUNDED",
+        "FORFEITED"
+      ]
+    },
+    {
+      "name": "DepositHoldState",
+      "values": [
+        "PENDING",
+        "PAID",
+        "EXPIRED",
+        "SUPERSEDED",
+        "CANCELED",
+        "VOIDED"
+      ]
+    },
+    {
+      "name": "DepositType",
+      "values": [
+        "FIXED",
+        "PERCENTAGE"
+      ]
+    },
+    {
+      "name": "DepositHoldReason",
+      "values": [
+        "INITIAL",
+        "RAISE_SHORTFALL",
+        "REAPPLY"
+      ]
+    },
+    {
+      "name": "BidSource",
+      "values": [
+        "INITIAL_APPLY",
+        "RAISE",
+        "ROLLBACK",
+        "REAPPLY",
+        "ADMIN_ADJUST"
+      ]
+    },
+    {
+      "name": "RefundReason",
+      "values": [
+        "NOT_SELECTED",
+        "EVENT_CANCELED",
+        "PARTNER_REJECTED",
+        "ADMIN_REVERSAL",
+        "DUPLICATE_PAYMENT",
+        "ROLLBACK_OVERPAY"
+      ]
+    },
+    {
+      "name": "RefundState",
+      "values": [
+        "REQUESTED",
+        "PROCESSING",
+        "COMPLETED",
+        "FAILED",
+        "MANUAL_REQUIRED"
+      ]
+    },
+    {
+      "name": "RankingState",
+      "values": [
+        "NOT_APPLICABLE",
+        "PENDING",
+        "FINALIZING",
+        "FINALIZED",
+        "CONFIRMED"
+      ]
+    },
+    {
+      "name": "SelectionSource",
+      "values": [
+        "RANKED",
+        "PARTNER_ADDED",
+        "PARTNER_REMOVED",
+        "INSTANT_CLAIM"
+      ]
+    },
+    {
+      "name": "ApplicationCancelReason",
+      "values": [
+        "USER_REQUEST",
+        "DEPOSIT_TIMEOUT",
+        "PARTNER_REJECT",
+        "EVENT_CANCELED",
+        "ADMIN"
+      ]
+    },
+    {
+      "name": "IdempotencyState",
+      "values": [
+        "IN_PROGRESS",
+        "COMPLETED",
+        "FAILED"
+      ]
+    },
+    {
+      "name": "ActorType",
+      "values": [
+        "USER",
+        "PARTNER",
+        "ADMIN",
+        "SYSTEM"
+      ]
+    }
+  ],
+  "stateMachines": [
+    {
+      "entity": "Application (INSTANT — 선착순 즉시확정)",
+      "states": [
+        "(none)",
+        "PENDING_DEPOSIT",
+        "CONFIRMED",
+        "EXPIRED",
+        "CANCELED",
+        "REJECTED",
+        "EVENT_CANCELED"
+      ],
+      "transitions": [
+        "(none) -> CONFIRMED : apply, when deposit gate OFF. The atomic claim succeeded; user immediately sees 확정. slotClaimed=true, depositState=NOT_REQUIRED.",
+        "(none) -> PENDING_DEPOSIT : apply, when deposit gate ON. Slot is ALREADY claimed (slotClaimed=true) and held for the duration of the window — this is why an expiry-reclaim race can overshoot capacity, which is accepted.",
+        "PENDING_DEPOSIT -> CONFIRMED : deposit paid within window (hold.state=PAID).",
+        "PENDING_DEPOSIT -> EXPIRED : depositDueAt passed, by cron sweeper OR lazy expire-on-read. Releases the slot (claimedCount -= 1, slotClaimed=false).",
+        "PENDING_DEPOSIT -> CANCELED : user cancels. Releases the slot. Open hold -> CANCELED.",
+        "CONFIRMED -> CANCELED : user cancels before the cancellation cutoff (see rules). Releases the slot. Deposit -> REFUND_REQUESTED.",
+        "CONFIRMED -> REJECTED : partner removes on the final-list edit screen (the designated remedy for overbooking). Deposit -> REFUND_REQUESTED.",
+        "EXPIRED -> PENDING_DEPOSIT : re-apply, only while the event is still OPEN and reapplyCount < REAPPLY_MAX. Requires a FRESH successful atomic claim — an expired user has no reserved priority.",
+        "CANCELED -> PENDING_DEPOSIT : re-apply, same conditions.",
+        "ANY non-terminal -> EVENT_CANCELED : partner/admin cancels the event. All deposits -> REFUND_REQUESTED.",
+        "FORBIDDEN: CONFIRMED -> EXPIRED (a paid slot never times out); EXPIRED -> CONFIRMED without a new claim; any transition out of REJECTED/EVENT_CANCELED except by Admin reversal."
+      ]
+    },
+    {
+      "entity": "Application (BID — 금액 입찰형)",
+      "states": [
+        "(none)",
+        "PENDING_DEPOSIT",
+        "VALID",
+        "CONFIRMED",
+        "NOT_SELECTED",
+        "EXPIRED",
+        "CANCELED",
+        "REJECTED",
+        "EVENT_CANCELED"
+      ],
+      "transitions": [
+        "(none) -> VALID : apply, deposit gate OFF. Plain INSERT, no capacity check, overbooking expected. amount=settledAmount=highestAmountEver, lastBidAt=settledLastBidAt=DB now().",
+        "(none) -> PENDING_DEPOSIT : apply, deposit gate ON. NOT counted in ranking until the deposit lands. depositDueAt = now + windowMinutes.",
+        "PENDING_DEPOSIT -> VALID : initial deposit paid. settledAmount=amount, settledLastBidAt=lastBidAt.",
+        "PENDING_DEPOSIT -> EXPIRED : window missed. Excluded from ranking. No slot to release (BID never claims).",
+        "VALID -> VALID (raise, no shortfall) : newAmount > amount AND newRequiredDeposit <= depositPaidAmount (typical for FIXED deposits). amount, lastBidAt, settledAmount, settledLastBidAt ALL advance atomically. Fully settled, nothing pending.",
+        "VALID -> VALID (raise WITH shortfall, depositState=SHORTFALL_PENDING) : percentage deposit. amount and lastBidAt advance OPTIMISTICALLY; settledAmount/settledLastBidAt stay at the old pair as the rollback anchor. A new DepositHold(reason=RAISE_SHORTFALL, fresh full window) opens. Status stays VALID throughout — the application is never at risk from a failed raise.",
+        "SHORTFALL_PENDING -> PAID (still VALID) : shortfall paid. settledAmount=amount, settledLastBidAt=lastBidAt. The raise is now permanent.",
+        "SHORTFALL_PENDING -> ROLLBACK (still VALID) : shortfall window missed. amount := settledAmount, lastBidAt := settledLastBidAt, depositRequiredAmount recomputed, BidHistory(source=ROLLBACK) appended, depositState := PAID. The application SURVIVES at its previous amount. Notification: rebid-rollback (금액 원상 복구 안내).",
+        "VALID -> CANCELED : user cancels before the deadline. Deposit -> REFUND_REQUESTED. highestAmountEver is retained.",
+        "CANCELED/EXPIRED -> PENDING_DEPOSIT or VALID : re-apply before the deadline, reapplyCount < REAPPLY_MAX, newAmount >= highestAmountEver, and lastBidAt := DB now() (strictly worse clock than the original). Deposit restarts from zero paid.",
+        "VALID -> CONFIRMED : final-list confirm by the partner. selectionSource = RANKED or PARTNER_ADDED.",
+        "VALID -> NOT_SELECTED : final-list confirm; outside capacity or PARTNER_REMOVED. Deposit -> REFUND_REQUESTED.",
+        "VALID -> REJECTED : partner explicitly rejects (rule violation, no-show history) at any time. Distinct from NOT_SELECTED so the Korean copy can differ.",
+        "ANY non-terminal -> EVENT_CANCELED : event canceled. All deposits -> REFUND_REQUESTED.",
+        "FORBIDDEN: any amount DECREASE except source=ROLLBACK/ADMIN_ADJUST; any raise after effectiveDeadlineAt; any transition into VALID/PENDING_DEPOSIT after finalization has started (rankingState != PENDING)."
+      ]
+    },
+    {
+      "entity": "DepositHold",
+      "states": [
+        "PENDING",
+        "PAID",
+        "EXPIRED",
+        "SUPERSEDED",
+        "CANCELED",
+        "VOIDED"
+      ],
+      "transitions": [
+        "(none) -> PENDING : created on apply / raise-with-shortfall / re-apply. dueAt = openedAt + windowMinutes, computed in SQL.",
+        "PENDING -> PAID : amountPaid >= amountDue. Idempotent — a replayed settlement callback is a no-op.",
+        "PENDING -> EXPIRED : now() > dueAt, by cron sweeper or lazy expire-on-read, inside a transaction. Drives the application-side EXPIRED (initial hold) or ROLLBACK (shortfall hold).",
+        "PENDING -> SUPERSEDED : a NEW raise arrives while a shortfall hold is still open. The old hold closes and a single new hold is opened, computed from the settled baseline, with a FRESH window. (Combined with the anti-filibuster caps in businessRules, this cannot be abused to extend indefinitely.)",
+        "PENDING -> CANCELED : user cancels the application, or the event is canceled.",
+        "PAID -> (no transition) : refunds are separate DepositRefund rows; the hold itself stays PAID forever as the payment-of-record.",
+        "ANY -> VOIDED : DEPOSIT_HOLD_ENABLED is flipped OFF while holds are live — a one-shot migration voids all PENDING holds and promotes their applications (PENDING_DEPOSIT -> VALID/CONFIRMED) rather than mass-expiring innocent users."
+      ]
+    },
+    {
+      "entity": "Event ranking lifecycle (BID)",
+      "states": [
+        "PENDING",
+        "FINALIZING",
+        "FINALIZED",
+        "CONFIRMED"
+      ],
+      "transitions": [
+        "PENDING -> PENDING : every soft-close extension recomputes rankingFinalizeAt.",
+        "PENDING -> FINALIZING : cron picks up the event at now() >= rankingFinalizeAt. Guarded by pg_advisory_xact_lock(hashtextextended(eventId)) so concurrent cron instances cannot both finalize.",
+        "FINALIZING -> FINALIZED : inside ONE transaction — (1) expire all overdue holds, (2) roll back all unsettled raises, (3) INSERT ... SELECT the ranking rows with ROW_NUMBER(), (4) stamp Application.finalRank. Partner is notified that 심사 시작 is possible. NO selected/not-selected user notifications yet.",
+        "FINALIZED -> CONFIRMED : partner confirms the final list. THIS is what flips applications to CONFIRMED/NOT_SELECTED, enqueues DepositRefund rows, and emits selected / not-selected notifications.",
+        "CONFIRMED -> FINALIZED : Admin-only reopen, with a full audit entry and a rankingVersion bump. Notifications already sent are NOT retracted; a correction message is sent instead."
+      ]
+    }
+  ],
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/events/:eventId/applications",
+      "roles": [
+        "USER"
+      ],
+      "description": "신청하기. Header `Idempotency-Key` REQUIRED. Body: { amount?: number, agreedTermsVersion: string }. INSTANT ignores client amount and uses Event.fixedAmount. BID validates min<=amount<=max. Single transaction: idempotency insert -> event load FOR SHARE -> period check against DB now() -> (INSTANT) atomic claim UPDATE, 409 CAPACITY_FULL on 0 rows -> upsert Application by (eventId,userId) -> BidHistory(INITIAL_APPLY|REAPPLY) -> optional DepositHold -> soft-close check (BID). Returns { applicationId, status, amount, depositDueAt, remainingSeconds, competition:{capacity,applicantCount,ratio} }. Never returns rank or any other user's amount."
+    },
+    {
+      "method": "PATCH",
+      "path": "/applications/:id/amount",
+      "roles": [
+        "USER"
+      ],
+      "description": "금액 올리기 (raise-only, BID only). Header `Idempotency-Key` REQUIRED. Body: { newAmount, expectedCurrentAmount, version }. Rejects newAmount <= amount with 422 AMOUNT_MUST_INCREASE, newAmount > Event.maxAmount with 422, any raise past effectiveDeadlineAt with 409 DEADLINE_PASSED. Optimistic UPDATE ... WHERE id AND version=? AND amount=? -> 409 CONFLICT_STALE on 0 rows. Sets lastBidAt = DB now(). Returns { amount, lastBidAt, depositShortfall, depositDueAt, remainingSeconds, deadlineExtendedTo? }."
+    },
+    {
+      "method": "POST",
+      "path": "/applications/:id/cancel",
+      "roles": [
+        "USER"
+      ],
+      "description": "신청 취소. Body: { reason?: string }. Allowed only before effectiveDeadlineAt (BID) or before the event's cancellation cutoff (INSTANT). Releases the INSTANT slot exactly once via the slotClaimed guard, cancels the open hold, enqueues a DepositRefund if anything was paid. Retains highestAmountEver so a later re-apply cannot go lower."
+    },
+    {
+      "method": "POST",
+      "path": "/events/:eventId/applications/reapply",
+      "roles": [
+        "USER"
+      ],
+      "description": "다시 신청. Resurrects the existing CANCELED/EXPIRED row. Enforces reapplyCount < REAPPLY_MAX (1), amount >= highestAmountEver, lastBidAt = DB now(). Exists as a separate route from POST /applications purely so the client can show an explicit '이전 신청 금액 이상으로만 다시 신청할 수 있어요' confirmation; the server accepts either route."
+    },
+    {
+      "method": "GET",
+      "path": "/applications/me",
+      "roles": [
+        "USER"
+      ],
+      "description": "내 신청 내역. Cursor-paginated, filter by status / mode / eventId. Applies lazy expire-on-read to the caller's own overdue rows before serializing. `Cache-Control: private, no-store`."
+    },
+    {
+      "method": "GET",
+      "path": "/events/:eventId/applications/me",
+      "roles": [
+        "USER"
+      ],
+      "description": "이 이벤트에 대한 내 신청. Returns my own amount, status, deposit countdown (server-computed remainingSeconds), and the public competition ratio. Returns 404 (not 403) when no application exists, so the endpoint cannot be used as an existence oracle for other users."
+    },
+    {
+      "method": "GET",
+      "path": "/applications/:id/deposit",
+      "roles": [
+        "USER"
+      ],
+      "description": "예약금 상태 조회. { holdId, amountDue, dueAt (ISO with +09:00 offset), remainingSeconds, state }. remainingSeconds is authoritative; the client counts down locally but re-syncs on focus and on 0."
+    },
+    {
+      "method": "POST",
+      "path": "/applications/:id/deposit/confirm",
+      "roles": [
+        "USER"
+      ],
+      "description": "예약금 결제 (MVP STUB). With DEPOSIT_HOLD_ENABLED=false this returns 501 NOT_IMPLEMENTED. With the flag on and no PG wired, it settles the hold directly in a dev/staging mode only. Header `Idempotency-Key` REQUIRED. The future PG webhook (POST /internal/payments/deposit-webhook) will drive this same domain service."
+    },
+    {
+      "method": "GET",
+      "path": "/events/:eventId/competition",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "경쟁률 조회. Returns ONLY { capacity, applicantCount, ratio, deadlineAt, deadlineExtended, softCloseWindowMinutes, serverTime }. applicantCount counts status IN (PENDING_DEPOSIT, VALID, CONFIRMED). NEVER returns amounts, min/max observed, cutoff, distribution, or rank — even to the applicant. Response built by an explicit whitelist DTO, never by object spread with deletions. Cached 5s at the edge with a stale-while-revalidate of 10s."
+    },
+    {
+      "method": "GET",
+      "path": "/events/:eventId/competition/stream",
+      "roles": [
+        "PUBLIC",
+        "USER"
+      ],
+      "description": "경쟁률 실시간 (SSE). Emits the same whitelist payload every POLL_INTERVAL (default 5s), max connection lifetime 60s then the client reconnects (Vercel function duration limit). Falls back to plain polling of the endpoint above if EventSource fails. Payload is identical to the REST DTO — one serializer, so a leak cannot be introduced on only one path."
+    },
+    {
+      "method": "GET",
+      "path": "/partner/events/:eventId/applications",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ],
+      "description": "신청자 목록 (누가 얼마를 썼는지). Full amounts, lastBidAt, deposit state, rebidCount. Sort: rank (amount DESC, lastBidAt ASC, id ASC) | amount | appliedAt. Filters: status, depositState, keyword. Before rankingFinalizeAt the response carries { provisional: true } and the UI must label it 잠정 순위. Ownership check is `event.partnerId === req.user.partnerId`, not a role check alone."
+    },
+    {
+      "method": "GET",
+      "path": "/partner/events/:eventId/ranking",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ],
+      "description": "확정 순위표. Reads EventRankingEntry (frozen). 409 RANKING_NOT_FINALIZED before rankingFinalizeAt, with { finalizeAt, remainingSeconds } so the UI can show a countdown."
+    },
+    {
+      "method": "PUT",
+      "path": "/partner/events/:eventId/final-list",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "최종 명단 편집 (draft). Body: { include: applicationId[], exclude: applicationId[], note? }. Idempotent full-replacement of the draft selection. Warns (does not block) when include.length > capacity — INSTANT overbooking is resolved here. Requires rankingState=FINALIZED for BID; available any time after the deadline for INSTANT."
+    },
+    {
+      "method": "POST",
+      "path": "/partner/events/:eventId/final-list/confirm",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "최종 명단 확정. Header `Idempotency-Key` REQUIRED. One transaction: flip VALID -> CONFIRMED / NOT_SELECTED, set selectionSource + finalRank, enqueue DepositRefund for every non-confirmed paid hold, set rankingState=CONFIRMED, emit selected / not-selected domain events. Irreversible for the partner (Admin-only reopen)."
+    },
+    {
+      "method": "POST",
+      "path": "/partner/applications/:id/reject",
+      "roles": [
+        "PARTNER(owner)"
+      ],
+      "description": "신청 제외. Body: { reason }. -> REJECTED, deposit refund enqueued. Reason is stored and included in the notification."
+    },
+    {
+      "method": "GET",
+      "path": "/partner/events/:eventId/applications/export",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ],
+      "description": "CSV 내보내기 of the applicant list. UTF-8 with BOM (Excel on Korean Windows mangles it otherwise), all datetimes formatted in KST with an explicit +09:00. Rate-limited and audit-logged — this is the highest-value bulk-PII egress in the context."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/applications",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "전체 신청 조회. Filter by eventId, userId, status, depositState, date range (KST-interpreted). Includes BidHistory expansion for dispute resolution."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/applications/:id/restore",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "관리자 복구. Reverses an EXPIRED/CANCELED application (e.g. our sweeper misfired during an incident). Writes BidHistory(ADMIN_ADJUST) + ApplicationEventLog with a mandatory reason. Can restore the original lastBidAt — the only path in the system that may improve a tie-break clock."
+    },
+    {
+      "method": "POST",
+      "path": "/admin/events/:eventId/ranking/refinalize",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "순위 재확정. Bumps rankingVersion, keeps old entries. Requires a reason. Blocked once refunds have reached COMPLETED state."
+    },
+    {
+      "method": "GET",
+      "path": "/admin/deposits/refunds",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "환불 대기열. The MVP deliverable for refunds: a queue view of REQUESTED rows so ops can settle manually until the Payment context ships."
+    },
+    {
+      "method": "POST",
+      "path": "/internal/cron/deposit-sweeper",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Vercel Cron, every minute. Auth: `Authorization: Bearer ${CRON_SECRET}` AND the x-vercel-cron header. Processes overdue holds in batches of 200, ordered by dueAt, each batch its own transaction, with a wall-clock budget of 20s and `SKIP LOCKED` so overlapping runs never fight. Initial holds -> EXPIRED (+ INSTANT slot release); shortfall holds -> ROLLBACK. Emits hold-expired / rebid-rollback events."
+    },
+    {
+      "method": "POST",
+      "path": "/internal/cron/finalize-rankings",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Vercel Cron, every minute. Selects BID events with rankingState=PENDING AND rankingFinalizeAt <= now(), limit 20, one advisory-locked transaction each. Runs the sweeper logic for that event first, then materializes EventRankingEntry."
+    },
+    {
+      "method": "POST",
+      "path": "/internal/cron/idempotency-gc",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Daily. Deletes ApplicationIdempotencyKey rows past expiresAt in bounded batches."
+    }
+  ],
+  "businessRules": [
+    "BR-1 (1인 1신청): @@unique([eventId, userId]) on Application. The row is created once and never deleted; cancel/expire/re-apply are transitions. No 'soft-delete + insert new row' — that pattern is exactly what would let a user mint a fresh tie-break clock.",
+    "BR-2 (서버 시계 단일화): lastBidAt, firstAppliedAt, bidAt, openedAt, dueAt, and every deadline comparison use the DATABASE clock inside the writing transaction (`now()` / `transaction_timestamp()`), never `new Date()` in Node. Concurrent Vercel instances have clock skew; with lastBidAt as a tie-break, app-generated timestamps are a fairness bug and an exploit.",
+    "BR-3 (INSTANT 원자적 확보): capacity is enforced by exactly ONE statement — `UPDATE \"Event\" SET \"claimedCount\" = \"claimedCount\" + 1, \"updatedAt\" = now() WHERE \"id\" = $1 AND \"claimedCount\" < \"capacity\" AND \"status\" = 'OPEN' AND now() >= \"startAt\" AND now() < \"deadlineAt\" RETURNING \"claimedCount\", \"capacity\"`. Via prisma.$executeRaw / $queryRaw. Zero affected rows => 409 CAPACITY_FULL. No SELECT ... FOR UPDATE, no advisory lock, no Redis, no waitlist queue. Postgres row-level locking on the single Event row serializes this correctly and cheaply.",
+    "BR-4 (클레임 후 삽입, 같은 트랜잭션): the claim UPDATE and the Application INSERT are in ONE Prisma interactive transaction. If the INSERT violates the unique constraint (double-submit), the transaction rolls back and the counter is automatically restored — no compensating decrement code exists, and therefore no compensating-decrement bug exists.",
+    "BR-5 (오버부킹 허용): claimedCount MAY exceed capacity transiently — a slot released by expiry can be re-claimed while another expiry is mid-flight, and PENDING_DEPOSIT applications hold slots. This is accepted. There is no reconciliation job, no waitlist succession, no promotion machinery. The partner resolves any overshoot on the 최종 명단 편집 screen, which exists regardless. Log every overshoot to ApplicationEventLog for observability, but do not act on it automatically.",
+    "BR-6 (슬롯 반환 1회 보장): release is `UPDATE \"Application\" SET \"slotClaimed\"=false WHERE id=$1 AND \"slotClaimed\"=true` followed, only if 1 row was affected, by `UPDATE \"Event\" SET \"claimedCount\" = GREATEST(\"claimedCount\" - 1, 0) WHERE id=$2` — same transaction. The guard flag makes double release impossible; GREATEST makes negative counts impossible.",
+    "BR-7 (BID 신청은 순수 INSERT): no capacity check, no counter, no lock, no waitlist. Overbooking is the expected steady state. Capacity is consulted exactly once, at finalization, to compute withinCapacity.",
+    "BR-8 (랭킹 규칙): `ORDER BY amount DESC, lastBidAt ASC, id ASC`. Highest amount wins; among equal amounts the applicant who REACHED that amount first wins (not who applied first); id ASC is a final deterministic tie-break so the ordering is stable across recomputation (two rows can share a lastBidAt at millisecond truncation).",
+    "BR-9 (랭킹 SQL): materialization is a single INSERT..SELECT — `INSERT INTO \"EventRankingEntry\" (id,\"eventId\",\"applicationId\",\"rank\",\"amount\",\"lastBidAt\",\"withinCapacity\",\"capacitySnapshot\",\"finalizedAt\",\"rankingVersion\") SELECT gen_random_uuid()::text, a.\"eventId\", a.\"id\", rn, a.\"amount\", a.\"lastBidAt\", rn <= e.\"capacity\", e.\"capacity\", now(), $2 FROM (SELECT a.*, ROW_NUMBER() OVER (ORDER BY a.\"amount\" DESC, a.\"lastBidAt\" ASC, a.\"id\" ASC) AS rn FROM \"Application\" a WHERE a.\"eventId\" = $1 AND a.\"status\" = 'VALID') a JOIN \"Event\" e ON e.\"id\" = a.\"eventId\"`. The Prisma equivalent for the partner's live provisional list is `orderBy: [{ amount: 'desc' }, { lastBidAt: 'asc' }, { id: 'asc' }]` with `where: { eventId, status: 'VALID' }`.",
+    "BR-10 (필수 복합 인덱스): `CREATE INDEX CONCURRENTLY app_rank_valid ON \"Application\" (\"eventId\", \"amount\" DESC, \"lastBidAt\" ASC, \"id\") WHERE \"status\" = 'VALID';` — a partial covering index that turns the ranking read into an index-only scan with no sort node. Plus `app_deposit_due ON \"Application\"(\"depositDueAt\") WHERE \"depositState\" IN ('PENDING','SHORTFALL_PENDING')` for the sweeper, and `(\"userId\", \"status\", \"createdAt\" DESC)` for 내 신청 내역. Verify with EXPLAIN that no Sort node appears in the ranking plan.",
+    "BR-11 (확정 시점): rankingFinalizeAt = effectiveDeadlineAt + depositWindowMinutes + FINALIZE_GRACE_MINUTES (default 1). This is the whole point of the grace: an applicant who applies or raises 1 second before the deadline still gets their FULL deposit window, and the sweeper gets one minute to run before ranking reads the table. Recomputed on every soft-close extension.",
+    "BR-12 (확정 전 강제 정리): the finalization transaction FIRST expires every overdue hold for that event and rolls back every unsettled raise, THEN ranks. Consequence: at ranking time no application is in a pending/optimistic state, so ranking can read `amount` directly and never needs a COALESCE against settledAmount.",
+    "BR-13 (인상 전용): a raise requires newAmount > current amount. Lowering is 422 AMOUNT_MUST_INCREASE. Equal is also rejected (it would be a pure lastBidAt refresh — i.e. a tie-break improvement for free, which is the most obvious exploit in the design).",
+    "BR-14 (lastBidAt 의미): lastBidAt = the instant the applicant reached the CURRENT amount. Raise advances it. Rollback restores it to settledLastBidAt. Cancel/re-apply resets it to now() (never earlier). Nothing else may write it except an audited Admin restore.",
+    "BR-15 (재신청 하한): re-apply and raise both require newAmount >= highestAmountEver. Cancel-then-reapply-lower is impossible. Combined with BR-14 (clock resets to now), cancel/re-apply is strictly non-advantageous in both dimensions — which is precisely the property we need.",
+    "BR-16 (재신청 횟수 제한): REAPPLY_MAX = 1 per event (configurable). Prevents cancel/reapply churn used as a probing or notification-spam vector.",
+    "BR-17 (예약금 계산): FIXED => required = depositFixedAmount, independent of amount. PERCENTAGE => required = ceil(amount * depositPercentBp / 10000), computed in integer arithmetic (`(amount * bp + 9999) / 10000` in SQL/BigInt), then rounded UP to the nearest 10원 (ROUND_UNIT, configurable). Never floats. amount * bp can reach 2^31 * 10^4 — compute in BIGINT then cast.",
+    "BR-18 (예약금은 자격 요건일 뿐): ranking is on 신청 금액, never on deposit paid. A user who pays a larger deposit gains nothing. Stated explicitly in the UI copy so users don't over-pay.",
+    "BR-19 (인상 시 부족분): shortfall = newRequired - depositPaidAmount. If shortfall <= 0 (typical FIXED), the raise settles immediately: amount, lastBidAt, settledAmount, settledLastBidAt all advance atomically, no hold. If shortfall > 0, amount and lastBidAt advance optimistically while settledAmount/settledLastBidAt stay put, and a new hold opens with a FRESH FULL window.",
+    "BR-20 (롤백 규칙): on shortfall expiry, amount := settledAmount AND lastBidAt := settledLastBidAt — BOTH, atomically. Restoring only the amount would leave the user holding a stale (old amount, new clock) pair, which is a strictly better tie-break obtained for free by defaulting. The application stays VALID; only the raise is undone. Append BidHistory(source=ROLLBACK, restoredLastBidAt) and notify rebid-rollback.",
+    "BR-21 (중첩 인상): at most one open hold per application, enforced by a partial unique index. A raise arriving while a shortfall hold is open SUPERSEDEs it; the new hold's amountDue is recomputed from the settled baseline (newRequired - depositPaidAmount), with a fresh window. The rollback anchor is unchanged, so a chain of defaulted raises collapses to the last settled state.",
+    "BR-22 (소프트 클로즈 트리거 제한): a bid extends the deadline ONLY if it is SETTLED at the moment of the bid (no shortfall) or the deposit gate is off. A raise that opens a shortfall hold does NOT extend the deadline. Without this rule, a user could raise-and-default in a loop to keep the auction open forever at zero cost. Rollbacks never extend.",
+    "BR-23 (소프트 클로즈 계산): if softCloseEnabled AND now() >= deadlineAt - softCloseWindowMinutes AND softCloseExtensionCount < softCloseMaxExtensions, then newDeadline = LEAST(GREATEST(deadlineAt, now() + softCloseWindowMinutes), absoluteDeadlineAt). Applied as `UPDATE \"Event\" SET \"deadlineAt\" = $new, \"softCloseExtensionCount\" = \"softCloseExtensionCount\" + 1, \"rankingFinalizeAt\" = $new + interval, ... WHERE id = $1 AND \"deadlineAt\" < $new` — the guard makes concurrent extensions converge to the max rather than stacking.",
+    "BR-24 (연장 알림 억제): the deadline-extended notification is rate-limited to at most one per user per event per 10 minutes. A sniping war could otherwise generate dozens of 쪽지 per applicant.",
+    "BR-25 (마감 판정): the deadline check is `now() < e.\"deadlineAt\"` evaluated inside the SAME transaction that writes the bid, against the freshly-read event row. Never validate the deadline in application code from a value read in an earlier request — a request that passed validation at T can otherwise commit after the deadline.",
+    "BR-26 (게으른 만료 + 스위퍼): both. Any read or write that touches an application whose depositDueAt has passed expires it inside that transaction before proceeding (correctness), and Vercel Cron sweeps every minute (liveness, notifications). The cron is an optimization, not the source of truth — a missed cron run must never change an outcome.",
+    "BR-27 (스위퍼 배치 안전): `SELECT ... WHERE state='PENDING' AND \"dueAt\" <= now() ORDER BY \"dueAt\" LIMIT 200 FOR UPDATE SKIP LOCKED` per transaction, with a 20-second wall-clock budget and a bounded loop. SKIP LOCKED means overlapping cron invocations (Vercel does not guarantee non-overlap) partition the work instead of deadlocking.",
+    "BR-28 (멱등성): every POST/PATCH in this context requires an `Idempotency-Key` header. Insert-first: `INSERT INTO \"ApplicationIdempotencyKey\" (...) VALUES (...) ON CONFLICT (\"userId\",\"key\") DO NOTHING`. Zero rows inserted => an existing record; COMPLETED => replay responseBody verbatim with the original status; IN_PROGRESS => 409 REQUEST_IN_PROGRESS with Retry-After: 2; different requestHash => 422 IDEMPOTENCY_KEY_REUSED.",
+    "BR-29 (낙관적 동시성): every Application mutation carries `WHERE version = $expected` and bumps version. Zero rows affected => 409 CONFLICT_STALE, client refetches. This covers raise-vs-sweeper, raise-vs-cancel, and two tabs of the same user without any row locks.",
+    "BR-30 (가시성 화이트리스트): the public competition DTO is constructed field-by-field by an explicit mapper. Never `{ ...event }` minus fields, never a Prisma `select` that someone later widens. A contract test asserts that the public response body, JSON-stringified, contains none of the substrings `amount`, `rank`, `cutoff`, `bid`.",
+    "BR-31 (자기 순위도 비공개): a user cannot see their own rank, the cutoff, the amount distribution, or the min/max of other bids. Near-sealed-bid. Event.visibilityConfig has showCutoffAmount / showMyRank flags wired through the same serializer, defaulting false, so the product can loosen this by config later without a code change.",
+    "BR-32 (경쟁률 산정): applicantCount = COUNT(*) WHERE status IN ('PENDING_DEPOSIT','VALID','CONFIRMED'). Deliberately includes PENDING_DEPOSIT: excluding it would let an observer diff the counter to infer deposit expiries, and would make the counter jump downward in ways users read as a bug. ratio = round(applicantCount / capacity, 1) rendered as `4.7:1`.",
+    "BR-33 (파트너/운영자 전권 조회): partners see full amounts, lastBidAt, and ranking for THEIR OWN events only, enforced by `event.partnerId === req.user.partnerId` (ownership, not just role). Admin sees everything, and every Admin read of applicant amounts is audit-logged.",
+    "BR-34 (확정 전 순위 라벨): any pre-finalization ordered list served to a partner carries `provisional: true` and the UI must render 잠정 순위 — the list can still change via late bids and pending deposits.",
+    "BR-35 (파트너 오버라이드): the partner may include applicants outside capacity and exclude applicants inside it. Overrides are recorded as selectionSource = PARTNER_ADDED / PARTNER_REMOVED and are visible to Admin. Pure ranking is a recommendation, not a contract — and the user-facing copy must never promise 'highest bids automatically win'.",
+    "BR-36 (선정 알림 시점): selected / not-selected notifications fire ONLY at final-list confirm, never at finalization. Partners need to review before applicants learn their fate.",
+    "BR-37 (환불 모델링): confirming the final list enqueues a DepositRefund (state=REQUESTED) for every paid hold on a non-CONFIRMED application, with a deterministic idempotencyKey `refund:{holdId}:{reason}`. Re-running confirm cannot double-enqueue. MVP performs no money movement.",
+    "BR-38 (기능 플래그 OFF 동작): with DEPOSIT_HOLD_ENABLED=false, no DepositHold rows are created, depositState=NOT_REQUIRED, depositDueAt=NULL, and applications go straight to VALID (BID) / CONFIRMED (INSTANT). All tables, state machine edges, sweeper code, and Korean copy ship and are unit-tested; only the entry condition is flipped.",
+    "BR-39 (플래그 전환 안전): turning the flag OFF while holds are live runs a one-shot migration that VOIDs all PENDING holds and PROMOTES their applications rather than expiring them. Turning it ON mid-event applies only to applications created after the flip — existing rows keep depositState=NOT_REQUIRED.",
+    "BR-40 (시간대): all timestamptz, UTC in the DB, `SET TIME ZONE 'UTC'` on the connection. The API accepts and returns ISO-8601 with an explicit offset. Partner-entered deadlines are interpreted as Asia/Seoul by a zod transform at the boundary. Date-only fields (서비스 일자) are `@db.Date` and interpreted as KST calendar days. 'Deadline soon' / 'today' filters compute KST day boundaries via `(now() AT TIME ZONE 'Asia/Seoul')::date`. Korea has no DST, so no ambiguous-hour handling is needed — but do not hardcode +09:00 arithmetic; use the named zone so the code survives a hypothetical policy change.",
+    "BR-41 (금액 도메인): KRW integers only, 0 <= amount <= 2147483647. Reject non-integers, strings with separators, scientific notation, negative zero, and NaN at the zod layer. amount=0 is legal (min can be 0) and must not be confused with 'no amount' — use explicit null checks, never truthiness.",
+    "BR-42 (레이트 리밋): per user per event — apply 5/min, raise 10/min with a 3-second minimum interval, deposit confirm 10/min. Per IP — 60/min across the context. Enforced at the API layer with a Postgres-backed counter (no Redis in the stack); on limiter failure, fail OPEN for reads and CLOSED for writes.",
+    "BR-43 (감사): every status transition writes ApplicationEventLog; every amount transition writes BidHistory. Neither table is ever updated or deleted. These are the artifacts we hand a user who disputes a tie-break loss."
+  ],
+  "edgeCases": [
+    "[경합] INSTANT 마지막 한 자리 동시 신청 100건: the conditional UPDATE serializes on the Event row; exactly one wins, 99 get 409 CAPACITY_FULL. Expected throughput on the hot row is roughly 1–2k updates/sec on Neon, which is far above any realistic Dibs event. No queue needed. Client must render 정원이 모두 찼어요 gracefully, not as a generic error.",
+    "[경합/오버부킹] 만료 회수와 신규 신청 경합: user A's slot is being released by the sweeper while user B claims the freed slot; a third expiry lands concurrently. Result can be claimedCount == capacity + 1. ACCEPTED by design. Do not add a reconciliation job. Log an OVERBOOK_OBSERVED metric and let the partner drop one on the final-list screen.",
+    "[경합] 스위퍼가 결제 확정과 동시에 실행: the sweeper expires the hold at the same instant the deposit settles. Both statements carry version/state guards (`WHERE state='PENDING'`), so exactly one wins. If the sweeper wins and the payment is real, the payment webhook finds state=EXPIRED and must enqueue a DepositRefund(reason=DUPLICATE_PAYMENT) rather than silently swallowing money. Grace: accept settlement up to 30 seconds past dueAt (SETTLEMENT_GRACE_SECONDS) to absorb PG latency — a user who tapped 결제 at T-2s should not lose to network round-trip time.",
+    "[중복 제출] 사용자가 신청 버튼 더블탭: unique(eventId,userId) + idempotency key. First request wins; the second returns the identical 201 body. INSTANT critically: because the claim and insert share a transaction, the duplicate's rollback restores claimedCount — no phantom slot consumption.",
+    "[중복 제출] 모바일 네트워크 재시도로 같은 인상 요청 2회: same key => replayed response. Different key but same body => the second is rejected by `expectedCurrentAmount` mismatch (409 CONFLICT_STALE), because the first already moved the amount. Two independent protections.",
+    "[게이밍] 동일 금액으로 재입찰해 lastBidAt만 갱신: blocked by BR-13 (strictly greater). This is the single most likely exploit attempt and must have a dedicated regression test.",
+    "[게이밍] 취소 후 즉시 재신청으로 시계 세탁: impossible — the same row is resurrected, lastBidAt := now() (strictly later, never earlier), and newAmount >= highestAmountEver. Both dimensions are strictly non-improving.",
+    "[게이밍] 인상 후 고의 미납으로 마감 시각 연장 반복: blocked by BR-22 (unsettled raises never trigger soft close) AND BR-23 caps (softCloseMaxExtensions, absoluteDeadlineAt) AND BR-42 rate limits AND rebidCount cap of 20. Four independent brakes because a filibuster breaks the event for everyone.",
+    "[게이밍] 인상 후 미납으로 더 유리한 클록 획득: blocked by BR-20 — rollback restores lastBidAt as well as amount. Without that line the exploit is: bid 10,000 at 09:00, raise to 20,000 at 12:00, default, and end up at 10,000 with a 12:00 clock — worse, actually, but the inverse (defaulting to keep a stale-but-earlier clock on a raised amount) is the real hazard. Restoring the exact pair closes both directions.",
+    "[게이밍] 마감 1초 전 신청으로 예약금 창을 마감 이후로 밀기: intended and fair — rankingFinalizeAt already accounts for it (BR-11). But note the interaction: with a 10-minute window, an event with soft close disabled still cannot be finalized until deadline+11min. Partners must be told this in the UI ('심사는 마감 후 약 11분 뒤 시작할 수 있어요') or they will file bugs.",
+    "[경합] 마감 직전 인상과 소프트 클로즈 연장이 동시에: the extension UPDATE is guarded by `WHERE deadlineAt < $new`, so N concurrent extenders converge to a single max value instead of stacking N windows. rankingFinalizeAt is recomputed in the same statement, so it can never lag behind deadlineAt.",
+    "[경합] 크론이 마감 연장과 동시에 확정 시작: the finalization transaction takes pg_advisory_xact_lock on the eventId and re-reads rankingFinalizeAt inside the lock; if a soft-close extension pushed it into the future, the job aborts and leaves rankingState=PENDING. Without the re-read inside the lock, a last-second snipe could be ranked out.",
+    "[크론] Vercel Cron이 실행되지 않거나 중복 실행: overlapping runs are safe (SKIP LOCKED + advisory locks + state guards). A missed run is safe because lazy expire-on-read makes the sweeper an optimization. What a missed run DOES delay is the hold-expired notification — acceptable. Alert if the oldest PENDING hold is more than 5 minutes past dueAt.",
+    "[크론] 함수 타임아웃 중간에 종료: every batch is its own transaction, so partial progress is durable and the next run resumes. Never wrap the whole sweep in one transaction — a 10,000-row sweep would hold locks past the function limit and roll back entirely.",
+    "[타임존] 파트너가 KST로 마감 20:00 입력, 서버는 UTC: zod transform at the boundary converts using the named zone Asia/Seoul. The classic failure is `new Date('2026-08-01T20:00')` on a UTC Vercel runtime silently producing 20:00 UTC = 05:00 KST next day. Require an explicit offset in the payload and reject offset-less datetime strings with 422.",
+    "[타임존] 클라이언트 시계가 5분 빠름: the countdown would hit 0 early and the user would think they missed the window. Server returns remainingSeconds and serverTime; the client anchors to performance.now() delta from serverTime, re-syncs on visibilitychange, and on reaching 0 calls the API rather than assuming expiry.",
+    "[타임존] KST 자정 경계의 '마감 임박' 필터: computed as `(now() AT TIME ZONE 'Asia/Seoul')::date`, not as UTC date arithmetic. Otherwise events look like they belong to the previous day for 9 hours every day.",
+    "[예약금] 퍼센트 예약금 반올림: 10% of 33,333 = 3,333.3. Integer ceil then round up to 10원 => 3,340. Must be identical in the API, the UI preview, and the eventual PG request — a 10원 mismatch means the PG charge does not settle the hold. Single shared implementation in packages/shared, unit-tested against a table of adversarial values (0, 1, 9, 10, 2147483647).",
+    "[예약금] amount=0인 BID 이벤트: percentage deposit of 0 is 0, so amountDue would be 0. Rule: a hold is created ONLY when amountDue > 0; otherwise the application is immediately settled. Do not create zero-value holds — they can never be 'paid' and would expire everyone.",
+    "[예약금] 부분 납부: not accepted in MVP. A hold settles only at amountPaid >= amountDue. If a future PG delivers a partial capture, the hold stays PENDING and the partial is refunded on expiry (RefundReason.ROLLBACK_OVERPAY).",
+    "[예약금] 인상으로 필요 예약금이 오히려 감소: impossible for monotonic formulas (fixed or percentage of a strictly increasing amount), but assert it — a future 'tiered deposit' config could break monotonicity. If newRequired < depositPaidAmount, settle immediately and enqueue a partial refund; never write a negative amountDue.",
+    "[정보 유출] 경쟁률을 초 단위로 폴링해 개별 신청 시각 추론: an attacker can learn WHEN someone applied but never WHO or HOW MUCH. Acceptable. Mitigate mildly with 5-second edge caching, which quantizes the signal.",
+    "[정보 유출] 오류 메시지 차이로 컷오프 탐지: the raise endpoint must return an identical error shape whether the new amount would rank 1st or 500th. There is no server-side response that varies with other users' amounts. Explicitly forbid any 'you are currently outside the cut' hint, however tempting for conversion.",
+    "[정보 유출] 파트너 CSV로 다른 파트너 이벤트 조회: ownership check on eventId, not a role check. Audit-log every export with actor, eventId, and row count.",
+    "[정보 유출] SSE와 REST의 직렬화 불일치: both must call the SAME mapper function. A contract test snapshots both payloads and asserts equality of key sets — this is the realistic path by which amounts leak six months from now.",
+    "[정보 유출] finalRank가 사용자 DTO에 실려 나감: finalRank, amount-of-others, partnerNote, and EventRankingEntry are excluded from every user-facing serializer by whitelist. Even after CONFIRMED, the user sees only 확정 / 미선정 — never their rank or the cutoff, unless visibilityConfig is loosened.",
+    "[남용] 봇이 수천 계정으로 BID 신청: BID has no capacity gate so a flood costs nothing but pollutes the ratio and the partner's list. Mitigations: Google-only auth (raises the cost), per-IP rate limits, ipHash clustering in BidHistory, and a partner bulk-reject tool. Flag events whose applicantCount/capacity exceeds a threshold for Admin review.",
+    "[남용] 예약금 게이트 OFF 상태에서 INSTANT 대량 확보 후 노쇼: with no deposit there is nothing to forfeit. This is exactly why DEPOSIT_HOLD_ENABLED exists; until it ships, note the exposure to partners in the event-creation UI ('예약금 없이 운영하면 노쇼 위험이 있어요').",
+    "[상태] 마감 후 도착한 신청 요청: 409 EVENT_CLOSED, checked against DB now() inside the transaction. A request that passed an app-level check at T-100ms but commits at T+50ms must still fail — hence the in-transaction check.",
+    "[상태] 확정 명단 확정 후 도착한 인상 요청: 409 RANKING_FINALIZED. The raise path asserts rankingState = PENDING.",
+    "[상태] 이벤트 취소가 확정과 동시에: both take the same advisory lock on eventId. Whichever commits first wins; the loser reads the new state and aborts. Event cancellation always supersedes and reverses selections, enqueueing refunds for CONFIRMED applications too.",
+    "[데이터] 동일 밀리초 lastBidAt 두 건: timestamptz(3) truncates to milliseconds and collisions are realistic under load. `id ASC` as the third sort key makes the order deterministic and stable, but it is arbitrary from a fairness standpoint — consider timestamptz(6) (microseconds) to make genuine ties vanishingly rare. Flagged in openQuestions.",
+    "[데이터] 파트너가 마감 후 capacity를 변경: capacitySnapshot on EventRankingEntry preserves what the recommendation was based on; withinCapacity is not recomputed. The final-list screen shows both the snapshot and the current value.",
+    "[데이터] Admin 복구로 lastBidAt을 되돌림: the only privileged clock write in the system. Requires a mandatory reason, writes BidHistory(ADMIN_ADJUST) + ApplicationEventLog, and is blocked once refunds are COMPLETED.",
+    "[연결] Neon 콜드 스타트 + serverless 커넥션 폭증: use Prisma with the Neon serverless driver over HTTP or PgBouncer in transaction mode. Note that transaction-mode pooling forbids session-level state — the advisory locks used here are TRANSACTION-scoped (pg_advisory_xact_lock), which is compatible. Never use pg_advisory_lock (session-scoped) in this codebase."
+  ],
+  "terms": [
+    {
+      "technical": "Application",
+      "userFriendlyKo": "신청"
+    },
+    {
+      "technical": "Application (my list)",
+      "userFriendlyKo": "내 신청 내역"
+    },
+    {
+      "technical": "amount (bid amount)",
+      "userFriendlyKo": "신청 금액"
+    },
+    {
+      "technical": "minAmount ~ maxAmount",
+      "userFriendlyKo": "신청 가능 금액"
+    },
+    {
+      "technical": "EventMode.INSTANT",
+      "userFriendlyKo": "선착순 즉시확정"
+    },
+    {
+      "technical": "EventMode.BID",
+      "userFriendlyKo": "금액 제안형 (마감 후 선정)"
+    },
+    {
+      "technical": "raise / re-bid",
+      "userFriendlyKo": "금액 올리기"
+    },
+    {
+      "technical": "raise-only policy",
+      "userFriendlyKo": "금액은 올릴 수만 있어요"
+    },
+    {
+      "technical": "lastBidAt",
+      "userFriendlyKo": "금액을 올린 시각"
+    },
+    {
+      "technical": "tie-break by lastBidAt",
+      "userFriendlyKo": "같은 금액이면 먼저 제안한 분이 우선이에요"
+    },
+    {
+      "technical": "BidHistory",
+      "userFriendlyKo": "금액 변경 이력"
+    },
+    {
+      "technical": "deposit / DepositHold",
+      "userFriendlyKo": "예약금"
+    },
+    {
+      "technical": "depositDueAt",
+      "userFriendlyKo": "예약금 입금 마감 시각"
+    },
+    {
+      "technical": "deposit window",
+      "userFriendlyKo": "예약금 입금 시간"
+    },
+    {
+      "technical": "deposit shortfall",
+      "userFriendlyKo": "추가 예약금"
+    },
+    {
+      "technical": "rollback to previous amount",
+      "userFriendlyKo": "이전 금액으로 되돌아갔어요"
+    },
+    {
+      "technical": "ApplicationStatus.PENDING_DEPOSIT",
+      "userFriendlyKo": "예약금 입금 대기"
+    },
+    {
+      "technical": "ApplicationStatus.VALID",
+      "userFriendlyKo": "신청 완료"
+    },
+    {
+      "technical": "ApplicationStatus.CONFIRMED (INSTANT)",
+      "userFriendlyKo": "확정"
+    },
+    {
+      "technical": "ApplicationStatus.CONFIRMED (BID)",
+      "userFriendlyKo": "선정 완료"
+    },
+    {
+      "technical": "ApplicationStatus.NOT_SELECTED",
+      "userFriendlyKo": "미선정"
+    },
+    {
+      "technical": "ApplicationStatus.EXPIRED",
+      "userFriendlyKo": "기한 만료"
+    },
+    {
+      "technical": "ApplicationStatus.CANCELED",
+      "userFriendlyKo": "신청 취소"
+    },
+    {
+      "technical": "ApplicationStatus.REJECTED",
+      "userFriendlyKo": "신청 제외"
+    },
+    {
+      "technical": "ApplicationStatus.EVENT_CANCELED",
+      "userFriendlyKo": "이벤트 취소"
+    },
+    {
+      "technical": "capacity",
+      "userFriendlyKo": "정원 (최대 인원)"
+    },
+    {
+      "technical": "competition ratio",
+      "userFriendlyKo": "경쟁률"
+    },
+    {
+      "technical": "applicantCount",
+      "userFriendlyKo": "신청 인원"
+    },
+    {
+      "technical": "deadlineAt",
+      "userFriendlyKo": "신청 마감"
+    },
+    {
+      "technical": "soft close extension",
+      "userFriendlyKo": "마감 자동 연장"
+    },
+    {
+      "technical": "deadline extended notification",
+      "userFriendlyKo": "마감 시간이 연장되었어요"
+    },
+    {
+      "technical": "ranking / rank",
+      "userFriendlyKo": "선정 순위 (파트너 전용)"
+    },
+    {
+      "technical": "final confirmed list",
+      "userFriendlyKo": "최종 확정 명단"
+    },
+    {
+      "technical": "finalization",
+      "userFriendlyKo": "선정 마감"
+    },
+    {
+      "technical": "refund",
+      "userFriendlyKo": "예약금 환불"
+    },
+    {
+      "technical": "re-apply",
+      "userFriendlyKo": "다시 신청"
+    },
+    {
+      "technical": "CAPACITY_FULL error",
+      "userFriendlyKo": "정원이 모두 찼어요"
+    },
+    {
+      "technical": "AMOUNT_MUST_INCREASE error",
+      "userFriendlyKo": "현재 신청 금액보다 높은 금액만 입력할 수 있어요"
+    },
+    {
+      "technical": "DEADLINE_PASSED error",
+      "userFriendlyKo": "신청이 마감되었어요"
+    },
+    {
+      "technical": "CONFLICT_STALE error",
+      "userFriendlyKo": "신청 정보가 변경되었어요. 새로고침 후 다시 시도해 주세요"
+    },
+    {
+      "technical": "rank hidden notice",
+      "userFriendlyKo": "공정한 선정을 위해 신청 금액과 순위는 공개되지 않아요"
+    }
+  ],
+  "openQuestions": [
+    "경쟁률의 신청 인원에 예약금 미납(PENDING_DEPOSIT)을 포함할지: 포함하면 카운터가 줄지 않아 UX가 안정적이고 만료 정보가 새지 않지만, 실제 유효 경쟁률보다 부풀려 보입니다. 현재 설계는 '포함'입니다. 제품 판단이 필요합니다.",
+    "lastBidAt 정밀도: timestamptz(3)(밀리초)면 동시 입찰 시 실질 동점이 발생해 id ASC라는 자의적 기준으로 갈립니다. timestamptz(6)(마이크로초)로 올릴까요? 저장 비용은 동일하고 동점 확률만 사실상 0이 됩니다. 추천: 마이크로초.",
+    "재신청(REAPPLY_MAX) 기본값 1이 맞습니까? 아니면 취소 후 재신청을 아예 금지할까요? 금지가 가장 단순하고 게이밍 여지가 완전히 사라지지만, 실수로 취소한 사용자를 구제할 수 없습니다.",
+    "BID 모드에서 취소를 마감 직전까지 허용할지: 마감 5분 전 대량 취소는 파트너의 명단을 흔듭니다. '마감 N시간 전까지만 취소 가능' 컷오프가 필요한지 확인 필요.",
+    "INSTANT 확정 후 사용자 취소 정책: 언제까지, 예약금은 전액/일부 환불? 현재는 '이벤트별 취소 마감 시각' 필드를 가정만 했고 위약금 모델은 없습니다. 위약금이 필요하면 DepositRefund에 forfeitAmount가 추가되어야 합니다.",
+    "동점 처리의 대안: '먼저 제안한 사람 우선' 대신 '동점자 전원 포함(정원 초과 허용)' 또는 '무작위 추첨'을 원하는 파트너가 있을 수 있습니다. 이벤트별 tieBreakPolicy 옵션이 필요한가요?",
+    "파트너가 정원을 초과해 확정하는 것을 어디까지 허용할까요? 현재는 경고만 하고 무제한 허용입니다. 상한(예: 정원의 120%)이 필요한가요?",
+    "예약금 반올림 단위: 10원 절상으로 가정했습니다. 100원 또는 1,000원 단위가 한국 결제 UX상 더 자연스러운지 확인 필요.",
+    "확정 명단 확정에 기한이 필요한가요? 파트너가 심사를 방치하면 신청자는 무기한 대기 상태가 됩니다. '선정 마감 후 72시간 내 미확정 시 순위대로 자동 확정' 같은 폴백을 원하십니까?",
+    "소프트 클로즈 기본값: N=5분, 최대 6회 연장, 절대 상한 원래 마감 +2시간으로 가정했습니다. 이 숫자들의 제품 승인이 필요합니다.",
+    "가시성 완화 시점: showMyRank / showCutoffAmount를 언제, 어떤 조건에서 켤 계획인지에 따라 UI를 미리 만들어 둘지 결정됩니다. 특히 '내 순위 공개'는 실시간 순위 계산이 필요해 지금의 '확정 시점에만 랭킹' 설계와 충돌합니다 — 켤 예정이라면 지금 설계를 재검토해야 합니다.",
+    "DEPOSIT_HOLD_ENABLED를 켤 목표 시점과 PG사(토스페이먼츠/포트원 등) 선택. 카드 사전승인(hold)을 쓸지, 실제 결제 후 환불로 갈지에 따라 DepositHold의 상태 전이와 환불 리드타임이 달라집니다.",
+    "환불 큐를 MVP에서 운영자가 수기로 처리한다는 전제가 맞습니까? 맞다면 운영자용 환불 대기열 화면의 우선순위를 올려야 합니다.",
+    "BidHistory의 ipHash 보관 기간과 개인정보 처리방침 반영 여부 — 어뷰징 대응 목적의 보관 근거와 기간(예: 90일) 확정 필요."
+  ]
+}

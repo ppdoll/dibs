@@ -1,0 +1,23 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "pnpm install",
+  "buildCommand": "pnpm --filter @dibs/shared build && pnpm --filter @dibs/api db:generate && pnpm --filter @dibs/api build",
+  "functions": {
+    "api/index.ts": {
+      "memory": 1024,
+      "maxDuration": 60
+    }
+  },
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
+  "crons": [
+    { "path": "/api/cron/events/lifecycle", "schedule": "* * * * *" },
+    { "path": "/api/cron/events/stats-refresh", "schedule": "* * * * *" },
+    { "path": "/api/cron/expire-holds", "schedule": "* * * * *" },
+    { "path": "/api/cron/deposit-reminders", "schedule": "* * * * *" },
+    { "path": "/api/cron/finalize-rankings", "schedule": "* * * * *" },
+    { "path": "/api/cron/notifications/expand-broadcasts", "schedule": "* * * * *" },
+    { "path": "/api/cron/notifications/dispatch", "schedule": "* * * * *" },
+    { "path": "/api/cron/notifications/sweep-expired", "schedule": "17 * * * *" }
+  ]
+}

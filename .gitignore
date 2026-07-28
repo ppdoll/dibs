@@ -1,0 +1,45 @@
+# deps
+node_modules/
+.pnp
+.pnp.js
+
+# build
+dist/
+build/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+
+# env
+.env
+.env.*
+!.env.example
+
+# prisma
+prisma/*.db
+prisma/migrations/dev.db*
+
+# logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# os / editor
+.DS_Store
+Thumbs.db
+# .vscode 는 통째로 무시하지 않는다. 디버그 구성과 태스크는 "이 저장소를 어떻게 돌리는가"의
+# 일부라 사람마다 다시 만들 이유가 없다. 개인 설정 파일만 골라서 뺀다.
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/scripts/
+.idea/
+
+# vercel
+.vercel
+
+# testing
+coverage/

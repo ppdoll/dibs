@@ -1,0 +1,202 @@
+{
+  // Ctrl+Shift+P → "Tasks: Run Task" 로 실행한다.
+  // 처음이라면 "① 설치 + env 준비" → Postgres 마련 → "② DB 세팅" 순서로 돌린다.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "① 설치 + env 준비",
+      "detail": "pnpm install 과 apps/api/.env · apps/web/.env.local 생성. DB 는 건드리지 않는다.",
+      "dependsOrder": "sequence",
+      "dependsOn": ["설치 (pnpm install)", "env 파일 만들기", "DB 설치 방법 보기"],
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "② DB 세팅 (연결 확인 → 마이그레이션 → 시드)",
+      "detail": "Postgres 를 마련하고 apps/api/.env 를 맞춘 뒤에 돌린다. Docker 든 WSL 이든 Neon 이든 상관없다.",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "DB 연결 확인",
+        "DB 마이그레이션",
+        "시드 데이터 넣기"
+      ],
+      "problemMatcher": []
+    },
+
+    {
+      "label": "DB 설치 방법 보기",
+      "detail": "WSL / Neon / 윈도우 네이티브 세 가지 방법을 출력한다. 아무것도 실행하지 않는다.",
+      "type": "shell",
+      "command": "node",
+      "args": [".vscode/scripts/db-help.mjs"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "DB 연결 확인",
+      "detail": "DATABASE_URL 이 가리키는 DB 에 붙어 보고, pg_trgm·pgcrypto 가 없으면 설치한다.",
+      "type": "shell",
+      "command": "node",
+      "args": ["../../.vscode/scripts/db-check.mjs"],
+      "options": { "cwd": "${workspaceFolder}/apps/api" },
+      "problemMatcher": []
+    },
+
+    {
+      "label": "설치 (pnpm install)",
+      "type": "shell",
+      "command": "pnpm install",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "env 파일 만들기",
+      "detail": "루트 .env 는 아무도 안 읽는다. apps/api/.env 와 apps/web/.env.local 에 놓아야 한다.",
+      "type": "shell",
+      "command": "node",
+      "args": [".vscode/scripts/setup-env.mjs"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "[선택] Postgres 띄우기 (docker)",
+      "detail": "Docker 를 쓸 때만. WSL 배포판을 건드리므로 필수는 아니다 — WSL/Neon/네이티브 중 편한 걸 쓰면 된다. 포트는 5433.",
+      "type": "shell",
+      "command": "node",
+      "args": [".vscode/scripts/start-db.mjs"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Postgres 내리기",
+      "type": "shell",
+      "command": "docker compose down",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+
+    {
+      "label": "DB 마이그레이션",
+      "detail": "스키마 + 제약(CHECK·트리거·부분 유니크)을 함께 올린다. 별도 SQL 적용 단계는 없다.",
+      "type": "shell",
+      "command": "pnpm exec prisma migrate dev --name init",
+      "options": { "cwd": "${workspaceFolder}/apps/api" },
+      "problemMatcher": []
+    },
+    {
+      "label": "시드 데이터 넣기",
+      "type": "shell",
+      "command": "pnpm db:seed",
+      "options": { "cwd": "${workspaceFolder}/apps/api" },
+      "problemMatcher": []
+    },
+    {
+      "label": "DB 비우고 최소 계정만 넣기",
+      "detail": "데모 데이터를 전부 지우고 운영자·파트너·이용자 각 1개만 남긴다. 업종·지역·설정은 유지.",
+      "type": "shell",
+      "command": "pnpm db:seed:minimal",
+      "options": { "cwd": "${workspaceFolder}/apps/api" },
+      "problemMatcher": []
+    },
+    {
+      "label": "DB 초기화 후 다시 세팅",
+      "detail": "스키마째로 날리고 마이그레이션·제약·시드를 다시 태운다. 데이터가 전부 사라진다.",
+      "dependsOrder": "sequence",
+      "dependsOn": ["DB 리셋", "시드 데이터 넣기"],
+      "problemMatcher": []
+    },
+    {
+      "label": "DB 리셋",
+      "type": "shell",
+      "command": "pnpm exec prisma migrate reset --force --skip-seed",
+      "options": { "cwd": "${workspaceFolder}/apps/api" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Prisma Studio",
+      "type": "shell",
+      "command": "pnpm db:studio",
+      "options": { "cwd": "${workspaceFolder}/apps/api" },
+      "isBackground": true,
+      "problemMatcher": []
+    },
+
+    {
+      "label": "타입체크 (전체)",
+      "type": "shell",
+      "command": "pnpm typecheck",
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "test",
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "빌드 (전체)",
+      "type": "shell",
+      "command": "pnpm build",
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "build",
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "단위 테스트 (전체)",
+      "type": "shell",
+      "command": "pnpm test",
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "깨진 링크 검사",
+      "detail": "코드의 내부 링크가 실제 App Router 라우트와 맞는지 검사한다. 타입체크가 못 잡는 종류다.",
+      "type": "shell",
+      "command": "node",
+      "args": [".vscode/scripts/check-links.mjs"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "API 라우트 문서 갱신",
+      "detail": "컨트롤러에서 엔드포인트를 다시 추출해 docs/API-ROUTES.md 를 갱신한다.",
+      "type": "shell",
+      "command": "node",
+      "args": [".vscode/scripts/extract-routes.mjs"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+
+    {
+      "label": "크론 전부 한 번씩 때리기",
+      "detail": "서버리스라 로컬에선 크론이 안 돈다. 만료·순위확정·메일발송을 손으로 진행시킨다.",
+      "type": "shell",
+      "command": "node",
+      "args": [".vscode/scripts/run-crons.mjs"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "개발용 토큰 발급",
+      "detail": "구글 OAuth 없이 시드 계정으로 로그인한다. 이메일을 입력하면 토큰을 뽑아 준다.",
+      "type": "shell",
+      "command": "node",
+      "args": [".vscode/scripts/dev-token.mjs", "${input:seedEmail}"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ],
+
+  "inputs": [
+    {
+      "id": "seedEmail",
+      "type": "pickString",
+      "description": "어느 계정으로 로그인할까요? (시드가 만든 계정들)",
+      "options": [
+        { "label": "운영자(내 구글) — ppdolla@gmail.com", "value": "ppdolla@gmail.com" },
+        { "label": "운영자(시드) — admin@dibs.local", "value": "admin@dibs.local" },
+        { "label": "파트너 — partner@dibs.local", "value": "partner@dibs.local" },
+        { "label": "이용자 — user@dibs.local", "value": "user@dibs.local" }
+      ],
+      "default": "user@dibs.local"
+    }
+  ]
+}

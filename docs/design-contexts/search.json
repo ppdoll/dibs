@@ -1,0 +1,2054 @@
+{
+  "context": "Bounded Context: **Search & Discovery** (검색·탐색) of the Dibs (딥스) platform.\n\nRESPONSIBILITY (owns): the public read-side of the platform — home/discovery feed, keyword search over venues/partners and events, faceted filtering, sorting, keyset pagination, autocomplete/suggest, popular & recent keywords, saved searches (검색 알림), favorites/찜, and the *cheap, non-leaking* competition-ratio (경쟁률) surface used in list views.\n\nDOES NOT OWN (consumes as upstream, read-only): `Partner`, `Venue`, `Event`, `EventDepositConfig`, `Application`, `BidHistory`, `Notification`. Those live in the Partner/Venue, Event & Application, and Notification contexts. This context maintains **denormalized read models** (`EventSearchDoc`, `VenueSearchDoc`, `EventStatsCache`) that are projections of those, updated by domain events + a Vercel Cron reconciler. It never writes to source-of-truth tables.\n\nARCHITECTURAL STANCE (serverless, Vercel + Neon Postgres + Prisma):\n- No Elasticsearch/Meili in MVP. Everything is Postgres: `pg_trgm` GIN indexes for Korean substring/typo-tolerant matching, plus a `tsvector` column with the `simple` configuration for token/prefix matching, plus a chosung (초성) column for ㅅㄱㅊ-style search. Korean has no bundled Postgres stemmer, so `simple` + trigram is the correct MVP combination, not `korean` (does not exist) and not `english` (destroys Korean tokens).\n- The search read model lives in the **same Postgres database** as the write model. Projections are updated in the *same transaction* as the write when the write happens in-process (Prisma `$transaction`), otherwise repaired by cron. This gives read-your-write for the partner who just published, and eventual consistency (≤60s) for everything else.\n- Ratio/counters are **never** computed with `COUNT(*)` over `Application` in a list query. They are maintained as integer columns on `EventStatsCache` and read as a plain column.\n- Everything user-facing about competition is **a ratio and two counts**, never an amount. Amount data physically does not exist in any table this context reads for anonymous callers.\n- All timestamps are `DateTime @db.Timestamptz(3)` stored in UTC. Every \"오늘/이번 주말/마감임박\" bucket is computed with `AT TIME ZONE 'Asia/Seoul'`. KST has no DST, but the server is UTC on Vercel, so *no* boundary may be derived from server-local time.\n- Pagination is **keyset (cursor)** on every list. `OFFSET` is banned beyond page 1 because the underlying set mutates constantly (soft-close extends deadlines, ratios change every second).\n\nFEATURE FLAGS honored here: `DEPOSIT_HOLD_ENABLED` (changes which applicant count feeds the ratio), `SEARCH_SUGGEST_ENABLED`, `SAVED_SEARCH_ALERTS_ENABLED`.",
+  "summary": "Postgres-only search/discovery read side: two denormalized search documents (EventSearchDoc, VenueSearchDoc) plus an EventStatsCache counter row per event, indexed with pg_trgm GIN + a `simple`-config tsvector + a chosung column for Korean. Public unauthenticated browse of OPEN/SCHEDULED events with faceted filters (region, category, mode, amount range, deadline-soon, service date) and four keyset-paginated sorts (인기순 / 마감임박순 / 최신순 / 경쟁률순). Competition ratio is served as two integers (capacity, validApplicantCount) maintained by in-transaction counter increments and repaired by a 1-minute Vercel Cron reconciler that also performs lazy status transitions and deposit-hold expiry recount — never a COUNT(*) in a list query, and never any bid amount. Information-leak control is the spine of the design: no filter, sort, or facet may be a function of applicant bid amounts; small-N ratios are masked; and a per-event EventVisibilityPolicy projection leaves room to later expose cutoff amount / my rank without a schema change.",
+  "entities": [
+    {
+      "name": "EventSearchDoc",
+      "description": "Denormalized, query-optimized projection of one Event. THE table every event list/search query hits. One row per Event, PK shared with Event.id (1:1). Contains zero amount data about applicants — only the event's own configured min/max, which are public by design.",
+      "fields": [
+        {
+          "name": "eventId",
+          "type": "String @id @db.Uuid",
+          "notes": "= Event.id. Shared PK, no separate surrogate. FK to Event with onDelete: Cascade."
+        },
+        {
+          "name": "partnerId",
+          "type": "String @db.Uuid",
+          "notes": "Denormalized for partner-scoped listing and for hiding events of suspended partners."
+        },
+        {
+          "name": "venueId",
+          "type": "String @db.Uuid",
+          "notes": "Denormalized."
+        },
+        {
+          "name": "title",
+          "type": "String @db.VarChar(200)",
+          "notes": "Event title as displayed."
+        },
+        {
+          "name": "summary",
+          "type": "String? @db.VarChar(500)",
+          "notes": "Short blurb for cards. Plain text, HTML stripped at projection time."
+        },
+        {
+          "name": "venueName",
+          "type": "String @db.VarChar(120)",
+          "notes": "Denormalized so a venue-name search hits the event index directly with no join."
+        },
+        {
+          "name": "partnerDisplayName",
+          "type": "String @db.VarChar(120)",
+          "notes": "Denormalized."
+        },
+        {
+          "name": "thumbnailUrl",
+          "type": "String?",
+          "notes": "Vercel Blob URL. Projected from Event's first image; card renders next/image with this."
+        },
+        {
+          "name": "mode",
+          "type": "EventMode",
+          "notes": "INSTANT | BID. Shared enum, referenced by name from packages/shared."
+        },
+        {
+          "name": "status",
+          "type": "EventStatus",
+          "notes": "Projected lifecycle. Only SCHEDULED and OPEN are publicly listable by default; CLOSED/FINALIZED are reachable by direct URL and by the '지난 이벤트' toggle."
+        },
+        {
+          "name": "searchable",
+          "type": "Boolean @default(false)",
+          "notes": "Master gate. Computed = status in (SCHEDULED, OPEN, CLOSED) AND partnerStatus = APPROVED AND NOT event.isHidden AND NOT event.isDeleted AND venue.isPublished. Every public query has `WHERE searchable = true` as its first predicate; it is the leading column of the main composite indexes."
+        },
+        {
+          "name": "regionCode",
+          "type": "String @db.VarChar(10)",
+          "notes": "Leaf region (시군구 level), e.g. '11680' (강남구). FK to Region.code."
+        },
+        {
+          "name": "regionPath",
+          "type": "String[] @db.VarChar(10)",
+          "notes": "Ancestor chain ['11','11680'] so a 시도-level filter is a single `regionPath @> ARRAY['11']` GIN lookup instead of a recursive join."
+        },
+        {
+          "name": "categoryIds",
+          "type": "String[] @db.Uuid",
+          "notes": "Multi-category. GIN indexed; filter is `categoryIds && ARRAY[...]`."
+        },
+        {
+          "name": "minAmount",
+          "type": "Int",
+          "notes": "Event-configured minimum applicable amount (KRW). For INSTANT, minAmount == maxAmount == the fixed price. Range 0..2147483647 (Int). PUBLIC — this is event config, not anyone's bid."
+        },
+        {
+          "name": "maxAmount",
+          "type": "Int",
+          "notes": "Event-configured maximum. minAmount == maxAmount means fixed."
+        },
+        {
+          "name": "capacity",
+          "type": "Int",
+          "notes": "정원. Denormalized."
+        },
+        {
+          "name": "applicationStartAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "신청 시작. UTC."
+        },
+        {
+          "name": "applicationDeadlineAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "신청 마감. MUTABLE — soft close pushes this forward. Every write to it must bump `indexVersion` and re-emit for cache purge."
+        },
+        {
+          "name": "serviceDateAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": "Actual reservation/service datetime, when the event has one. Drives the '방문일' filter and the '오늘/주말' home rails."
+        },
+        {
+          "name": "softCloseEnabled",
+          "type": "Boolean @default(false)",
+          "notes": "Projected so the card can render a '마감 연장될 수 있어요' hint and so clients know the deadline is not authoritative for countdown pinning."
+        },
+        {
+          "name": "softCloseWindowMinutes",
+          "type": "Int?",
+          "notes": "N minutes. Null when disabled."
+        },
+        {
+          "name": "depositRequired",
+          "type": "Boolean @default(false)",
+          "notes": "Projected from EventDepositConfig for the '보증금 필요' badge/filter. Rendered only when DEPOSIT_HOLD_ENABLED."
+        },
+        {
+          "name": "depositType",
+          "type": "DepositType?",
+          "notes": "FIXED | PERCENTAGE. Shared enum."
+        },
+        {
+          "name": "depositValue",
+          "type": "Int?",
+          "notes": "KRW when FIXED, basis points (1..10000) when PERCENTAGE. Basis points, not float, to avoid rounding drift across contexts."
+        },
+        {
+          "name": "depositWindowMinutes",
+          "type": "Int?",
+          "notes": "Default 10."
+        },
+        {
+          "name": "visibilityPolicyId",
+          "type": "String @db.Uuid",
+          "notes": "FK to EventVisibilityPolicy. Governs what this context is allowed to emit for this event."
+        },
+        {
+          "name": "searchText",
+          "type": "String",
+          "notes": "Concatenated haystack: title + summary + venueName + partnerDisplayName + regionNameKo + categoryNamesKo + curated tags, normalized (NFC, lowercased, whitespace-collapsed, punctuation stripped). This is the pg_trgm target column."
+        },
+        {
+          "name": "searchVector",
+          "type": "Unsupported(\"tsvector\")",
+          "notes": "GENERATED ALWAYS AS (to_tsvector('simple', searchText)) STORED. Raw SQL migration; Prisma sees Unsupported. 'simple' config because Postgres ships no Korean dictionary — we want raw token + prefix matching, and pg_trgm covers the morphology gap."
+        },
+        {
+          "name": "searchChosung",
+          "type": "String",
+          "notes": "Chosung (초성) reduction of title+venueName, e.g. '강남 스시 오마카세' -> 'ㄱㄴ ㅅㅅ ㅇㅁㅋㅅ'. Computed in Node at projection time (deterministic jamo table), not in SQL. Enables 'ㅅㅅㅇㅁㅋㅅ' queries which Korean users expect."
+        },
+        {
+          "name": "popularityScore",
+          "type": "Double @default(0)",
+          "notes": "Time-decayed engagement score, recomputed by cron. See businessRules for the exact formula. Sort key for 인기순."
+        },
+        {
+          "name": "trendingScore",
+          "type": "Double @default(0)",
+          "notes": "Short-window velocity (applications in last 60m vs prior 60m). Drives the '지금 뜨는' home rail. Separate from popularityScore so a big-but-stale event does not squat the trending rail."
+        },
+        {
+          "name": "publishedAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "When the event first became publicly visible. Sort key for 최신순 — NOT createdAt, because a draft can sit for weeks."
+        },
+        {
+          "name": "indexVersion",
+          "type": "Int @default(0)",
+          "notes": "Monotonic. Bumped on every projection write. Used for optimistic reconciliation and for cursor staleness detection."
+        },
+        {
+          "name": "indexState",
+          "type": "IndexState @default(PENDING)",
+          "notes": "PENDING | INDEXED | STALE | REMOVED. See state machine."
+        },
+        {
+          "name": "sourceUpdatedAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "Event.updatedAt at projection time. Reconciler compares this against the source to find drift: `WHERE doc.sourceUpdatedAt < event.updatedAt`."
+        },
+        {
+          "name": "indexedAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "When this row was last written."
+        }
+      ],
+      "relations": [
+        "EventSearchDoc 1:1 Event (eventId, shared PK, onDelete Cascade)",
+        "EventSearchDoc 1:1 EventStatsCache (eventId)",
+        "EventSearchDoc N:1 VenueSearchDoc (venueId)",
+        "EventSearchDoc N:1 Region (regionCode)",
+        "EventSearchDoc N:M Category (via categoryIds Int[]/Uuid[] array + GIN; deliberately NOT a join table on the read side — join tables kill list-query latency)",
+        "EventSearchDoc N:1 EventVisibilityPolicy (visibilityPolicyId)"
+      ]
+    },
+    {
+      "name": "EventStatsCache",
+      "description": "Hot counter row per event. Deliberately a SEPARATE table from EventSearchDoc so that high-frequency counter UPDATEs (every application) do not bloat/vacuum-thrash the wide, GIN-indexed search document. Contains counts only — never sums, averages, maxima, or any function of bid amounts.",
+      "fields": [
+        {
+          "name": "eventId",
+          "type": "String @id @db.Uuid",
+          "notes": "Shared PK with Event/EventSearchDoc."
+        },
+        {
+          "name": "capacity",
+          "type": "Int",
+          "notes": "Duplicated here so the ratio can be served from one row with zero joins."
+        },
+        {
+          "name": "totalApplicantCount",
+          "type": "Int @default(0)",
+          "notes": "Every Application row ever created that is not CANCELED, including deposit-pending and expired. Internal/partner-facing."
+        },
+        {
+          "name": "validApplicantCount",
+          "type": "Int @default(0)",
+          "notes": "THE number shown to users as '신청 인원'. Definition depends on the flag: DEPOSIT_HOLD_ENABLED=false -> = totalApplicantCount; =true -> applications in (APPLIED_NO_DEPOSIT_REQUIRED, DEPOSIT_PAID) i.e. excludes DEPOSIT_PENDING and HOLD_EXPIRED. Maintained by +1/-1 in the same transaction as the Application write."
+        },
+        {
+          "name": "pendingDepositCount",
+          "type": "Int @default(0)",
+          "notes": "Applications currently inside their deposit window. Needed so the reconciler can bound how wrong validApplicantCount can be, and so the partner sees '입금 대기 N명'. NOT exposed publicly (it is a weak signal about churn)."
+        },
+        {
+          "name": "expiredCount",
+          "type": "Int @default(0)",
+          "notes": "HOLD_EXPIRED count. Partner/admin only."
+        },
+        {
+          "name": "claimedCount",
+          "type": "Int @default(0)",
+          "notes": "INSTANT only. Mirror of Event.claimedCount (the atomically-incremented column). Used to render '잔여 N석' and the 마감 badge. For BID this is always 0 and must never be rendered."
+        },
+        {
+          "name": "competitionRatio",
+          "type": "Decimal @db.Decimal(8,2) @default(0)",
+          "notes": "= validApplicantCount / NULLIF(capacity,0), rounded to 2dp, materialized so it can be a sort key with a btree index. Recomputed in the same statement that changes validApplicantCount. Redundant-but-materialized on purpose: sorting by a computed expression cannot use an index."
+        },
+        {
+          "name": "viewCount24h",
+          "type": "Int @default(0)",
+          "notes": "Rolling 24h view count, decayed by cron. Feeds popularityScore. Incremented via a sampled, batched path (see rules) — never a synchronous UPDATE per pageview."
+        },
+        {
+          "name": "favoriteCount",
+          "type": "Int @default(0)",
+          "notes": "찜 count. Public (harmless, no amount signal)."
+        },
+        {
+          "name": "applicationsLast60m",
+          "type": "Int @default(0)",
+          "notes": "Velocity numerator for trendingScore."
+        },
+        {
+          "name": "applicationsPrev60m",
+          "type": "Int @default(0)",
+          "notes": "Velocity denominator. Rotated hourly by cron."
+        },
+        {
+          "name": "ratioDisplayState",
+          "type": "RatioDisplayState @default(VISIBLE)",
+          "notes": "VISIBLE | MASKED_LOW_N | HIDDEN. MASKED_LOW_N when validApplicantCount < smallCountThreshold (default 3) — with 1 applicant plus a public applicant-list-free UI you can still de-anonymize by timing; masking to '신청 시작' avoids it. HIDDEN when the visibility policy says so."
+        },
+        {
+          "name": "lastReconciledAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "Set by the cron reconciler after a true COUNT(*) recount."
+        },
+        {
+          "name": "counterEpoch",
+          "type": "Int @default(0)",
+          "notes": "Bumped when the reconciler corrects a drift, so dashboards can alarm on drift frequency."
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt @db.Timestamptz(3)",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "EventStatsCache 1:1 EventSearchDoc (eventId)",
+        "EventStatsCache 1:1 Event (eventId, upstream source of truth)"
+      ]
+    },
+    {
+      "name": "VenueSearchDoc",
+      "description": "Denormalized projection of a Venue + its owning Partner, for the '가게/파트너 찾기' tab and for autocomplete. One row per Venue.",
+      "fields": [
+        {
+          "name": "venueId",
+          "type": "String @id @db.Uuid",
+          "notes": "Shared PK with Venue."
+        },
+        {
+          "name": "partnerId",
+          "type": "String @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "name",
+          "type": "String @db.VarChar(120)",
+          "notes": "업체명."
+        },
+        {
+          "name": "branchName",
+          "type": "String? @db.VarChar(60)",
+          "notes": "'강남점'. Kept separate so '스시오마카세 강남' matches by concatenation but the card can render the branch as a chip."
+        },
+        {
+          "name": "description",
+          "type": "String? @db.VarChar(2000)",
+          "notes": "Plain text."
+        },
+        {
+          "name": "thumbnailUrl",
+          "type": "String?",
+          "notes": ""
+        },
+        {
+          "name": "regionCode",
+          "type": "String @db.VarChar(10)",
+          "notes": ""
+        },
+        {
+          "name": "regionPath",
+          "type": "String[] @db.VarChar(10)",
+          "notes": ""
+        },
+        {
+          "name": "roadAddress",
+          "type": "String @db.VarChar(200)",
+          "notes": "도로명주소. Included in searchText — Koreans search by address fragments ('청담동')."
+        },
+        {
+          "name": "jibunAddress",
+          "type": "String? @db.VarChar(200)",
+          "notes": "지번주소. Also in searchText; '청담동' is a legal 지번 token that the 도로명 address often lacks."
+        },
+        {
+          "name": "latitude",
+          "type": "Decimal? @db.Decimal(10,7)",
+          "notes": "For a future '내 주변' sort. NOT in MVP query surface, but stored so the PostGIS/earthdistance migration is additive."
+        },
+        {
+          "name": "longitude",
+          "type": "Decimal? @db.Decimal(10,7)",
+          "notes": ""
+        },
+        {
+          "name": "categoryIds",
+          "type": "String[] @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "searchable",
+          "type": "Boolean @default(false)",
+          "notes": "= partner.status = APPROVED AND venue.isPublished AND NOT venue.isDeleted AND NOT partner.isSuspended."
+        },
+        {
+          "name": "openEventCount",
+          "type": "Int @default(0)",
+          "notes": "Number of currently-OPEN events. Lets the venue card say '진행중인 이벤트 3개' and lets us sort venues by activity. Maintained by the same reconciler pass."
+        },
+        {
+          "name": "upcomingEventCount",
+          "type": "Int @default(0)",
+          "notes": "SCHEDULED events."
+        },
+        {
+          "name": "searchText",
+          "type": "String",
+          "notes": "name + branchName + description + roadAddress + jibunAddress + categoryNamesKo + regionNameKo, normalized."
+        },
+        {
+          "name": "searchVector",
+          "type": "Unsupported(\"tsvector\")",
+          "notes": "GENERATED ... to_tsvector('simple', searchText) STORED."
+        },
+        {
+          "name": "searchChosung",
+          "type": "String",
+          "notes": "Chosung of name + branchName."
+        },
+        {
+          "name": "popularityScore",
+          "type": "Double @default(0)",
+          "notes": "Derived from child events' aggregate engagement + favoriteCount."
+        },
+        {
+          "name": "favoriteCount",
+          "type": "Int @default(0)",
+          "notes": ""
+        },
+        {
+          "name": "indexState",
+          "type": "IndexState @default(PENDING)",
+          "notes": ""
+        },
+        {
+          "name": "sourceUpdatedAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": ""
+        },
+        {
+          "name": "indexedAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "VenueSearchDoc 1:1 Venue",
+        "VenueSearchDoc 1:N EventSearchDoc (venueId)",
+        "VenueSearchDoc N:1 Region (regionCode)"
+      ]
+    },
+    {
+      "name": "EventVisibilityPolicy",
+      "description": "Per-event switchboard for competition transparency. Exists NOW with all loosening toggles present and defaulted to the sealed-bid behavior, so that later product loosening is a data change, not a migration + code change. Owned jointly with the Event context; Search & Discovery is a strict CONSUMER that must obey it on every response projection.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(uuid()) @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "eventId",
+          "type": "String @unique @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "showCompetitionRatio",
+          "type": "Boolean @default(true)",
+          "notes": "The one thing on by default. '정원 10명 / 신청 47명 (4.7:1)'."
+        },
+        {
+          "name": "showApplicantCount",
+          "type": "Boolean @default(true)",
+          "notes": "If false, only the ratio string is shown, no raw counts. (Ratio+capacity trivially yields the count, so turning this off alone is cosmetic — the API enforces: showApplicantCount=false AND showCompetitionRatio=true is allowed but both numbers are rounded to a bucket.)"
+        },
+        {
+          "name": "showCutoffAmount",
+          "type": "Boolean @default(false)",
+          "notes": "FUTURE. When true, BID events may expose the current Nth-ranked amount. MVP: the API layer hard-refuses to emit this while SEARCH_ALLOW_CUTOFF_DISCLOSURE is off, even if the row says true — belt and suspenders against a bad admin edit."
+        },
+        {
+          "name": "showMyRank",
+          "type": "Boolean @default(false)",
+          "notes": "FUTURE. Would be served by the Application context, not here; this context only surfaces the flag so the card can render '내 순위 보기' affordance."
+        },
+        {
+          "name": "showAmountDistribution",
+          "type": "Boolean @default(false)",
+          "notes": "FUTURE. Histogram of bids. Never emitted in MVP."
+        },
+        {
+          "name": "smallCountThreshold",
+          "type": "Int @default(3)",
+          "notes": "Below this validApplicantCount, the ratio is masked to '신청 받는 중' instead of a number."
+        },
+        {
+          "name": "ratioRoundingBucket",
+          "type": "Int @default(1)",
+          "notes": "1 = exact count. >1 rounds the displayed applicant count down to a multiple (e.g. 10 -> '40명+'). Escape hatch if exact counts prove to leak or to be gamed."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now()) @db.Timestamptz(3)",
+          "notes": ""
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt @db.Timestamptz(3)",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "EventVisibilityPolicy 1:1 Event",
+        "EventVisibilityPolicy 1:N EventSearchDoc (logically 1:1)"
+      ]
+    },
+    {
+      "name": "Region",
+      "description": "Closed vocabulary of Korean administrative regions, seeded from 행정안전부 법정동/행정동 codes. Owned by this context (it is a discovery taxonomy). Two levels in MVP: 시도 (level 1) and 시군구 (level 2).",
+      "fields": [
+        {
+          "name": "code",
+          "type": "String @id @db.VarChar(10)",
+          "notes": "행정구역코드 prefix. '11' = 서울특별시, '11680' = 강남구. Stable, government-issued — do not invent UUIDs for regions."
+        },
+        {
+          "name": "parentCode",
+          "type": "String? @db.VarChar(10)",
+          "notes": "Null for level 1."
+        },
+        {
+          "name": "level",
+          "type": "RegionLevel",
+          "notes": "SIDO | SIGUNGU."
+        },
+        {
+          "name": "nameKo",
+          "type": "String @db.VarChar(40)",
+          "notes": "'강남구'."
+        },
+        {
+          "name": "shortNameKo",
+          "type": "String @db.VarChar(20)",
+          "notes": "'강남'. Users type the short form; both go into searchText and into the region autocomplete."
+        },
+        {
+          "name": "aliases",
+          "type": "String[]",
+          "notes": "['강남','강남구','서울 강남','GangNam']. Hand-curated. Solves '판교' (not an administrative region — alias onto 성남시 분당구) and '홍대' (alias onto 마포구)."
+        },
+        {
+          "name": "displayOrder",
+          "type": "Int @default(0)",
+          "notes": "So 서울/경기 float to the top of the filter sheet rather than being alphabetical."
+        },
+        {
+          "name": "isActive",
+          "type": "Boolean @default(true)",
+          "notes": ""
+        },
+        {
+          "name": "eventCount",
+          "type": "Int @default(0)",
+          "notes": "Cached count of searchable OPEN events, so the filter sheet can render '강남구 (23)' without a facet query per open."
+        }
+      ],
+      "relations": [
+        "Region 1:N Region (self, parentCode)",
+        "Region 1:N EventSearchDoc",
+        "Region 1:N VenueSearchDoc"
+      ]
+    },
+    {
+      "name": "Category",
+      "description": "Curated category taxonomy (다이닝, 오마카세, 파인다이닝, 팝업, 클래스, 공연 …). Admin-managed closed vocabulary — free-form tags are a separate, non-filterable concept.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(uuid()) @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "parentId",
+          "type": "String? @db.Uuid",
+          "notes": "Two levels max."
+        },
+        {
+          "name": "slug",
+          "type": "String @unique @db.VarChar(40)",
+          "notes": "'omakase'. Used in URLs: /events?category=omakase — human-readable, SEO-friendly, and stable across renames."
+        },
+        {
+          "name": "nameKo",
+          "type": "String @db.VarChar(40)",
+          "notes": "'오마카세'."
+        },
+        {
+          "name": "aliases",
+          "type": "String[]",
+          "notes": "['오마카세','오마','omakase','스시야']. Feeds the synonym expansion in suggest."
+        },
+        {
+          "name": "iconKey",
+          "type": "String?",
+          "notes": "Key into a client-side icon map (catchtable-style icon rail on home)."
+        },
+        {
+          "name": "displayOrder",
+          "type": "Int @default(0)",
+          "notes": ""
+        },
+        {
+          "name": "isActive",
+          "type": "Boolean @default(true)",
+          "notes": "Deactivating hides it from filters but does not orphan existing docs."
+        },
+        {
+          "name": "eventCount",
+          "type": "Int @default(0)",
+          "notes": "Cached, cron-maintained."
+        }
+      ],
+      "relations": [
+        "Category 1:N Category (self)",
+        "Category N:M EventSearchDoc (denormalized array on the doc)",
+        "Category N:M VenueSearchDoc (denormalized array)"
+      ]
+    },
+    {
+      "name": "SearchSynonym",
+      "description": "Admin-editable query rewrite table. Applied at query time (expand the user's term into an OR group) — NOT at index time, so editing a synonym takes effect immediately with no reindex.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(uuid()) @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "term",
+          "type": "String @db.VarChar(60)",
+          "notes": "Normalized lookup key, e.g. '오마'."
+        },
+        {
+          "name": "expansions",
+          "type": "String[]",
+          "notes": "['오마카세','스시오마카세']."
+        },
+        {
+          "name": "type",
+          "type": "SynonymType",
+          "notes": "SYNONYM (bidirectional) | TYPO (unidirectional correction) | STOPWORD (drop the token)."
+        },
+        {
+          "name": "isActive",
+          "type": "Boolean @default(true)",
+          "notes": ""
+        },
+        {
+          "name": "createdByAdminId",
+          "type": "String? @db.Uuid",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "Standalone; loaded into an in-memory LRU per lambda instance with a 60s TTL (the table is tiny, <5k rows)."
+      ]
+    },
+    {
+      "name": "SearchQueryLog",
+      "description": "Append-only log of executed searches. Powers popular keywords, zero-result analysis, and abuse detection. Written asynchronously (fire-and-forget insert after the response is composed) so it never adds latency to the search path.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(uuid()) @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "normalizedQuery",
+          "type": "String @db.VarChar(120)",
+          "notes": "Post-normalization. Empty string for pure-filter browses (still logged — filter popularity matters)."
+        },
+        {
+          "name": "rawQueryHash",
+          "type": "String @db.VarChar(64)",
+          "notes": "sha256 of the raw query. Lets us dedupe/rate-limit without storing raw PII-ish strings forever."
+        },
+        {
+          "name": "userId",
+          "type": "String? @db.Uuid",
+          "notes": "Null for anonymous."
+        },
+        {
+          "name": "anonymousId",
+          "type": "String? @db.Uuid",
+          "notes": "First-party cookie id. Never an IP address in the row (IP is used transiently for rate limiting only)."
+        },
+        {
+          "name": "entityType",
+          "type": "SearchEntityType",
+          "notes": "EVENT | VENUE | ALL."
+        },
+        {
+          "name": "filtersJson",
+          "type": "Json",
+          "notes": "The normalized filter object, so we can mine 'which filter combos return nothing'."
+        },
+        {
+          "name": "sort",
+          "type": "EventSortKey?",
+          "notes": ""
+        },
+        {
+          "name": "resultCount",
+          "type": "Int",
+          "notes": "0 => zero-result query, the highest-value analytics signal."
+        },
+        {
+          "name": "clickedEventId",
+          "type": "String? @db.Uuid",
+          "notes": "Backfilled by a separate /search/click beacon; enables CTR-based ranking later."
+        },
+        {
+          "name": "latencyMs",
+          "type": "Int",
+          "notes": ""
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now()) @db.Timestamptz(3)",
+          "notes": "Partition/retention key. Rows older than 90 days are dropped by cron."
+        }
+      ],
+      "relations": [
+        "SearchQueryLog N:1 User (optional)"
+      ]
+    },
+    {
+      "name": "PopularKeyword",
+      "description": "Materialized top-N keyword ranking, recomputed every 10 minutes by cron. Read path is a single indexed scan of ~20 rows — never an aggregate over SearchQueryLog at request time.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(uuid()) @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "keyword",
+          "type": "String @db.VarChar(60)",
+          "notes": ""
+        },
+        {
+          "name": "scope",
+          "type": "String @db.VarChar(40) @default(\"GLOBAL\")",
+          "notes": "'GLOBAL' or a regionCode, so 부산 users can get 부산 trending terms later."
+        },
+        {
+          "name": "rank",
+          "type": "Int",
+          "notes": "1..20."
+        },
+        {
+          "name": "previousRank",
+          "type": "Int?",
+          "notes": "For the ▲▼- delta arrows catchtable shows."
+        },
+        {
+          "name": "searchCount",
+          "type": "Int",
+          "notes": "Distinct-actor count in the window, not raw hits (raw hits are trivially inflatable)."
+        },
+        {
+          "name": "snapshotAt",
+          "type": "DateTime @db.Timestamptz(3)",
+          "notes": "All rows of one snapshot share this. Read query: WHERE snapshotAt = (SELECT max(snapshotAt) ...) — or better, a `isCurrent Boolean` flipped transactionally."
+        },
+        {
+          "name": "isCurrent",
+          "type": "Boolean @default(false)",
+          "notes": "Exactly one snapshot has true. Swapped inside a transaction so readers never see a half-written ranking."
+        },
+        {
+          "name": "isBlocked",
+          "type": "Boolean @default(false)",
+          "notes": "Admin kill switch for a keyword that trended for the wrong reasons."
+        }
+      ],
+      "relations": [
+        "Standalone. Unique index on (scope, snapshotAt, rank)."
+      ]
+    },
+    {
+      "name": "UserRecentSearch",
+      "description": "Per-user recent keywords (최근 검색어), max 10, LRU. Stored server-side (not only localStorage) because catchtable-style apps sync across devices, and because anonymous->login migration needs a home.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(uuid()) @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "userId",
+          "type": "String @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "keyword",
+          "type": "String @db.VarChar(120)",
+          "notes": ""
+        },
+        {
+          "name": "entityType",
+          "type": "SearchEntityType @default(ALL)",
+          "notes": ""
+        },
+        {
+          "name": "searchedAt",
+          "type": "DateTime @default(now()) @db.Timestamptz(3)",
+          "notes": "Upserted on repeat (unique on userId+keyword+entityType), so repeats move to the top rather than duplicating."
+        }
+      ],
+      "relations": [
+        "UserRecentSearch N:1 User (onDelete Cascade)",
+        "@@unique([userId, keyword, entityType])"
+      ]
+    },
+    {
+      "name": "SavedSearch",
+      "description": "'이런 이벤트 열리면 알려주세요' — a stored filter set that triggers a 쪽지/email when a newly-published event matches. Owned here (it is a search artifact); delivery is delegated to the Notification context via a domain event. Behind SAVED_SEARCH_ALERTS_ENABLED.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(uuid()) @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "userId",
+          "type": "String @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "label",
+          "type": "String @db.VarChar(60)",
+          "notes": "User-supplied or auto-generated ('강남 · 오마카세 · 10만원 이하')."
+        },
+        {
+          "name": "keyword",
+          "type": "String? @db.VarChar(120)",
+          "notes": ""
+        },
+        {
+          "name": "filtersJson",
+          "type": "Json",
+          "notes": "Same normalized filter shape as the search endpoint, validated by the shared zod schema on write. Storing the validated DTO (not raw query string) means a filter-schema change breaks loudly at read time instead of silently matching nothing."
+        },
+        {
+          "name": "filtersHash",
+          "type": "String @db.VarChar(64)",
+          "notes": "sha256 of the canonicalized filter object. Unique per user — prevents 40 identical saved searches and lets the matcher group users by hash and evaluate each distinct filter ONCE per new event."
+        },
+        {
+          "name": "notifyInApp",
+          "type": "Boolean @default(true)",
+          "notes": ""
+        },
+        {
+          "name": "notifyEmail",
+          "type": "Boolean @default(false)",
+          "notes": ""
+        },
+        {
+          "name": "isActive",
+          "type": "Boolean @default(true)",
+          "notes": ""
+        },
+        {
+          "name": "maxAlertsPerDay",
+          "type": "Int @default(5)",
+          "notes": "Hard cap so a broad saved search ('전체') cannot turn into a firehose."
+        },
+        {
+          "name": "alertsSentToday",
+          "type": "Int @default(0)",
+          "notes": "Reset by the daily KST-midnight cron."
+        },
+        {
+          "name": "lastMatchedEventId",
+          "type": "String? @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "lastNotifiedAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": ""
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now()) @db.Timestamptz(3)",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "SavedSearch N:1 User (onDelete Cascade)",
+        "@@unique([userId, filtersHash])"
+      ]
+    },
+    {
+      "name": "Favorite",
+      "description": "찜 (bookmark). Polymorphic over event/venue. Lives here because the '찜한 이벤트' rail is a discovery surface and favoriteCount feeds ranking.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(uuid()) @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "userId",
+          "type": "String @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "targetType",
+          "type": "FavoriteTargetType",
+          "notes": "EVENT | VENUE."
+        },
+        {
+          "name": "targetId",
+          "type": "String @db.Uuid",
+          "notes": "No FK (polymorphic); integrity enforced by the service + a cleanup cron."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now()) @db.Timestamptz(3)",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "Favorite N:1 User (onDelete Cascade)",
+        "@@unique([userId, targetType, targetId]) — makes double-tap idempotent at the DB level",
+        "@@index([targetType, targetId]) for count maintenance"
+      ]
+    },
+    {
+      "name": "HomeSection",
+      "description": "Admin-curated home feed layout (catchtable-style stacked rails). The home feed is CONFIGURATION, not hardcoded — the ops team retunes it weekly without a deploy.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(uuid()) @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "key",
+          "type": "String @unique @db.VarChar(40)",
+          "notes": "'deadline_soon', 'trending_now', 'new_this_week', 'editor_pick_0731'."
+        },
+        {
+          "name": "titleKo",
+          "type": "String @db.VarChar(60)",
+          "notes": "'마감 임박! 지금 신청하세요'."
+        },
+        {
+          "name": "subtitleKo",
+          "type": "String? @db.VarChar(120)",
+          "notes": ""
+        },
+        {
+          "name": "type",
+          "type": "HomeSectionType",
+          "notes": "AUTO_QUERY | MANUAL_PICK | BANNER | CATEGORY_RAIL | REGION_RAIL."
+        },
+        {
+          "name": "queryJson",
+          "type": "Json?",
+          "notes": "For AUTO_QUERY: the same normalized filter+sort DTO the public search endpoint accepts. Home rails are literally saved searches — one code path, one set of leak rules, no second query builder to keep in sync."
+        },
+        {
+          "name": "layout",
+          "type": "HomeSectionLayout @default(CAROUSEL)",
+          "notes": "CAROUSEL | GRID | LARGE_CARD | BANNER_STRIP."
+        },
+        {
+          "name": "itemLimit",
+          "type": "Int @default(10)",
+          "notes": ""
+        },
+        {
+          "name": "displayOrder",
+          "type": "Int",
+          "notes": ""
+        },
+        {
+          "name": "isActive",
+          "type": "Boolean @default(true)",
+          "notes": ""
+        },
+        {
+          "name": "startAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": "Scheduled activation (e.g. a 크리스마스 rail)."
+        },
+        {
+          "name": "endAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": ""
+        },
+        {
+          "name": "targetAudience",
+          "type": "HomeAudience @default(ALL)",
+          "notes": "ALL | ANONYMOUS | LOGGED_IN. Lets '찜한 가게의 새 이벤트' render only for authed users without a client-side hole in the layout."
+        },
+        {
+          "name": "cacheTtlSeconds",
+          "type": "Int @default(60)",
+          "notes": "Per-section CDN/ISR TTL. Deadline-soon needs 30s; editor picks can be 600s."
+        }
+      ],
+      "relations": [
+        "HomeSection 1:N HomeSectionItem"
+      ]
+    },
+    {
+      "name": "HomeSectionItem",
+      "description": "Manual pin for MANUAL_PICK / BANNER sections.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(uuid()) @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "sectionId",
+          "type": "String @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "targetType",
+          "type": "FavoriteTargetType",
+          "notes": "EVENT | VENUE. Reuses the enum."
+        },
+        {
+          "name": "targetId",
+          "type": "String? @db.Uuid",
+          "notes": "Null for pure BANNER items."
+        },
+        {
+          "name": "imageUrl",
+          "type": "String?",
+          "notes": "Vercel Blob. Overrides the doc thumbnail for hero placements."
+        },
+        {
+          "name": "linkUrl",
+          "type": "String?",
+          "notes": "For BANNER. Must be same-origin or an allowlisted host — validated on write, never rendered as an open redirect."
+        },
+        {
+          "name": "displayOrder",
+          "type": "Int",
+          "notes": ""
+        },
+        {
+          "name": "isActive",
+          "type": "Boolean @default(true)",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "HomeSectionItem N:1 HomeSection (onDelete Cascade)"
+      ]
+    },
+    {
+      "name": "SearchIndexOutbox",
+      "description": "Transactional outbox for reprojection. The write context inserts a row in the SAME transaction as its Event/Venue mutation; a cron worker drains it. This is what makes 'the projection is never silently stale' true without distributed transactions or a message broker on serverless.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "BigInt @id @default(autoincrement())",
+          "notes": "Sequence, not UUID — drain order matters and bigserial is the cheapest monotonic key."
+        },
+        {
+          "name": "entityType",
+          "type": "SearchEntityType",
+          "notes": "EVENT | VENUE."
+        },
+        {
+          "name": "entityId",
+          "type": "String @db.Uuid",
+          "notes": ""
+        },
+        {
+          "name": "reason",
+          "type": "String @db.VarChar(40)",
+          "notes": "'created' | 'updated' | 'status_changed' | 'deadline_extended' | 'partner_suspended' | 'counter_drift'."
+        },
+        {
+          "name": "attempts",
+          "type": "Int @default(0)",
+          "notes": ""
+        },
+        {
+          "name": "processedAt",
+          "type": "DateTime? @db.Timestamptz(3)",
+          "notes": "Null = pending. Partial index WHERE processedAt IS NULL keeps the drain query O(pending)."
+        },
+        {
+          "name": "lastError",
+          "type": "String?",
+          "notes": ""
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now()) @db.Timestamptz(3)",
+          "notes": ""
+        }
+      ],
+      "relations": [
+        "Standalone. @@index([processedAt, id]) partial on processedAt IS NULL. Deduped on drain by (entityType, entityId) — the last write wins, so 50 queued updates cost one reprojection."
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "name": "EventMode",
+      "values": [
+        "INSTANT",
+        "BID"
+      ]
+    },
+    {
+      "name": "EventStatus",
+      "values": [
+        "DRAFT",
+        "PENDING_APPROVAL",
+        "SCHEDULED",
+        "OPEN",
+        "CLOSED",
+        "FINALIZED",
+        "CANCELED"
+      ]
+    },
+    {
+      "name": "DepositType",
+      "values": [
+        "FIXED",
+        "PERCENTAGE"
+      ]
+    },
+    {
+      "name": "EventSortKey",
+      "values": [
+        "POPULAR",
+        "DEADLINE_SOON",
+        "NEWEST",
+        "COMPETITION_RATIO_DESC",
+        "COMPETITION_RATIO_ASC",
+        "AMOUNT_ASC",
+        "AMOUNT_DESC",
+        "SERVICE_DATE_ASC"
+      ]
+    },
+    {
+      "name": "VenueSortKey",
+      "values": [
+        "POPULAR",
+        "NEWEST",
+        "OPEN_EVENT_COUNT_DESC",
+        "NAME_ASC"
+      ]
+    },
+    {
+      "name": "SearchEntityType",
+      "values": [
+        "EVENT",
+        "VENUE",
+        "ALL"
+      ]
+    },
+    {
+      "name": "RegionLevel",
+      "values": [
+        "SIDO",
+        "SIGUNGU"
+      ]
+    },
+    {
+      "name": "IndexState",
+      "values": [
+        "PENDING",
+        "INDEXED",
+        "STALE",
+        "REMOVED"
+      ]
+    },
+    {
+      "name": "RatioDisplayState",
+      "values": [
+        "VISIBLE",
+        "MASKED_LOW_N",
+        "HIDDEN"
+      ]
+    },
+    {
+      "name": "HomeSectionType",
+      "values": [
+        "AUTO_QUERY",
+        "MANUAL_PICK",
+        "BANNER",
+        "CATEGORY_RAIL",
+        "REGION_RAIL"
+      ]
+    },
+    {
+      "name": "HomeSectionLayout",
+      "values": [
+        "CAROUSEL",
+        "GRID",
+        "LARGE_CARD",
+        "BANNER_STRIP"
+      ]
+    },
+    {
+      "name": "HomeAudience",
+      "values": [
+        "ALL",
+        "ANONYMOUS",
+        "LOGGED_IN"
+      ]
+    },
+    {
+      "name": "FavoriteTargetType",
+      "values": [
+        "EVENT",
+        "VENUE"
+      ]
+    },
+    {
+      "name": "SynonymType",
+      "values": [
+        "SYNONYM",
+        "TYPO",
+        "STOPWORD"
+      ]
+    },
+    {
+      "name": "DeadlineBucket",
+      "values": [
+        "WITHIN_1H",
+        "WITHIN_6H",
+        "TODAY_KST",
+        "WITHIN_3D",
+        "WITHIN_7D"
+      ]
+    },
+    {
+      "name": "UserRole",
+      "values": [
+        "ADMIN",
+        "PARTNER",
+        "USER"
+      ]
+    }
+  ],
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/home",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Home feed. Returns active HomeSections ordered by displayOrder, each hydrated with up to itemLimit event/venue cards. AUTO_QUERY sections execute the shared search pipeline. Anonymous callers get targetAudience in (ALL, ANONYMOUS); authed get (ALL, LOGGED_IN) plus personalized rails ('찜한 가게의 새 이벤트'). Response carries per-section cacheTtlSeconds; Next.js route uses `revalidate` = min(TTL) with `Cache-Control: public, s-maxage=30, stale-while-revalidate=120` for the anonymous variant and `private, no-store` for the personalized variant (never let a CDN cache a personalized feed)."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/events",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "THE event search/browse endpoint. Query params (all validated by a shared zod schema in packages/shared): q, regionCodes[], categorySlugs[], mode (INSTANT|BID), amountMin, amountMax, deadlineBucket, serviceDateFrom, serviceDateTo, depositRequired, includeClosed (default false), sort (EventSortKey, default POPULAR), cursor, limit (default 20, max 50). Returns EventCard[] + nextCursor + totalHint. Amount filters apply ONLY to the event's configured minAmount/maxAmount, never to any applicant's bid. Anonymous access is fully allowed and is the default browse experience; auth only adds isFavorited/hasApplied flags."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/events/count",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Cheap count-only variant for the '조건에 맞는 이벤트 N개' button in the filter bottom-sheet. Executes the same predicate with a capped `COUNT(*)` over a LIMIT 1000 subquery and returns {count, isCapped}. Separated from the list endpoint so the list never pays for an exact count."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/events/facets",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Facet counts for the current filter context (per region, per category, per mode). Computed with a single grouped query over the filtered set, capped and cached 60s. Optional — the client renders the filter sheet without counts if this 404s/times out."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/events/:eventId",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Public event detail read model (the discovery-side projection: title, images, venue, region, category, period, capacity, configured amount range, deposit config, softClose hint, ratio block). Reachable even when searchable=false due to status=CLOSED (deep links from 쪽지 must not 404), but 404s for DRAFT/CANCELED/hidden/suspended-partner events to non-owners. Returns 200 with a `viewerContext` block only for authed callers. The authoritative apply-eligibility check lives in the Application context; this endpoint's flags are advisory and must be re-validated on apply."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/events/:eventId/ratio",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Single-event live ratio poll. Returns {capacity, applicantCount|null, ratio|null, displayState, remainingSlots|null, deadlineAt, isDeadlineExtended, serverTimeAt}. remainingSlots is non-null ONLY for INSTANT. serverTimeAt is mandatory so the client countdown is driven by server clock skew correction, not by the device clock. Cache-Control: public, s-maxage=5."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/events/:eventId/ratio/stream",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "SSE stream of the same payload, emitted at most every 3s and only on change (plus a 25s keepalive comment to survive proxy idle timeouts). Hard 5-minute connection cap with a `retry: 3000` hint so the client reconnects — required because Vercel serverless functions have a max duration. Falls back to polling /ratio when EventSource is unavailable or when the event has >N concurrent listeners (client reads a `pollAfterMs` hint)."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/discovery/events/ratio/batch",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Body: {eventIds: string[]} (max 50). Returns the ratio block for each. Used by list views to refresh visible cards with ONE request instead of N — critical because a home feed shows ~40 cards. POST (not GET) purely to avoid 2KB URLs; explicitly marked idempotent and safe, no CSRF token required, no side effects."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/venues",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Venue/partner search. Params: q, regionCodes[], categorySlugs[], hasOpenEvents (bool), sort (VenueSortKey), cursor, limit. Returns VenueCard[] with openEventCount and up to 3 preview event chips."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/venues/:venueId",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Venue detail read model + its searchable events (paginated sub-list, default sort DEADLINE_SOON with OPEN before SCHEDULED before CLOSED)."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/suggest",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Autocomplete. Params: q (min 1 char), limit (default 10). Returns a mixed, typed list: {type: 'KEYWORD'|'VENUE'|'EVENT'|'CATEGORY'|'REGION', label, highlightRanges, targetSlugOrId}. Implementation: one query per source with tight LIMITs, run in parallel via Promise.all, merged by a fixed type quota (2 category/region, 4 venue, 3 event, 1 keyword) — quota-merge, not score-merge, so the list composition is stable while the user types. Debounced 200ms client-side. Rate limited to 20 req/10s per IP."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/keywords/popular",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Current PopularKeyword snapshot (isCurrent=true), max 20, with rank deltas and snapshotAt. Cache-Control: public, s-maxage=300."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/keywords/recent",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "The caller's UserRecentSearch, max 10, newest first."
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/discovery/keywords/recent/:id",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Delete one recent keyword. Ownership enforced."
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/discovery/keywords/recent",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Clear all recent keywords for the caller (전체 삭제)."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/meta/regions",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Active region tree (SIDO -> SIGUNGU) with eventCount per node for the filter sheet. Cache-Control: public, s-maxage=600, immutable-ish."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/meta/categories",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Active category tree with iconKey, displayOrder, eventCount. Same caching."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/discovery/favorites",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "찜하기. Body {targetType, targetId}. Idempotent via the (userId,targetType,targetId) unique index — a duplicate returns 200 with the existing row, never 409, because double-tap on mobile is normal. Increments favoriteCount in the same transaction."
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/discovery/favorites",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "찜 해제. Body/query {targetType, targetId}. Idempotent; decrements favoriteCount with a GREATEST(count-1, 0) guard."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/favorites",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "The caller's favorites, filterable by targetType, keyset-paginated, hydrated with the current card + live ratio."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/discovery/saved-searches",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Create a 검색 알림. Body {label?, keyword?, filters, notifyInApp, notifyEmail}. Rejects with 409 if filtersHash already exists for the user (returns the existing one). Max 20 per user."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/discovery/saved-searches",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "List the caller's saved searches with a live matchCount preview."
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/discovery/saved-searches/:id",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Toggle isActive / channels / label. Recomputes filtersHash if filters change."
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/discovery/saved-searches/:id",
+      "roles": [
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Delete. Ownership enforced."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/discovery/events/:eventId/view",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Sampled view beacon (navigator.sendBeacon). Server applies 1-in-K sampling (K from env, default 5) and a per-anonymousId+eventId 30-minute dedupe in an in-memory/Upstash-free approach: a `viewDedupe` hash stored in a short-TTL Postgres table or simply accepted-with-sampling. Always returns 204 immediately; the counter increment is best-effort. NEVER blocks page render."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/discovery/search/click",
+      "roles": [
+        "PUBLIC",
+        "USER",
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "CTR beacon: {searchLogId, eventId, position}. Backfills SearchQueryLog.clickedEventId. 204, best-effort."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/internal/cron/search-reindex",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Vercel Cron, every 1 minute. Drains SearchIndexOutbox (dedupe by entity, batch 200), then a bounded drift sweep: reprojects docs where sourceUpdatedAt < source.updatedAt (LIMIT 500). Authenticated by the `Authorization: Bearer ${CRON_SECRET}` header — a public /api/cron/* route with no secret is a free DoS lever."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/internal/cron/stats-refresh",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Vercel Cron, every 1 minute. (a) Lazy status transitions: SCHEDULED->OPEN where applicationStartAt <= now; OPEN->CLOSED where applicationDeadlineAt <= now OR (mode=INSTANT AND claimedCount >= capacity). (b) Recount validApplicantCount from Application for events touched since lastReconciledAt, bounded LIMIT 300 ordered by staleness. (c) Recompute competitionRatio + ratioDisplayState. (d) Rotate applicationsLast60m/Prev60m hourly. Each event is handled in its own small transaction — one poisoned event must not roll back the batch."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/internal/cron/popularity-refresh",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Vercel Cron, every 10 minutes. Recomputes popularityScore/trendingScore for events touched in the last 24h + all OPEN events, decays viewCount24h, rebuilds the PopularKeyword snapshot and flips isCurrent transactionally, refreshes Region.eventCount / Category.eventCount / VenueSearchDoc.openEventCount."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/internal/cron/saved-search-match",
+      "roles": [
+        "CRON"
+      ],
+      "description": "Vercel Cron, every 15 minutes. For events published since the last run, groups active SavedSearches by filtersHash, evaluates each distinct filter once, respects maxAlertsPerDay, and emits notification commands to the Notification context. Never sends directly."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/admin/discovery/index/health",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Index observability: pending outbox depth, oldest pending age, count of STALE docs, count of events whose cached validApplicantCount drifted at last reconcile, p95 search latency. The single screen ops looks at when '검색에 안 떠요' comes in."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/discovery/index/reindex",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Body {scope: 'ALL'|'EVENT'|'VENUE'|'PARTNER', ids?: string[]}. Enqueues outbox rows rather than reprojecting inline (a full reindex cannot fit in one serverless invocation). Returns the enqueued count."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/admin/discovery/queries/zero-result",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Top zero-result normalized queries in a date range — the work queue for adding SearchSynonym rows."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/discovery/synonyms",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Create a synonym/typo/stopword rule. Takes effect within 60s (per-instance LRU TTL), no reindex."
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/admin/discovery/synonyms/:id",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Edit or deactivate."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/admin/discovery/home-sections",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "List home sections with a live preview of what each AUTO_QUERY currently returns."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/discovery/home-sections",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Create a section. AUTO_QUERY.queryJson is validated against the same zod filter schema as the public endpoint — an admin cannot author a rail that the public pipeline cannot execute."
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/admin/discovery/home-sections/:id",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Edit / reorder / activate / schedule."
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/admin/discovery/home-sections/:id",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Soft delete (isActive=false); hard delete only for never-activated sections."
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/admin/discovery/home-sections/:id/items",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Replace the pinned item list wholesale (avoids per-item reorder races between two admins)."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/admin/discovery/keywords/:keyword/block",
+      "roles": [
+        "ADMIN"
+      ],
+      "description": "Block a keyword from the popular list and from suggest."
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/partner/discovery/events/:eventId/preview",
+      "roles": [
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Shows the partner exactly what a public user sees for their event (the discovery projection), plus an index-health line ('검색 반영 완료 / 반영 중'). Ownership enforced: partner must own the event. This is the answer to the inevitable '내 이벤트가 검색에 안 나와요' ticket."
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/partner/discovery/events/:eventId/reindex",
+      "roles": [
+        "PARTNER",
+        "ADMIN"
+      ],
+      "description": "Self-service reindex of one owned event: enqueues an outbox row. Rate-limited to 1 per event per 60s."
+    }
+  ],
+  "stateMachines": [
+    {
+      "entity": "EventSearchDoc.indexState",
+      "states": [
+        "PENDING",
+        "INDEXED",
+        "STALE",
+        "REMOVED"
+      ],
+      "transitions": [
+        "(none) -> PENDING: an outbox row exists for an event that has no doc yet, or a doc was just created but its derived fields (searchChosung, popularityScore) are not yet computed. Not publicly visible (searchable forced false while PENDING).",
+        "PENDING -> INDEXED: reprojection completed successfully; searchable recomputed; sourceUpdatedAt set to the source's updatedAt.",
+        "INDEXED -> STALE: the drift sweep found doc.sourceUpdatedAt < event.updatedAt, or an outbox row for this entity is pending. STALE rows REMAIN publicly visible with their old content — a 60-second-stale title is vastly better than an event vanishing from search.",
+        "STALE -> INDEXED: reprojection completed.",
+        "INDEXED|STALE -> REMOVED: source event deleted, canceled, hidden by admin, or its partner suspended/unapproved. searchable=false. Row is retained (not deleted) for 30 days so that deep links can render a proper '종료된 이벤트예요' page instead of a 404, and so re-approval is a flag flip.",
+        "REMOVED -> PENDING: event un-hidden / partner re-approved / event restored.",
+        "PENDING -> REMOVED: the source disappeared before the first projection (race between create and delete). Reprojection is written to be idempotent and to treat 'source not found' as REMOVED, never as an error retry loop."
+      ]
+    },
+    {
+      "entity": "EventStatus (projected lifecycle as it affects discoverability)",
+      "states": [
+        "DRAFT",
+        "PENDING_APPROVAL",
+        "SCHEDULED",
+        "OPEN",
+        "CLOSED",
+        "FINALIZED",
+        "CANCELED"
+      ],
+      "transitions": [
+        "DRAFT -> PENDING_APPROVAL / SCHEDULED: no discovery doc is created until the event is publishable. DRAFT is never searchable, never deep-linkable by non-owners (404).",
+        "SCHEDULED -> OPEN: at applicationStartAt. Effected by BOTH the 1-minute cron AND lazily on read (any query for an event whose applicationStartAt <= now() computes the effective status in SQL, so a user hitting refresh at 오픈 시각 never sees a stale '오픈 예정' even if cron is 40s behind). Searchable in both states; the card badge differs (오픈 예정 vs 신청 중) and the apply CTA is disabled while SCHEDULED.",
+        "OPEN -> CLOSED: at applicationDeadlineAt, or (INSTANT only) when claimedCount >= capacity. Same dual cron+lazy mechanism. On transition, the doc leaves the default result set (includeClosed=false) but stays deep-linkable.",
+        "OPEN -> OPEN with a later applicationDeadlineAt: SOFT CLOSE extension. This is a doc UPDATE, not a status change, but it MUST bump indexVersion and enqueue an outbox row, because DEADLINE_SOON sort order and the WITHIN_1H bucket both change. It also invalidates any in-flight DEADLINE_SOON cursor (see edge cases).",
+        "CLOSED -> FINALIZED: partner finalized the confirmed list. Discovery treats FINALIZED identically to CLOSED (not in default results, deep-linkable, badge '선정 완료').",
+        "any -> CANCELED: doc goes REMOVED, searchable=false, deep link renders '취소된 이벤트'. Home sections drop it on their next hydration; a MANUAL_PICK item pointing at it is skipped at render time (never rendered as a broken card) and flagged on the admin screen.",
+        "CLOSED/FINALIZED -> (retention): after serviceDateAt + 90 days (or deadline + 90 days when no service date), the doc is archived out of the hot table by cron."
+      ]
+    },
+    {
+      "entity": "Search request pipeline (per-request, not persisted — documented because the order is load-bearing for correctness and for leak prevention)",
+      "states": [
+        "PARSE",
+        "NORMALIZE",
+        "AUTHORIZE",
+        "BUILD_PREDICATE",
+        "EXECUTE",
+        "PROJECT",
+        "REDACT",
+        "LOG"
+      ],
+      "transitions": [
+        "PARSE -> NORMALIZE: zod-validate the query DTO from packages/shared. Unknown params are REJECTED (400), not ignored — silently ignoring an unknown filter is how a client ships a filter that quietly does nothing.",
+        "NORMALIZE: NFC-normalize q, lowercase, collapse whitespace, strip control chars, truncate to 120 chars, drop tokens < 1 char, expand via SearchSynonym (max 3 expansions per token, max 8 tokens total — an unbounded expansion is a query-of-death).",
+        "AUTHORIZE: resolve viewer role. Anonymous and USER get the identical predicate (searchable=true). PARTNER additionally may pass ownedOnly=true to see their own non-searchable docs. ADMIN may pass includeHidden=true. There is exactly ONE predicate builder; role only adds OR-clauses, it never bypasses the builder.",
+        "BUILD_PREDICATE -> EXECUTE: compose WHERE + ORDER BY + keyset cursor. Assert at build time that no ORDER BY term and no WHERE term references any applicant-amount column — enforced by a unit test that greps the generated SQL for forbidden identifiers.",
+        "EXECUTE -> PROJECT: map rows to EventCard DTOs.",
+        "PROJECT -> REDACT: apply EventVisibilityPolicy per row — mask ratio when validApplicantCount < smallCountThreshold, bucket counts by ratioRoundingBucket, drop remainingSlots for BID events, drop every cutoff/rank field unconditionally in MVP. REDACT is a separate, mandatory, centrally-tested step, not scattered ifs in the mapper.",
+        "REDACT -> LOG: fire-and-forget SearchQueryLog insert with the result count. Response is already being streamed; logging failures are swallowed and metered."
+      ]
+    }
+  ],
+  "businessRules": [
+    "Public browse is fully unauthenticated. Every GET under /api/v1/discovery/** except favorites/saved-searches/recent-keywords works with no JWT. The apply CTA is the only auth wall, and it renders as '로그인하고 신청하기' rather than hiding the event. Rationale: SEO + the catchtable pattern of browsing before signup.",
+    "Authentication, when present, is ADDITIVE ONLY: it adds isFavorited, hasApplied, and myApplicationStatus to each card. It NEVER changes the set of events returned, their order, or any competition figure. This makes the anonymous response CDN-cacheable and makes it impossible for a logged-in attacker to extract more ranking signal than an anonymous one.",
+    "Default result set = `searchable = true AND effectiveStatus IN (SCHEDULED, OPEN)`. `includeClosed=true` adds CLOSED and FINALIZED, and forces sort to NEWEST or DEADLINE_SOON descending (a closed event has no meaningful 'ending soon').",
+    "effectiveStatus is computed in SQL, not read from the column: `CASE WHEN status='SCHEDULED' AND applicationStartAt <= now() THEN 'OPEN' WHEN status='OPEN' AND applicationDeadlineAt <= now() THEN 'CLOSED' ELSE status END`. The stored column is the cron-materialized approximation; the SQL expression is the truth. Both exist so that the common predicate can still use the indexed column as a coarse pre-filter (`status IN ('SCHEDULED','OPEN','CLOSED')`) and the CASE only refines.",
+    "THE AMOUNT RULE: amountMin/amountMax filters and AMOUNT_ASC/DESC sorts operate exclusively on EventSearchDoc.minAmount / maxAmount, which are the partner's published price range — public information printed on the card. No endpoint in this context reads, aggregates, filters by, or sorts by Application.amount, BidHistory.amount, or any derivative (max, min, avg, percentile, cutoff, histogram). This is asserted by a CI test that fails if the strings 'Application.amount', 'bidAmount', or 'lastBidAt' appear in this module's query layer.",
+    "Amount range filter semantics = OVERLAP, not containment: an event matches [f_min, f_max] when `event.minAmount <= f_max AND event.maxAmount >= f_min`. A '5만~15만원' event must appear when the user filters '10만원 이하' — containment semantics would hide it and users would call it a bug.",
+    "Competition ratio displayed = validApplicantCount / capacity, formatted as '정원 {capacity}명 / 신청 {n}명 ({r}:1)'. r is rounded to 1 decimal. When capacity is 0 or null (shouldn't happen; defensive) the ratio block is omitted entirely rather than dividing by zero.",
+    "validApplicantCount definition is flag-dependent and MUST be identical everywhere: with DEPOSIT_HOLD_ENABLED=false it counts all non-canceled applications; with =true it counts only applications whose deposit gate is satisfied (no deposit required, or deposit paid), excluding DEPOSIT_PENDING and HOLD_EXPIRED. The definition lives as one exported SQL fragment + one TS predicate in packages/shared, imported by both this context and the Application context, so the number a user sees in search always equals the number the partner sees on the dashboard.",
+    "Counter maintenance is push-based and in-transaction: the Application context's create/cancel/expire/deposit-confirm operations include `UPDATE EventStatsCache SET validApplicantCount = validApplicantCount + :delta, competitionRatio = ... WHERE eventId = ?` in the same Prisma $transaction. A single-row UPDATE on a narrow table is cheap and correct under Postgres MVCC without any application-level lock. Row-level lock contention on one hot event is acceptable and self-limiting; this is a counter, not the capacity gate.",
+    "Counters are ALLOWED to be wrong. They are a display artifact, not a business invariant. The 1-minute reconciler performs a true COUNT(*) for recently-touched events and corrects drift, bumping counterEpoch. Never add a lock, advisory lock, or serializable isolation level to protect a display counter — that would contradict the platform's explicit acceptance of overbooking.",
+    "No list query may execute COUNT(*) over Application. If EventStatsCache is missing for an event (projection lag), the card renders the ratio block as a skeleton and the client re-fetches via /ratio/batch; it does NOT fall back to counting.",
+    "BID events NEVER expose remainingSlots, '잔여 N석', '마감 임박(정원)' badges, or claimedCount — overbooking is expected and 'N석 남음' would be a lie. Only INSTANT events show remaining slots, computed as GREATEST(capacity - claimedCount, 0). If overbooking pushed claimedCount past capacity, the display clamps to 0 and the badge reads '마감' — the partner resolves the overshoot on the final-list screen, and discovery never surfaces a negative number.",
+    "MASKED_LOW_N: when validApplicantCount < smallCountThreshold (default 3) the ratio is replaced with the string key 'JUST_OPENED' rendering as '신청 받는 중'. Reason: on a low-volume event a watcher who polls the ratio every 5s learns exactly when a specific person applied, and combined with the deposit-window timing that is a real de-anonymization channel. Masking the first few also avoids the demoralizing '신청 1명' on a fresh event.",
+    "Ratio polling is served from a 5-second CDN cache (`s-maxage=5, stale-while-revalidate=10`) and the batch endpoint from an in-function 3-second memo. Polling cadence advertised to the client: 10s when the event's deadline is >1h away, 3s when <1h, 1s never. SSE is preferred but must degrade to polling.",
+    "DEADLINE_SOON sort = `ORDER BY applicationDeadlineAt ASC, eventId ASC`, filtered to `applicationDeadlineAt > now()`. The secondary eventId key is mandatory — without a unique tiebreaker, keyset pagination on a non-unique column silently drops or duplicates rows.",
+    "POPULAR sort = `ORDER BY popularityScore DESC, eventId ASC` where popularityScore = 0.5*ln(1+validApplicantCount) + 0.25*ln(1+viewCount24h) + 0.15*ln(1+favoriteCount) + 0.10*recencyBoost, multiplied by a deadline-proximity factor of 1.0 (>7d), 1.15 (1-7d), 1.3 (<24h), and hard-multiplied by 0 for non-OPEN events. Log-scaled so one viral event cannot own every rail; recomputed every 10 minutes; the exact weights live in one exported constant object so tuning is a config change.",
+    "COMPETITION_RATIO sort uses the materialized competitionRatio column with a minimum-sample guard: events with validApplicantCount < smallCountThreshold are sorted last regardless of ratio, so a '정원 1명 / 신청 2명 (2:1)' brand-new event cannot top the '경쟁률 높은 순' rail.",
+    "NEWEST sort uses publishedAt, never createdAt. An event drafted three weeks ago and published today is new to the user.",
+    "Keyset pagination on every list. Cursor = base64url of `{v: 1, sort, lastSortValue, lastId, filtersHash, issuedAt}`, HMAC-signed with a server secret. On read: verify the signature (reject tampered cursors with 400), verify filtersHash matches the current request's filters (reject with 400 'FILTER_CHANGED' — silently ignoring a changed filter produces incoherent pages), and reject cursors older than 30 minutes with 410 'CURSOR_EXPIRED' so the client restarts cleanly.",
+    "Korean text matching strategy, in priority order per query token: (1) exact/prefix match on tsvector via `searchVector @@ to_tsquery('simple', token || ':*')` — fast, index-backed, handles well-formed tokens; (2) trigram similarity `searchText % token` with `pg_trgm.similarity_threshold = 0.3` — handles 띄어쓰기 variance ('스시오마카세' vs '스시 오마카세'), josa attachment ('강남에서'), and typos; (3) chosung match `searchChosung LIKE '%' || chosungOf(token) || '%'` only when the token is entirely chosung characters. Results are UNIONed and ranked by `GREATEST(ts_rank, similarity) * 0.7 + normalizedPopularity * 0.3`. Never run all three unconditionally on every token — token shape selects the strategy.",
+    "Required indexes (exact list): (a) `GIN (searchText gin_trgm_ops)` on EventSearchDoc and VenueSearchDoc — the workhorse for Korean; (b) `GIN (searchVector)` on both; (c) `GIN (searchChosung gin_trgm_ops)` on both; (d) `BTREE (searchable, status, applicationDeadlineAt, eventId)` — DEADLINE_SOON; (e) `BTREE (searchable, status, popularityScore DESC, eventId)` — POPULAR; (f) `BTREE (searchable, status, publishedAt DESC, eventId)` — NEWEST; (g) `BTREE (searchable, status, competitionRatio DESC, eventId)` — RATIO; (h) `GIN (categoryIds)`; (i) `GIN (regionPath)`; (j) `BTREE (regionCode, searchable, applicationDeadlineAt)`; (k) `BTREE (searchable, minAmount)` and `(searchable, maxAmount)` for range overlap; (l) `BTREE (serviceDateAt)` partial `WHERE serviceDateAt IS NOT NULL`; (m) `BTREE (partnerId, status)` for partner preview; (n) partial `BTREE (processedAt, id) WHERE processedAt IS NULL` on SearchIndexOutbox; (o) unique `(userId, targetType, targetId)` on Favorite; (p) unique `(userId, filtersHash)` on SavedSearch. Every composite sort index leads with `searchable` because it is in 100% of public predicates.",
+    "Filtered-sort queries must be index-satisfiable. When a keyword is present, the trigram GIN drives and the sort is applied to a bounded candidate set — so keyword searches cap candidates at 2000 rows (`LIMIT 2000` in a CTE) before sorting. Keyword-search relevance beyond 2000 candidates is not a real user need and the cap is what keeps p95 under 200ms on Neon.",
+    "All KST bucketing goes through SQL `AT TIME ZONE 'Asia/Seoul'`. `TODAY_KST` = deadline within [today 00:00 KST, today 24:00 KST). '이번 주말' = the coming Saturday 00:00 KST through Sunday 23:59:59.999 KST. The API also accepts an explicit `tz` param defaulting to 'Asia/Seoul' but currently only accepts that value — the parameter exists so a future overseas rollout is not a breaking change.",
+    "Every response that contains a countdown or a deadline includes `serverTimeAt` (ISO-8601 with offset). The client computes `skew = serverTimeAt - clientNow` once and drives all countdowns from the corrected clock. A device with a wrong clock must never see '마감 3시간 남음' on a closed event.",
+    "Search never leaks a partner's unapproved state: events of a PENDING_APPROVAL or SUSPENDED partner have searchable=false, are excluded from suggest, are excluded from facet counts, and their deep link returns the same 404 body as a nonexistent event (no distinguishing message that would let someone enumerate pending partners).",
+    "Rate limits (per IP for anonymous, per userId for authed, enforced at the edge with a fixed-window counter): /suggest 20/10s, /discovery/events 60/min, /ratio and /ratio/batch 120/min, /ratio/stream 3 concurrent connections, /favorites 30/min, /saved-searches 10/min. Exceeding returns 429 with Retry-After. Rationale: /suggest is the cheapest DoS surface (a GIN scan per keystroke).",
+    "q is length-capped at 120 chars and token-capped at 8 after synonym expansion. Queries consisting only of stopwords or only of punctuation short-circuit to the unfiltered browse rather than executing an empty tsquery (which errors in Postgres).",
+    "SearchQueryLog writes are fire-and-forget and never inside the response transaction. On Vercel this means `void logSearch(...)` after the response object is constructed but before return, with `waitUntil` where available; a logging failure is counted as a metric and swallowed.",
+    "PopularKeyword counts DISTINCT actors (userId when present, else anonymousId), not raw query events, and drops any keyword whose distinct-actor count is below 5 in the window. Otherwise one person with a loop inflates the trending list.",
+    "Popular keyword snapshot swap is transactional: insert the new snapshot rows with isCurrent=false, then `UPDATE ... SET isCurrent = (snapshotAt = :new)` in one statement inside a transaction. Readers always see exactly one complete ranking.",
+    "Home AUTO_QUERY sections execute through the exact same service method as GET /discovery/events. There is precisely one query builder and one REDACT step in this context. A curated rail cannot accidentally expose a field the public endpoint hides.",
+    "MANUAL_PICK / BANNER items whose target has become non-searchable are skipped silently at hydration and the section is backfilled from its fallback query (or shrinks). A curated rail must never render a dead card, and must never 500 because an admin pinned an event the partner then canceled.",
+    "Favorite counts use GREATEST(count - 1, 0) on decrement and are reconciled nightly against `SELECT count(*) FROM Favorite`. Same philosophy as the applicant counter: display value, self-healing, no locks.",
+    "Deep links to a non-searchable-but-existing event (CLOSED, FINALIZED) return 200 with a `viewState: 'ENDED'` so the page renders '종료된 이벤트예요' plus recommendations, not a 404. Deep links to DRAFT/CANCELED/hidden/suspended return 404 for non-owners and 200 for the owning partner and admin.",
+    "No personal or sensitive value ever goes into a query string that this context logs: SearchQueryLog stores normalizedQuery (a search term, acceptable) plus a hash of the raw string, and never stores IP addresses. Search URLs are shareable by design and therefore must never carry a token or a userId.",
+    "packages/shared owns: EventMode, EventStatus, DepositType, and every enum listed above; the EventSearchFilters zod schema; the EventCard/VenueCard DTOs; the validApplicantCount predicate; and the ratio formatting helper. apps/web imports the same zod schema it posts, so a filter added in one place cannot drift."
+  ],
+  "edgeCases": [
+    "AMOUNT-PROBING ATTACK (the most dangerous leak): an attacker binary-searches an amount filter to infer the winning bid distribution. Mitigated structurally — amount filters bind only to the event's published min/max, and no endpoint accepts an applicant-amount predicate. A CI test greps the generated SQL for applicant-amount identifiers. If a future 'sort by average bid' is ever requested, it must be treated as a product decision about disclosure, not a search feature.",
+    "RATIO-DELTA DE-ANONYMIZATION: an attacker polls /ratio every 3s on a low-traffic event and correlates a +1 with a person who just posted '신청했다' in a KakaoTalk group, learning that a specific person applied. Mitigated by MASKED_LOW_N below 3 applicants, by the 5s cache (which quantizes timing), and by never exposing pendingDepositCount publicly. Full mitigation (adding noise) is deliberately NOT done because a wrong public count would undermine trust; the ratioRoundingBucket escape hatch exists if this becomes real.",
+    "DEPOSIT-EXPIRY RATIO FLICKER: with DEPOSIT_HOLD_ENABLED=true, an applicant's hold expires and validApplicantCount goes 47 -> 46. A user watching the card sees the number go DOWN, which reads as a bug or as someone canceling. UX rule: the ratio component animates increases but renders decreases without animation, and the tooltip says '입금 확인된 신청만 집계돼요'. Also: the decrement happens via the Application context's expiry sweeper, which may run in the same minute as our reconciler — both paths must be idempotent (the sweeper decrements only on the state transition, the reconciler sets an absolute recount).",
+    "LAZY-EXPIRY VS CACHED COUNT RACE: lazy expiry-on-read in the Application context flips a hold to HOLD_EXPIRED at read time and decrements the counter; simultaneously our reconciler is mid-COUNT(*). The reconciler's absolute write can clobber the delta or vice versa. Resolution: the reconciler writes `validApplicantCount = :recount` only when `updatedAt <= :snapshotTakenAt` (optimistic guard); otherwise it skips and retries next minute. Bounded staleness, no lock.",
+    "SOFT CLOSE BREAKS DEADLINE_SOON PAGINATION: user is on page 3 of 마감임박순; an event on page 1 gets its deadline extended by 10 minutes and should now sort after the user's cursor — the user will see it again on page 4 (duplicate) or an event may be skipped. Accepted and handled client-side: the list dedupes by eventId, and the response includes `mayContainShifts: true` for DEADLINE_SOON. Additionally, cursors embed issuedAt and expire at 30 minutes, bounding the drift.",
+    "SOFT CLOSE AND '마감임박' BADGES: an event is in WITHIN_1H, the user sees '1시간 남음', then a sniper's bid extends the deadline and the countdown jumps UP. Handled by projecting softCloseEnabled onto the card and rendering '마감 연장 가능' next to the countdown, and by the /ratio payload carrying isDeadlineExtended so the client can show a one-time '마감이 연장되었어요' toast rather than a silently jumping timer.",
+    "SNIPING-DRIVEN THUNDERING HERD ON DISCOVERY: in the last 60 seconds of a popular BID event, thousands of clients poll /ratio simultaneously. Mitigated by the 5s CDN cache (which collapses N requests into 1 origin hit), by SSE with change-only emission, and by a `pollAfterMs` server hint that the API can raise under load (adaptive backpressure). The ratio endpoint must never touch Application; it is a single-row PK lookup on EventStatsCache and stays sub-millisecond.",
+    "MIDNIGHT KST BOUNDARY: a cron running at 14:59 UTC computes 'TODAY_KST' as the 27th; at 15:00 UTC it becomes the 28th, and every '오늘 마감' rail empties instantly. This is correct but jarring. The home rail therefore uses WITHIN_6H rather than TODAY_KST as its primary bucket, and TODAY_KST appears only in the explicit filter sheet where the user chose it. Also: KST has no DST, but the code must still never compute a boundary from `new Date()` local time on a UTC Vercel box.",
+    "SERVICE DATE VS DEADLINE CONFUSION: a user filters '이번 주말 방문' and gets an event whose application deadline already passed but whose service date is Saturday. Rule: the service-date filter is always ANDed with the default status predicate, so closed events never appear unless includeClosed=true. Copy uses '방문일' for serviceDateAt and '신청 마감' for applicationDeadlineAt, never both as '날짜'.",
+    "INSTANT EVENT REACHES CAPACITY MID-SCROLL: the card said '3석 남음' when rendered and is 마감 by the time the user taps. The apply endpoint is the sole authority and returns a typed CAPACITY_REACHED error; the discovery card is explicitly advisory. The detail page re-fetches /ratio on focus/visibilitychange so returning from the background does not show a stale slot count.",
+    "OVERBOOKED INSTANT EVENT SHOWS NEGATIVE SLOTS: expiry-reclaim races can push claimedCount above capacity. Display clamps with GREATEST(capacity - claimedCount, 0) and the badge switches to '마감'. Never render '-2석'. The partner resolves the overshoot on the final-list screen, which is exactly the documented business posture.",
+    "DOUBLE-SUBMIT ON 찜: mobile double-tap fires two POST /favorites. The (userId,targetType,targetId) unique index makes the second an upsert no-op returning 200, and favoriteCount is incremented only when the insert actually created a row (`ON CONFLICT DO NOTHING` + check rowCount). Without the rowCount check the counter double-increments on every double-tap.",
+    "DOUBLE-SUBMIT ON SAVED SEARCH: filtersHash unique per user turns a double-tap into a 200-with-existing rather than two identical alert subscriptions.",
+    "CURSOR TAMPERING: a client edits the base64 cursor to inject a sort value or a filter hash. Cursors are HMAC-signed and the filtersHash is cross-checked against the live request; tampered cursors 400. Cursors are also not a security boundary for row visibility — the `searchable=true` predicate is applied unconditionally regardless of cursor content.",
+    "INDEX LAG AFTER PUBLISH: a partner publishes and immediately searches; the outbox has not drained and the event is invisible. Mitigated by (a) writing the EventSearchDoc synchronously in the same transaction as publish when the publish happens in our API process — the outbox is the repair path, not the primary path; (b) the partner preview endpoint showing '검색 반영 중' with a self-service reindex button.",
+    "PARTNER SUSPENDED MID-CAMPAIGN: admin suspends a partner with 12 OPEN events. All 12 docs must go REMOVED. This is one outbox row per event enqueued by the admin action, drained within a minute. In the meantime, the detail endpoint re-checks partner status live (a cheap indexed join) so a suspended partner's event cannot be applied to even during the lag window — search list may be up to 60s stale, but the detail page and apply are not.",
+    "EVENT DELETED WHILE PINNED TO A HOME BANNER: hydration skips it, section shrinks, admin health screen flags 'broken pin'. Never a 500, never an empty card frame.",
+    "ZERO-RESULT SEARCH: '오마까세' (typo). Falls to the trigram path; if still zero, the response includes `didYouMean` from the SearchSynonym TYPO table and `fallbackResults` from a relaxed query (drop the keyword, keep the filters) clearly labeled '검색 결과가 없어 인기 이벤트를 보여드려요' — never an unlabeled fallback that looks like a match.",
+    "SEARCH-TERM ABUSE: a scraper hits /suggest with a generated dictionary to enumerate every venue. Rate limits + the fact that suggest returns at most 10 rows with no amounts, no counts, and no contact data. Venue names are public information; this is accepted exposure, not a leak.",
+    "tsquery INJECTION: a user types '강남 & | !:*' — passing raw text to `to_tsquery` throws a syntax error and 500s. Always use `plainto_tsquery`/`websearch_to_tsquery` for user text, or build the tsquery programmatically from sanitized tokens with explicit `:*` prefix operators. Never string-concatenate user input into to_tsquery.",
+    "EXTREMELY LONG OR ADVERSARIAL QUERY: 10,000-char q, or 200 tokens designed to fan out through synonyms into a 2000-term tsquery. Capped at 120 chars / 8 tokens / 3 expansions per token before the query is built.",
+    "PATHOLOGICAL FILTER COMBO: regionCodes with 250 entries × categorySlugs with 80 entries. Caps: max 20 regionCodes, max 10 categorySlugs, max 5 modes-equivalent — 400 beyond that.",
+    "amountMin > amountMax, or negative amounts, or amounts > 2147483647 (Int overflow — the spec says range is 0..Int max, so a client sending 2^31 must 400, not silently wrap). zod schema enforces int().min(0).max(2147483647) and a cross-field refine.",
+    "EVENT WITH capacity = 0: division by zero in the ratio. Ratio block omitted; card shows '신청 인원 N명'. Also flagged to admin as a likely partner data error.",
+    "EVENT WITH minAmount = 0 (free): the '금액대' filter's lowest bucket must include 0, and the card must render '무료' rather than '0원'.",
+    "SIMULTANEOUS ADMIN EDITS TO HOME SECTION ORDER: two admins reorder concurrently, last write wins and the other's change vanishes. Mitigated by the PUT-whole-list item endpoint plus an `If-Match`/version field on the section; a stale version 409s with 'someone else changed this'.",
+    "RECONCILER TIMEOUT: a full-table recount does not fit in a Vercel function's max duration. Every cron pass is bounded (LIMIT 300/500) and ordered by staleness, so it is a continuously-converging sweep, not a batch job. Each event is its own small transaction so a timeout mid-pass leaves consistent partial progress.",
+    "CRON OVERLAP: Vercel may invoke the next minute's cron while the previous is still running. Guarded by a Postgres advisory lock (`pg_try_advisory_lock(hashtext('search-stats-refresh'))`) — if not acquired, exit 200 immediately. This is the one place an advisory lock is justified: it protects a job, not a user-facing counter.",
+    "CRON ENDPOINT UNAUTHENTICATED: /api/cron/* on Vercel is publicly reachable. Every internal cron route requires `Authorization: Bearer ${CRON_SECRET}` and returns 404 (not 401) otherwise, so the endpoint's existence is not advertised.",
+    "SSE CONNECTION LEAK / FUNCTION DURATION LIMIT: the stream is killed at 5 minutes by the platform mid-countdown. Server sends an explicit close with `retry: 3000`; the client reconnects and re-syncs from the /ratio snapshot rather than assuming continuity. Clients that cannot hold SSE (older iOS webviews, corporate proxies buffering text/event-stream) must fall back to polling — feature-detect and also time out if no event arrives within 30s.",
+    "CACHE POISONING VIA VARY: the anonymous list response is CDN-cached; if the personalized variant ever shares a cache key, one user's isFavorited flags leak to everyone. Enforced by serving personalization from a SEPARATE endpoint/response segment (`/discovery/me/overlay?eventIds=`) rather than by varying the main response on Authorization — the main list response is byte-identical for all viewers of the same role class.",
+    "SEARCH RESULTS DIFFERING BETWEEN /events and /events/count: the count endpoint is capped at 1000 and cached 60s, so the sheet may say '324개' while the list has 319. Response carries isCapped and the copy says '약 324개' when isCapped or when the count came from cache.",
+    "REGION ALIAS AMBIGUITY: '중구' exists in 서울, 부산, 대구, 인천, 대전. Region autocomplete must always render the parent ('서울 중구'), and a bare '중구' keyword search matches all of them by trigram rather than silently picking Seoul.",
+    "EMOJI / ZERO-WIDTH / HOMOGLYPH IN QUERY OR IN A VENUE NAME: normalization strips zero-width and control characters at both index and query time; otherwise a venue named '스시​오마카세' becomes unsearchable. Emoji are preserved in display but stripped from searchText.",
+    "JOSA AND SPACING: '강남에서', '강남의', '강남맛집' must all hit '강남'. The tsvector 'simple' config will not help (no stemmer); this is exactly why pg_trgm is mandatory rather than optional, and why the similarity threshold is tuned at 0.3 rather than the 0.6 default.",
+    "MIXED-SCRIPT SEARCH: 'omakase' should find '오마카세'. Handled by the SearchSynonym alias table and by including romanized aliases in Category.aliases and Region.aliases — NOT by a romanization library, which produces too many false positives for MVP.",
+    "A USER SEARCHES FOR THEIR OWN CANCELED APPLICATION'S EVENT and cannot find it because it closed. Deep links from 쪽지/email must therefore point at the detail route (which renders ENDED) and never at a search URL."
+  ],
+  "terms": [
+    {
+      "technical": "Search & Discovery",
+      "userFriendlyKo": "둘러보기 / 검색"
+    },
+    {
+      "technical": "Home feed",
+      "userFriendlyKo": "홈"
+    },
+    {
+      "technical": "Event",
+      "userFriendlyKo": "이벤트 (또는 '예약 이벤트')"
+    },
+    {
+      "technical": "Venue / Partner",
+      "userFriendlyKo": "가게 / 파트너"
+    },
+    {
+      "technical": "EventMode = INSTANT",
+      "userFriendlyKo": "선착순 즉시확정"
+    },
+    {
+      "technical": "EventMode = BID",
+      "userFriendlyKo": "금액 입찰형 (마감 후 선정)"
+    },
+    {
+      "technical": "capacity",
+      "userFriendlyKo": "정원"
+    },
+    {
+      "technical": "validApplicantCount",
+      "userFriendlyKo": "신청 인원"
+    },
+    {
+      "technical": "competitionRatio",
+      "userFriendlyKo": "경쟁률"
+    },
+    {
+      "technical": "ratio display string",
+      "userFriendlyKo": "정원 10명 / 신청 47명 (4.7:1)"
+    },
+    {
+      "technical": "RatioDisplayState = MASKED_LOW_N",
+      "userFriendlyKo": "신청 받는 중"
+    },
+    {
+      "technical": "remainingSlots (INSTANT only)",
+      "userFriendlyKo": "잔여 3석"
+    },
+    {
+      "technical": "status SCHEDULED",
+      "userFriendlyKo": "오픈 예정"
+    },
+    {
+      "technical": "status OPEN",
+      "userFriendlyKo": "신청 중"
+    },
+    {
+      "technical": "status CLOSED",
+      "userFriendlyKo": "신청 마감"
+    },
+    {
+      "technical": "status FINALIZED",
+      "userFriendlyKo": "선정 완료"
+    },
+    {
+      "technical": "status CANCELED",
+      "userFriendlyKo": "취소된 이벤트"
+    },
+    {
+      "technical": "viewState = ENDED",
+      "userFriendlyKo": "종료된 이벤트예요"
+    },
+    {
+      "technical": "applicationStartAt",
+      "userFriendlyKo": "신청 시작"
+    },
+    {
+      "technical": "applicationDeadlineAt",
+      "userFriendlyKo": "신청 마감"
+    },
+    {
+      "technical": "serviceDateAt",
+      "userFriendlyKo": "방문일"
+    },
+    {
+      "technical": "deadlineBucket = WITHIN_1H",
+      "userFriendlyKo": "1시간 내 마감"
+    },
+    {
+      "technical": "deadlineBucket = WITHIN_6H",
+      "userFriendlyKo": "오늘 곧 마감"
+    },
+    {
+      "technical": "deadlineBucket = TODAY_KST",
+      "userFriendlyKo": "오늘 마감"
+    },
+    {
+      "technical": "deadlineBucket = WITHIN_3D / WITHIN_7D",
+      "userFriendlyKo": "3일 내 마감 / 이번 주 마감"
+    },
+    {
+      "technical": "softCloseEnabled hint",
+      "userFriendlyKo": "마감이 연장될 수 있어요"
+    },
+    {
+      "technical": "deadline extended toast",
+      "userFriendlyKo": "마감이 연장되었어요"
+    },
+    {
+      "technical": "minAmount~maxAmount",
+      "userFriendlyKo": "신청 가능 금액"
+    },
+    {
+      "technical": "minAmount == maxAmount",
+      "userFriendlyKo": "정가"
+    },
+    {
+      "technical": "minAmount == 0",
+      "userFriendlyKo": "무료"
+    },
+    {
+      "technical": "amount range filter",
+      "userFriendlyKo": "금액대"
+    },
+    {
+      "technical": "depositRequired",
+      "userFriendlyKo": "보증금 필요"
+    },
+    {
+      "technical": "depositWindowMinutes",
+      "userFriendlyKo": "보증금 입금 시간 (10분)"
+    },
+    {
+      "technical": "sort = POPULAR",
+      "userFriendlyKo": "인기순"
+    },
+    {
+      "technical": "sort = DEADLINE_SOON",
+      "userFriendlyKo": "마감임박순"
+    },
+    {
+      "technical": "sort = NEWEST",
+      "userFriendlyKo": "최신순"
+    },
+    {
+      "technical": "sort = COMPETITION_RATIO_DESC",
+      "userFriendlyKo": "경쟁률 높은 순"
+    },
+    {
+      "technical": "sort = COMPETITION_RATIO_ASC",
+      "userFriendlyKo": "경쟁률 낮은 순"
+    },
+    {
+      "technical": "sort = AMOUNT_ASC / DESC",
+      "userFriendlyKo": "낮은 금액순 / 높은 금액순"
+    },
+    {
+      "technical": "sort = SERVICE_DATE_ASC",
+      "userFriendlyKo": "방문일 빠른순"
+    },
+    {
+      "technical": "filter sheet apply button",
+      "userFriendlyKo": "조건에 맞는 이벤트 32개 보기"
+    },
+    {
+      "technical": "region filter",
+      "userFriendlyKo": "지역"
+    },
+    {
+      "technical": "category filter",
+      "userFriendlyKo": "카테고리"
+    },
+    {
+      "technical": "Favorite",
+      "userFriendlyKo": "찜"
+    },
+    {
+      "technical": "favorites list",
+      "userFriendlyKo": "찜한 이벤트 / 찜한 가게"
+    },
+    {
+      "technical": "SavedSearch",
+      "userFriendlyKo": "검색 알림"
+    },
+    {
+      "technical": "SavedSearch create CTA",
+      "userFriendlyKo": "이런 이벤트 열리면 알려드릴게요"
+    },
+    {
+      "technical": "UserRecentSearch",
+      "userFriendlyKo": "최근 검색어"
+    },
+    {
+      "technical": "clear all recent searches",
+      "userFriendlyKo": "전체 삭제"
+    },
+    {
+      "technical": "PopularKeyword",
+      "userFriendlyKo": "인기 검색어"
+    },
+    {
+      "technical": "suggest / autocomplete",
+      "userFriendlyKo": "추천 검색어"
+    },
+    {
+      "technical": "didYouMean",
+      "userFriendlyKo": "이걸 찾으셨나요?"
+    },
+    {
+      "technical": "zero results + fallback",
+      "userFriendlyKo": "검색 결과가 없어 인기 이벤트를 보여드려요"
+    },
+    {
+      "technical": "trending rail",
+      "userFriendlyKo": "지금 뜨는 이벤트"
+    },
+    {
+      "technical": "deadline-soon rail",
+      "userFriendlyKo": "마감 임박! 지금 신청하세요"
+    },
+    {
+      "technical": "new rail",
+      "userFriendlyKo": "새로 열린 이벤트"
+    },
+    {
+      "technical": "login-gated apply CTA",
+      "userFriendlyKo": "로그인하고 신청하기"
+    },
+    {
+      "technical": "index lag notice (partner-facing)",
+      "userFriendlyKo": "검색 반영 중이에요 (최대 1분)"
+    },
+    {
+      "technical": "ratio tooltip when deposit gate is on",
+      "userFriendlyKo": "입금 확인된 신청만 집계돼요"
+    },
+    {
+      "technical": "CURSOR_EXPIRED",
+      "userFriendlyKo": "목록이 갱신되었어요. 새로고침해 주세요"
+    },
+    {
+      "technical": "rate limited (429)",
+      "userFriendlyKo": "잠시 후 다시 시도해 주세요"
+    }
+  ],
+  "openQuestions": [
+    "Should CLOSED/FINALIZED events be searchable at all by default, or only via deep link? Showing them adds SEO surface and lets users see a venue's track record ('지난 이벤트 경쟁률 12:1'), but it also dilutes results and, for BID events, publishing historical competition ratios is itself a disclosure decision — it teaches future bidders how hot this venue runs. Current design: excluded by default, opt-in via includeClosed. Need product sign-off.",
+    "For a CLOSED BID event, may we display the FINAL competition ratio publicly? It is arguably marketing gold for the partner and contains no amounts, but it is a stronger signal than the live ratio. Assumed yes; flagged because it interacts with the sealed-bid posture.",
+    "Is the '경쟁률순' sort actually desirable? It creates a rich-get-richer feedback loop (high ratio -> top of list -> more applicants) and, for BID events, it is a coarse proxy for 'where the money is'. Options: keep it, keep it but only for INSTANT, or drop it in MVP. Need a decision before index (g) is created.",
+    "Confirm the exact validApplicantCount definition for the ratio while DEPOSIT_HOLD_ENABLED=false. Assumed: all non-canceled applications. When the flag flips on, every event's public ratio will visibly DROP. Do we need a migration-day communication plan, or should the flag be per-event so events are converted gradually?",
+    "smallCountThreshold default of 3 — is masking the ratio below 3 applicants acceptable to partners, who may want '신청 1명' visible as social proof at launch? Should it be per-event partner-configurable, or admin-global only?",
+    "Region taxonomy source and depth: two levels (시도/시군구) only, or a third 읍면동 level? And do we need commercial-district pseudo-regions (홍대, 성수, 판교, 연남) as first-class filter chips? Users think in 상권, not in 행정구역. Current design handles them as Region.aliases, which is a compromise — a real 상권 entity may be warranted.",
+    "Is a geo '내 주변' sort in scope for v1.1? latitude/longitude are stored but unindexed. If yes, decide now between cube+earthdistance (available on Neon, cheap) and PostGIS (heavier), because the index is not additive-free at scale.",
+    "Category taxonomy: who owns it and how many top-level categories? Filter UX degrades badly past ~12. Also need the initial seed list.",
+    "Personalization scope for v1: is the home feed identical for everyone (plus a '찜한 가게의 새 이벤트' rail), or do we want behavior-based recommendations? The latter changes the caching model entirely (no CDN caching of home) and I would push it out of MVP.",
+    "SEO / rendering strategy: should public event and venue pages be statically generated with ISR for crawlers? That implies stable canonical URLs (/events/[slug] vs /events/[uuid]) and a sitemap generator — both belong to this context but are not in the brief. Also: do we WANT these indexed by Google, given partners may consider their pricing competitive information?",
+    "Search log retention: 90 days assumed. Legal/privacy review needed on storing normalizedQuery tied to a userId (개인정보처리방침 disclosure), and on whether anonymousId cookies require consent under the Korean framework.",
+    "Saved-search alert volume: 15-minute batching with maxAlertsPerDay=5 is a guess. Is the desired UX 'instant alert on publish' (needs a synchronous hook, more expensive) or 'daily digest'? This determines whether the matcher is a cron or an event handler.",
+    "Should the suggest endpoint return live competition ratios inline on event suggestions? It looks great and matches catchtable's density, but it multiplies the cost of the cheapest-to-abuse endpoint. Current design: no ratios in suggest.",
+    "Query-of-the-day scale assumption: I have designed for roughly 10^4-10^5 searchable events and low-thousands concurrent readers, where Postgres+pg_trgm is comfortably sufficient. If the roadmap expects 10^6+ events or heavy multi-token Korean relevance, we should plan the exit to a dedicated engine (Typesense/Meili on a small box, or pgroonga if Neon ever supports it) now rather than after the indexes calcify.",
+    "Confirm that the Event/Application contexts will accept the contract that they must update EventStatsCache inside their own write transactions. If those contexts would rather emit domain events only, this context must fall back to cron-only counters and the public ratio becomes up-to-60s stale — acceptable but worse, and the decision must be explicit rather than discovered at integration time."
+  ]
+}

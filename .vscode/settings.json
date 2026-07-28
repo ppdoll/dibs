@@ -1,0 +1,57 @@
+{
+  // 워크스페이스에 설치된 TypeScript 를 쓴다. VS Code 내장 버전과 다르면
+  // 에디터에만 없는 오류가 뜨거나, 반대로 진짜 오류를 놓친다.
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "typescript.enablePromptUseWorkspaceTsdk": true,
+  "typescript.preferences.importModuleSpecifier": "non-relative",
+  "typescript.updateImportsOnFileMove.enabled": "always",
+
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit",
+    "source.organizeImports": "never"
+  },
+
+  "[prisma]": { "editor.defaultFormatter": "Prisma.prisma" },
+  "[json]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+  "[jsonc]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+
+  "eslint.workingDirectories": [
+    { "directory": "apps/api", "changeProcessCWD": true },
+    { "directory": "apps/web", "changeProcessCWD": true },
+    { "directory": "packages/shared", "changeProcessCWD": true }
+  ],
+
+  // 검색·탐색에서 걷어낸다. 특히 .next 와 dist 는 같은 코드의 낡은 사본이라
+  // 검색 결과에 섞이면 엉뚱한 파일을 고치게 된다.
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/.next": true,
+    "**/.turbo": true,
+    "**/pnpm-lock.yaml": true,
+    "docs/design-contexts": true
+  },
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/dist/**": true,
+    "**/.next/**": true,
+    "**/.turbo/**": true
+  },
+  "files.exclude": {
+    "**/.turbo": true
+  },
+
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+
+  // 이 저장소는 한국어 주석이 기본이다. 영어 사전에 걸려 물결이 도배되지 않게 한다.
+  "cSpell.enabled": false,
+
+  "npm.packageManager": "pnpm",
+  "debug.javascript.autoAttachFilter": "smart",
+  "debug.internalConsoleOptions": "neverOpen",
+  "terminal.integrated.scrollback": 20000
+}

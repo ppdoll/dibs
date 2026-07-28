@@ -1,0 +1,1392 @@
+{
+  "context": "Bounded Context: **Selection & Finalization (선정·확정)** of the Dibs platform.\n\nOwns everything that happens *after* the application window closes: freezing an immutable ranking snapshot, auto-preselecting top-N, letting the 파트너 manually override (add/remove/reorder), finalizing the 확정 명단, auditing every override, notifying selected/not-selected users, CSV export, and manual backfill (추가 선정) when a confirmed slot is later canceled.\n\nBoundaries (what this context does NOT own):\n- Application creation, re-bidding, `lastBidAt` maintenance, soft-close deadline extension → **Application & Bidding** context. This context READS `Application` (applicationId, userId, amount, lastBidAt, appliedAt, status) and treats it as immutable input after `rankingBasisAt`.\n- Deposit ledger, hold timers, PG execution, refunds → **Deposit Hold** context. This context READS `depositStatus` and WRITES a refund-eligibility signal (`SelectionOutcomeEvent`) that the Deposit context consumes.\n- Event lifecycle, capacity, deadline, visibility policy → **Event** context (read-only here, except `Event.selectionState` mirror field).\n- Actual delivery of 쪽지/email → **Notification** context. This context only emits idempotent dispatch rows/triggers.\n\nKey invariants of this context:\n1. Ranking is **computed once** at `rankingBasisAt = effectiveDeadlineAt + depositWindowMinutes` (KST-aware, stored UTC) and frozen into `RankSnapshotEntry`. All later screens read the snapshot, never a live re-query. This is what makes \"a user who bids 1 minute before the deadline still gets their full deposit window\" work, and what makes partner edits reproducible/auditable.\n2. Ranking key (BID): `amount DESC, lastBidAt ASC, appliedAt ASC, applicationId ASC`. INSTANT: `depositConfirmedAt ASC (or claimedAt ASC when DEPOSIT_HOLD_ENABLED=false), applicationId ASC`.\n3. Auto-preselect is a *suggestion*; the partner's edits are authoritative and every divergence from the snapshot is recorded as an override with an actor, timestamp and (configurably) a reason.\n4. Overbooking is expected. Finalization never fights concurrency with locks — the round row carries `version` + `rankingSnapshotHash` and mutations use optimistic concurrency + an `Idempotency-Key`.\n5. Information leakage is a first-class threat: until `SelectionRound.status = FINALIZED` **and** the user's own notification is dispatched, no endpoint may reveal amounts, ranks, cutoff, or even \"you are currently preselected\".\n\nFeature flags respected: `DEPOSIT_HOLD_ENABLED=false` in MVP → deposit-based exclusion filters are no-ops (every non-canceled application is rank-eligible), but all columns/state are modeled now.\n\nServerless notes: no long-running jobs. Round opening + auto-preselect are triggered by (a) Vercel Cron sweeper `/api/cron/selection-open` every minute, and (b) lazy-on-read when a partner opens the selection screen after `rankingBasisAt`. Both run inside a single Postgres transaction and are idempotent via `@@unique([eventId, roundNo])`.",
+  "summary": "Design for the Selection & Finalization context: an immutable per-round ranking snapshot frozen at (deadline + deposit window), auto-preselect of top-N, fully audited partner overrides, an optimistic-concurrency finalize that emits selected/not-selected notifications exactly once, CSV export with PII masking levels, and manual-only backfill (추가 선정) through explicit round-2+ promotions rather than automatic waitlist succession. Ranking uses amount DESC then lastBidAt ASC then appliedAt ASC then applicationId ASC for BID, and deposit/claim time ASC for INSTANT overbooking reconciliation. Every user-visible surface is sealed until finalize to prevent rank/cutoff leakage.",
+  "entities": [
+    {
+      "name": "SelectionPolicy",
+      "description": "Per-event configuration for how selection behaves. 1:1 with Event, created lazily with defaults on first round open. Owned by this context so the Event context stays lean.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "eventId",
+          "type": "String @unique",
+          "notes": "FK → Event.id, onDelete: Cascade"
+        },
+        {
+          "name": "autoPreselectEnabled",
+          "type": "Boolean @default(true)",
+          "notes": "If false the round opens with an empty draft and the partner picks everyone manually."
+        },
+        {
+          "name": "tieBreakPolicy",
+          "type": "TieBreakPolicy @default(LAST_BID_AT_ASC)",
+          "notes": "Reserved for future policies (e.g. RANDOM_WITHIN_TIE). MVP only supports LAST_BID_AT_ASC."
+        },
+        {
+          "name": "requireReasonOnOverride",
+          "type": "Boolean @default(true)",
+          "notes": "When true, adding a below-cutoff applicant or removing an above-cutoff one requires overrideReason (min 2 chars, max 500)."
+        },
+        {
+          "name": "allowSelectOverCapacity",
+          "type": "Boolean @default(false)",
+          "notes": "If false, SELECTED count may not exceed capacitySnapshot + overCapacityTolerance."
+        },
+        {
+          "name": "overCapacityTolerance",
+          "type": "Int @default(0)",
+          "notes": "Extra seats the partner may knowingly confirm (INSTANT overbooking reconciliation sometimes honors the overshoot instead of cutting it)."
+        },
+        {
+          "name": "waitlistSize",
+          "type": "Int @default(0)",
+          "notes": "How many below-cutoff applicants are auto-marked WAITING as a backfill pool. 0 = no 예비 명단. WAITING is never shown to the user in MVP (see visibility rules)."
+        },
+        {
+          "name": "editAfterFinalizeWindowHours",
+          "type": "Int @default(72)",
+          "notes": "Partner may reopen/edit within this many hours after finalizedAt; Admin may always reopen."
+        },
+        {
+          "name": "maxReopenCount",
+          "type": "Int @default(3)",
+          "notes": "Anti-harassment: prevents notification spam by repeated finalize/reopen cycles."
+        },
+        {
+          "name": "exportMaskingLevel",
+          "type": "ExportMaskingLevel @default(MASKED)",
+          "notes": "MASKED = phone/email partially masked; FULL requires event-level PII consent flag and is Admin-grantable only."
+        },
+        {
+          "name": "notifyOnFinalize",
+          "type": "Boolean @default(true)"
+        },
+        {
+          "name": "notifyNotSelected",
+          "type": "Boolean @default(true)",
+          "notes": "Some partners prefer silence for 미선정; if false, non-selected users only see the result in 내 신청 내역."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt"
+        }
+      ],
+      "relations": [
+        "Event 1—1 SelectionPolicy"
+      ]
+    },
+    {
+      "name": "SelectionRound",
+      "description": "One finalization pass over an event. roundNo=1 is the initial 확정; roundNo>=2 are 결원 보충(추가 선정) rounds created manually by the partner after cancellations. Holds the frozen ranking metadata.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "eventId",
+          "type": "String",
+          "notes": "FK → Event.id"
+        },
+        {
+          "name": "roundNo",
+          "type": "Int",
+          "notes": "@@unique([eventId, roundNo]) — the idempotency anchor for cron vs. lazy-open races."
+        },
+        {
+          "name": "status",
+          "type": "SelectionRoundStatus @default(PENDING)"
+        },
+        {
+          "name": "eventMode",
+          "type": "EventMode",
+          "notes": "Copied from Event at open time; determines the ranking ORDER BY. Prevents a later event edit from changing history."
+        },
+        {
+          "name": "capacitySnapshot",
+          "type": "Int",
+          "notes": "Event.capacity (정원) at open time. Round 2+ stores the REMAINING seats, not the original capacity."
+        },
+        {
+          "name": "remainingSeats",
+          "type": "Int",
+          "notes": "capacitySnapshot minus currently SELECTED-and-not-revoked from prior rounds. Recomputed on open."
+        },
+        {
+          "name": "effectiveDeadlineAt",
+          "type": "DateTime",
+          "notes": "Event deadline AFTER all soft-close extensions. Copied at open."
+        },
+        {
+          "name": "depositWindowMinutes",
+          "type": "Int",
+          "notes": "Copied from event deposit config (0 when DEPOSIT_HOLD_ENABLED=false)."
+        },
+        {
+          "name": "rankingBasisAt",
+          "type": "DateTime",
+          "notes": "= effectiveDeadlineAt + depositWindowMinutes. A round may not be opened before now() >= rankingBasisAt. Stored UTC; all UI renders Asia/Seoul."
+        },
+        {
+          "name": "rankingComputedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "rankingSnapshotHash",
+          "type": "String?",
+          "notes": "sha256 over the ordered tuple list `${applicationId}:${amount}:${lastBidAt.toISOString()}` joined by '\\n'. Sent to the client and echoed back on finalize to detect stale-tab edits."
+        },
+        {
+          "name": "eligibleCount",
+          "type": "Int @default(0)",
+          "notes": "Applications that entered the snapshot (신청 47명 → e.g. 44 eligible after deposit expiry/cancel)."
+        },
+        {
+          "name": "excludedCount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "autoPreselectedCount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "overrideCount",
+          "type": "Int @default(0)",
+          "notes": "Denormalized count of Selection rows with isOverride=true; shown as '직접 조정 N건' on the finalize confirm modal."
+        },
+        {
+          "name": "cutoffAmount",
+          "type": "Int?",
+          "notes": "Amount of the last within-capacity entry in the snapshot (BID only). NEVER exposed on user endpoints unless Event.visibility.showCutoffAmount is later enabled."
+        },
+        {
+          "name": "cutoffLastBidAt",
+          "type": "DateTime?",
+          "notes": "Needed to describe the cutoff precisely when the cutoff amount is tied across the boundary."
+        },
+        {
+          "name": "hasCutoffTie",
+          "type": "Boolean @default(false)",
+          "notes": "True when the applicant at rank capacity+1 has the same amount as the applicant at rank capacity. Surfaces a warning banner to the partner."
+        },
+        {
+          "name": "finalizedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "finalizedByUserId",
+          "type": "String?"
+        },
+        {
+          "name": "reopenCount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "lastReopenedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "canceledAt",
+          "type": "DateTime?",
+          "notes": "Set when the event itself is canceled; round becomes read-only."
+        },
+        {
+          "name": "notifyDispatchedAt",
+          "type": "DateTime?",
+          "notes": "Guards against double notification on re-finalize."
+        },
+        {
+          "name": "partnerMemo",
+          "type": "String?",
+          "notes": "Internal note, max 1000 chars, never shown to users."
+        },
+        {
+          "name": "version",
+          "type": "Int @default(0)",
+          "notes": "Optimistic lock: every mutating endpoint does `WHERE id = ? AND version = ?` then `version = version + 1`."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt"
+        }
+      ],
+      "relations": [
+        "Event 1—N SelectionRound",
+        "SelectionRound 1—N RankSnapshotEntry",
+        "SelectionRound 1—N Selection",
+        "SelectionRound 1—N SelectionChangeLog",
+        "SelectionRound 1—N SelectionExport"
+      ]
+    },
+    {
+      "name": "RankSnapshotEntry",
+      "description": "Immutable frozen ranking row. Written exactly once when the round opens; never UPDATEd. This is the audit-grade record of 'who applied for how much, and in what order'.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "selectionRoundId",
+          "type": "String"
+        },
+        {
+          "name": "applicationId",
+          "type": "String",
+          "notes": "@@unique([selectionRoundId, applicationId])"
+        },
+        {
+          "name": "userId",
+          "type": "String",
+          "notes": "Denormalized for export/notification without joining Application."
+        },
+        {
+          "name": "displayName",
+          "type": "String",
+          "notes": "Snapshot of the user's nickname at ranking time, so a later nickname change doesn't rewrite the confirmed list."
+        },
+        {
+          "name": "amount",
+          "type": "Int",
+          "notes": "신청 금액 in KRW, 0 ~ 2147483647. For INSTANT this is the event's fixed price."
+        },
+        {
+          "name": "lastBidAt",
+          "type": "DateTime",
+          "notes": "THE tie-break key: the moment the applicant reached this amount (updated on raise), not the original apply time."
+        },
+        {
+          "name": "appliedAt",
+          "type": "DateTime",
+          "notes": "Original application creation time; 3rd-level tie-break and shown in the partner table."
+        },
+        {
+          "name": "rebidCount",
+          "type": "Int @default(0)",
+          "notes": "From the bid history; lets the partner see 'raised 3 times'."
+        },
+        {
+          "name": "depositStatus",
+          "type": "DepositStatus",
+          "notes": "Shared enum from the Deposit context. NOT_REQUIRED when the flag is off."
+        },
+        {
+          "name": "depositPaidAmount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "depositConfirmedAt",
+          "type": "DateTime?",
+          "notes": "INSTANT primary sort key."
+        },
+        {
+          "name": "rankNo",
+          "type": "Int",
+          "notes": "1-based dense rank position after full ordering. @@unique([selectionRoundId, rankNo]). Excluded entries get rankNo = null? No — excluded rows are stored with rankNo = -1 * sequence to keep the unique index usable; prefer a separate nullable column, see notes."
+        },
+        {
+          "name": "isEligible",
+          "type": "Boolean",
+          "notes": "False for excluded rows; excluded rows carry rankNo = null and are ordered by excludedAt."
+        },
+        {
+          "name": "excludedReason",
+          "type": "SelectionExclusionReason?",
+          "notes": "DEPOSIT_EXPIRED / USER_CANCELED / DEPOSIT_UNPAID / BLOCKED_USER / ADMIN_DISQUALIFIED / DUPLICATE_ACCOUNT."
+        },
+        {
+          "name": "tieGroupKey",
+          "type": "String?",
+          "notes": "`${amount}` when 2+ eligible entries share the amount; used to render the '동일 금액' grouping and the tie warning."
+        },
+        {
+          "name": "tieOrdinal",
+          "type": "Int?",
+          "notes": "Position within the tie group after lastBidAt ordering (1 = named that amount first)."
+        },
+        {
+          "name": "withinCapacity",
+          "type": "Boolean",
+          "notes": "rankNo <= remainingSeats. Drives auto-preselect and the cutoff line in the UI."
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "SelectionRound 1—N RankSnapshotEntry",
+        "Application 1—N RankSnapshotEntry (one per round)"
+      ]
+    },
+    {
+      "name": "Selection",
+      "description": "The mutable working set = the 확정 명단 under construction, and after finalize the authoritative outcome per applicant. Exactly one row per (round, application) for every ELIGIBLE snapshot entry — including the ones that end up NOT_SELECTED, so that not-selected notifications and refund signals have a durable anchor.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "selectionRoundId",
+          "type": "String"
+        },
+        {
+          "name": "eventId",
+          "type": "String",
+          "notes": "Denormalized for `GET /me/selections` and partner dashboards; indexed."
+        },
+        {
+          "name": "applicationId",
+          "type": "String",
+          "notes": "@@unique([selectionRoundId, applicationId]); also @@index([applicationId]) for the user-facing lookup across rounds."
+        },
+        {
+          "name": "userId",
+          "type": "String",
+          "notes": "@@index([userId, eventId])"
+        },
+        {
+          "name": "status",
+          "type": "SelectionStatus @default(CANDIDATE)"
+        },
+        {
+          "name": "source",
+          "type": "SelectionSource",
+          "notes": "How the CURRENT status was reached: AUTO_RANK / PARTNER_ADD / PARTNER_REMOVE / PARTNER_PROMOTE / ADMIN_OVERRIDE / SYSTEM_REVOKE."
+        },
+        {
+          "name": "rankNoAtSnapshot",
+          "type": "Int?",
+          "notes": "Copied from RankSnapshotEntry.rankNo for fast sorting; null for entries promoted from a prior round."
+        },
+        {
+          "name": "amountAtSelection",
+          "type": "Int",
+          "notes": "확정 금액. Frozen at finalize; the amount actually charged/honored. Diverges from the snapshot amount only if an Admin corrects a dispute (logged)."
+        },
+        {
+          "name": "position",
+          "type": "Int?",
+          "notes": "Partner-controlled display order in the confirmed list (좌석 배정/입장 순서 등). Defaults to rankNoAtSnapshot. Sparse ints (10,20,30) so reorder is a single UPDATE."
+        },
+        {
+          "name": "isOverride",
+          "type": "Boolean @default(false)",
+          "notes": "True when the final status contradicts the snapshot's withinCapacity. Computed on every mutation, not trusted from the client."
+        },
+        {
+          "name": "overrideReason",
+          "type": "String?",
+          "notes": "Required when requireReasonOnOverride && isOverride. Max 500 chars. Visible to Admin and to the partner, never to the user."
+        },
+        {
+          "name": "preselectedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "selectedAt",
+          "type": "DateTime?",
+          "notes": "Set at finalize (or at promote for round 2+)."
+        },
+        {
+          "name": "notifiedAt",
+          "type": "DateTime?",
+          "notes": "When the selected/not-selected 쪽지+email was dispatched. Gates user visibility of the result."
+        },
+        {
+          "name": "revokedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "revokeReason",
+          "type": "SelectionRevokeReason?",
+          "notes": "USER_CANCELED / NO_SHOW / PARTNER_REMOVED / PAYMENT_FAILED / ADMIN_ACTION / EVENT_CANCELED."
+        },
+        {
+          "name": "revokedByRole",
+          "type": "ActorRole?"
+        },
+        {
+          "name": "promotedFromSelectionId",
+          "type": "String?",
+          "notes": "Self-relation: the revoked Selection whose seat this row backfilled. Gives a full lineage chain for 추가 선정."
+        },
+        {
+          "name": "backfilledBySelectionId",
+          "type": "String?",
+          "notes": "Inverse pointer, set on the revoked row when a replacement is confirmed."
+        },
+        {
+          "name": "refundSignaledAt",
+          "type": "DateTime?",
+          "notes": "When this context told the Deposit context 'this deposit is refundable' (NOT_SELECTED or revoked-by-partner)."
+        },
+        {
+          "name": "version",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        },
+        {
+          "name": "updatedAt",
+          "type": "DateTime @updatedAt"
+        }
+      ],
+      "relations": [
+        "SelectionRound 1—N Selection",
+        "Selection 0..1—0..1 Selection (promotedFrom / backfilledBy self-relation)",
+        "Application 1—N Selection (across rounds)",
+        "User 1—N Selection"
+      ]
+    },
+    {
+      "name": "SelectionChangeLog",
+      "description": "Append-only audit trail. Every state-changing operation in this context writes exactly one row inside the same transaction. Never UPDATEd, never DELETEd (Admin-only soft archive after 3 years).",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "selectionRoundId",
+          "type": "String",
+          "notes": "@@index([selectionRoundId, createdAt])"
+        },
+        {
+          "name": "selectionId",
+          "type": "String?"
+        },
+        {
+          "name": "applicationId",
+          "type": "String?"
+        },
+        {
+          "name": "action",
+          "type": "SelectionChangeAction"
+        },
+        {
+          "name": "actorRole",
+          "type": "ActorRole",
+          "notes": "PARTNER / ADMIN / SYSTEM"
+        },
+        {
+          "name": "actorUserId",
+          "type": "String?",
+          "notes": "Null only for SYSTEM (cron)."
+        },
+        {
+          "name": "beforeStatus",
+          "type": "SelectionStatus?"
+        },
+        {
+          "name": "afterStatus",
+          "type": "SelectionStatus?"
+        },
+        {
+          "name": "diff",
+          "type": "Json?",
+          "notes": "{ field: [before, after] } for non-status changes (position, amountAtSelection, overrideReason)."
+        },
+        {
+          "name": "reason",
+          "type": "String?"
+        },
+        {
+          "name": "batchSize",
+          "type": "Int?",
+          "notes": "For batch ops, one summary row + N detail rows sharing correlationId."
+        },
+        {
+          "name": "correlationId",
+          "type": "String",
+          "notes": "Ties a batch/finalize's rows together."
+        },
+        {
+          "name": "requestId",
+          "type": "String",
+          "notes": "Client Idempotency-Key. @@unique([selectionRoundId, requestId]) → replaying a request returns the prior result instead of double-applying."
+        },
+        {
+          "name": "ipHash",
+          "type": "String?",
+          "notes": "sha256(ip + serverSalt); never store raw IP."
+        },
+        {
+          "name": "userAgent",
+          "type": "String?"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "SelectionRound 1—N SelectionChangeLog",
+        "Selection 1—N SelectionChangeLog"
+      ]
+    },
+    {
+      "name": "SelectionExport",
+      "description": "Record of every CSV export of a confirmed/ranked list. Exports contain applicant PII, so each one is logged and the file is short-lived.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "selectionRoundId",
+          "type": "String"
+        },
+        {
+          "name": "requestedByUserId",
+          "type": "String"
+        },
+        {
+          "name": "requestedByRole",
+          "type": "ActorRole"
+        },
+        {
+          "name": "scope",
+          "type": "ExportScope",
+          "notes": "CONFIRMED_ONLY / FULL_RANKING / NOT_SELECTED_ONLY"
+        },
+        {
+          "name": "format",
+          "type": "ExportFormat @default(CSV)"
+        },
+        {
+          "name": "maskingLevel",
+          "type": "ExportMaskingLevel"
+        },
+        {
+          "name": "filter",
+          "type": "Json?",
+          "notes": "{ status?, minAmount?, maxAmount?, q? } echoed for audit."
+        },
+        {
+          "name": "rowCount",
+          "type": "Int"
+        },
+        {
+          "name": "blobUrl",
+          "type": "String?",
+          "notes": "Vercel Blob, private, signed URL."
+        },
+        {
+          "name": "blobPathname",
+          "type": "String?"
+        },
+        {
+          "name": "expiresAt",
+          "type": "DateTime",
+          "notes": "now() + 24h; a Vercel Cron job deletes the blob and nulls blobUrl."
+        },
+        {
+          "name": "downloadCount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "SelectionRound 1—N SelectionExport"
+      ]
+    },
+    {
+      "name": "SelectionNotificationDispatch",
+      "description": "Idempotency ledger between this context and the Notification context. One row per (selection, trigger). Guarantees a user is never told '선정되었습니다' twice for the same round.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "selectionRoundId",
+          "type": "String"
+        },
+        {
+          "name": "selectionId",
+          "type": "String"
+        },
+        {
+          "name": "userId",
+          "type": "String"
+        },
+        {
+          "name": "trigger",
+          "type": "NotificationTrigger",
+          "notes": "Shared enum. Values used here: SELECTED, NOT_SELECTED, SELECTION_PROMOTED, SELECTION_REVOKED, SELECTION_LIST_UPDATED, EVENT_CANCELED."
+        },
+        {
+          "name": "dedupeKey",
+          "type": "String @unique",
+          "notes": "`sel:${selectionId}:${trigger}` — a unique-violation on insert is the ONLY concurrency control needed; it is caught and swallowed."
+        },
+        {
+          "name": "channels",
+          "type": "NotificationChannel[]",
+          "notes": "[IN_APP, EMAIL]"
+        },
+        {
+          "name": "status",
+          "type": "DispatchStatus @default(QUEUED)",
+          "notes": "QUEUED / SENT / FAILED / SKIPPED"
+        },
+        {
+          "name": "payload",
+          "type": "Json",
+          "notes": "Rendered variables only (eventTitle, amount, serviceDate). Never rank or cutoff for user-bound messages."
+        },
+        {
+          "name": "attemptCount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "lastError",
+          "type": "String?"
+        },
+        {
+          "name": "sentAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())"
+        }
+      ],
+      "relations": [
+        "Selection 1—N SelectionNotificationDispatch"
+      ]
+    },
+    {
+      "name": "SelectionOutcomeEvent",
+      "description": "Outbox row consumed by the Deposit Hold context (refund eligibility) and analytics. Written in the same transaction as the state change; drained by a Vercel Cron worker. Keeps the two contexts decoupled without needing a message broker.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "String @id @default(cuid())"
+        },
+        {
+          "name": "selectionRoundId",
+          "type": "String"
+        },
+        {
+          "name": "selectionId",
+          "type": "String"
+        },
+        {
+          "name": "applicationId",
+          "type": "String"
+        },
+        {
+          "name": "userId",
+          "type": "String"
+        },
+        {
+          "name": "type",
+          "type": "SelectionOutcomeType",
+          "notes": "CONFIRMED / NOT_SELECTED_REFUNDABLE / REVOKED_REFUNDABLE / REVOKED_FORFEIT / PROMOTED"
+        },
+        {
+          "name": "amount",
+          "type": "Int"
+        },
+        {
+          "name": "depositAmount",
+          "type": "Int @default(0)"
+        },
+        {
+          "name": "processedAt",
+          "type": "DateTime?"
+        },
+        {
+          "name": "createdAt",
+          "type": "DateTime @default(now())",
+          "notes": "@@index([processedAt, createdAt]) for the drain query."
+        }
+      ],
+      "relations": [
+        "Selection 1—N SelectionOutcomeEvent"
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "name": "SelectionRoundStatus",
+      "values": [
+        "PENDING",
+        "RANKING_READY",
+        "DRAFT",
+        "FINALIZED",
+        "REOPENED",
+        "CANCELED"
+      ]
+    },
+    {
+      "name": "SelectionStatus",
+      "values": [
+        "CANDIDATE",
+        "PRESELECTED",
+        "SELECTED",
+        "WAITING",
+        "NOT_SELECTED",
+        "REVOKED"
+      ]
+    },
+    {
+      "name": "SelectionSource",
+      "values": [
+        "AUTO_RANK",
+        "PARTNER_ADD",
+        "PARTNER_REMOVE",
+        "PARTNER_PROMOTE",
+        "PARTNER_REORDER",
+        "ADMIN_OVERRIDE",
+        "SYSTEM_REVOKE",
+        "SYSTEM_EVENT_CANCELED"
+      ]
+    },
+    {
+      "name": "SelectionChangeAction",
+      "values": [
+        "ROUND_OPENED",
+        "RANKING_COMPUTED",
+        "AUTO_PRESELECT",
+        "ADD",
+        "REMOVE",
+        "REORDER",
+        "SET_AMOUNT",
+        "FINALIZE",
+        "REOPEN",
+        "PROMOTE",
+        "REVOKE",
+        "ROUND_CANCELED",
+        "EXPORT",
+        "NOTIFY_DISPATCHED"
+      ]
+    },
+    {
+      "name": "SelectionExclusionReason",
+      "values": [
+        "DEPOSIT_UNPAID",
+        "DEPOSIT_EXPIRED",
+        "USER_CANCELED",
+        "BLOCKED_USER",
+        "ADMIN_DISQUALIFIED",
+        "DUPLICATE_ACCOUNT",
+        "ALREADY_SELECTED_PRIOR_ROUND"
+      ]
+    },
+    {
+      "name": "SelectionRevokeReason",
+      "values": [
+        "USER_CANCELED",
+        "NO_SHOW",
+        "PARTNER_REMOVED",
+        "PAYMENT_FAILED",
+        "ADMIN_ACTION",
+        "EVENT_CANCELED"
+      ]
+    },
+    {
+      "name": "TieBreakPolicy",
+      "values": [
+        "LAST_BID_AT_ASC",
+        "APPLIED_AT_ASC",
+        "RANDOM_SEEDED"
+      ]
+    },
+    {
+      "name": "ExportScope",
+      "values": [
+        "CONFIRMED_ONLY",
+        "FULL_RANKING",
+        "NOT_SELECTED_ONLY",
+        "WAITING_ONLY"
+      ]
+    },
+    {
+      "name": "ExportFormat",
+      "values": [
+        "CSV"
+      ]
+    },
+    {
+      "name": "ExportMaskingLevel",
+      "values": [
+        "MASKED",
+        "FULL"
+      ]
+    },
+    {
+      "name": "SelectionOutcomeType",
+      "values": [
+        "CONFIRMED",
+        "NOT_SELECTED_REFUNDABLE",
+        "REVOKED_REFUNDABLE",
+        "REVOKED_FORFEIT",
+        "PROMOTED"
+      ]
+    },
+    {
+      "name": "ActorRole",
+      "values": [
+        "USER",
+        "PARTNER",
+        "ADMIN",
+        "SYSTEM"
+      ]
+    },
+    {
+      "name": "NotificationTrigger",
+      "values": [
+        "APPLIED",
+        "DEPOSIT_REQUIRED",
+        "DEPOSIT_CONFIRMED",
+        "HOLD_EXPIRED",
+        "REBID_ROLLBACK",
+        "SELECTED",
+        "NOT_SELECTED",
+        "SELECTION_PROMOTED",
+        "SELECTION_REVOKED",
+        "SELECTION_LIST_UPDATED",
+        "EVENT_CANCELED",
+        "DEADLINE_EXTENDED"
+      ]
+    },
+    {
+      "name": "DispatchStatus",
+      "values": [
+        "QUEUED",
+        "SENT",
+        "FAILED",
+        "SKIPPED"
+      ]
+    },
+    {
+      "name": "EventMode",
+      "values": [
+        "INSTANT",
+        "BID"
+      ]
+    },
+    {
+      "name": "DepositStatus",
+      "values": [
+        "NOT_REQUIRED",
+        "PENDING",
+        "PAID",
+        "EXPIRED",
+        "REFUND_PENDING",
+        "REFUNDED",
+        "FORFEITED"
+      ]
+    }
+  ],
+  "stateMachines": [
+    {
+      "entity": "SelectionRound",
+      "states": [
+        "PENDING",
+        "RANKING_READY",
+        "DRAFT",
+        "FINALIZED",
+        "REOPENED",
+        "CANCELED"
+      ],
+      "transitions": [
+        "PENDING → RANKING_READY : now() >= rankingBasisAt. Triggered by Vercel Cron (/api/cron/selection-open, every minute) OR lazily when the partner GETs the selection screen. Writes all RankSnapshotEntry rows + rankingSnapshotHash + cutoffAmount in one transaction. Idempotent via @@unique([eventId, roundNo]).",
+        "RANKING_READY → DRAFT : auto-preselect runs (or is skipped when autoPreselectEnabled=false, which still moves to DRAFT with zero PRESELECTED). Creates one Selection row per eligible entry: PRESELECTED for withinCapacity, WAITING for the next `waitlistSize` rows, CANDIDATE for the rest.",
+        "DRAFT → DRAFT : partner add/remove/reorder/re-run-auto-preselect. version increments each time.",
+        "DRAFT → FINALIZED : POST /finalize with matching expectedVersion + expectedSnapshotHash. All PRESELECTED → SELECTED, all CANDIDATE → NOT_SELECTED, WAITING stays WAITING. Emits notifications + outcome events.",
+        "FINALIZED → REOPENED : partner within editAfterFinalizeWindowHours and reopenCount < maxReopenCount, or Admin any time. Round becomes editable again; already-notified users are NOT un-notified.",
+        "REOPENED → FINALIZED : re-finalize. Only DELTAS notify (SELECTION_REVOKED for newly removed, SELECTED for newly added, SELECTION_LIST_UPDATED to unchanged selected users only if the partner ticks 'notify everyone').",
+        "REOPENED → DRAFT : never; REOPENED behaves as DRAFT but keeps the flag so the UI shows '확정 후 수정 중' and the audit distinguishes the two.",
+        "FINALIZED → (new SelectionRound roundNo+1, status PENDING→RANKING_READY immediately) : partner presses 추가 선정 after revocations. remainingSeats = capacity − live SELECTED. Snapshot for round N+1 is a re-projection of round 1's snapshot minus already-SELECTED/REVOKED-with-cause users (ALREADY_SELECTED_PRIOR_ROUND exclusion), preserving original rank order.",
+        "ANY → CANCELED : Event canceled by partner/admin. Round is frozen read-only, all non-REVOKED Selections → REVOKED(EVENT_CANCELED), EVENT_CANCELED notifications + full refund signals emitted."
+      ]
+    },
+    {
+      "entity": "Selection",
+      "states": [
+        "CANDIDATE",
+        "PRESELECTED",
+        "SELECTED",
+        "WAITING",
+        "NOT_SELECTED",
+        "REVOKED"
+      ],
+      "transitions": [
+        "(created) → CANDIDATE : eligible but outside capacity and outside the waitlist window.",
+        "(created) → PRESELECTED : withinCapacity=true at auto-preselect. source=AUTO_RANK.",
+        "(created) → WAITING : rank in (remainingSeats, remainingSeats + waitlistSize]. source=AUTO_RANK.",
+        "CANDIDATE|WAITING → PRESELECTED : partner adds. source=PARTNER_ADD, isOverride=true (snapshot said outside capacity), overrideReason required if configured.",
+        "PRESELECTED → CANDIDATE : partner removes before finalize. source=PARTNER_REMOVE, isOverride = (snapshot said withinCapacity).",
+        "PRESELECTED → SELECTED : finalize. selectedAt=now().",
+        "CANDIDATE → NOT_SELECTED : finalize.",
+        "WAITING → WAITING : finalize (kept as backfill pool; user is told nothing rank-related — see Korean copy).",
+        "SELECTED → REVOKED : user cancels (USER_CANCELED), partner removes after finalize (PARTNER_REMOVED), no-show, payment failure, or admin action. revokedAt/revokeReason/revokedByRole set. Emits SELECTION_REVOKED + refund/forfeit outcome.",
+        "WAITING|NOT_SELECTED → SELECTED : manual promotion (추가 선정) by the partner. source=PARTNER_PROMOTE, promotedFromSelectionId set to the revoked seat when the partner picked one, selectedAt=now(). NEVER automatic.",
+        "NOT_SELECTED → PRESELECTED : only inside a REOPENED round; on re-finalize becomes SELECTED.",
+        "SELECTED → SELECTED (amount edited) : Admin-only dispute correction; logged with SET_AMOUNT diff.",
+        "REVOKED → (terminal) : a revoked row is never reactivated. Re-including the same user means creating a new Selection row in a later round."
+      ]
+    }
+  ],
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/api/partner/events/:eventId/selection/rounds",
+      "description": "List all selection rounds for the event with summary counters (eligibleCount, selectedCount, revokedCount, remainingSeats, status, finalizedAt). Used by the 선정 관리 tab header.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/partner/events/:eventId/selection/rounds",
+      "description": "Open a round. Body: { roundNo?: number }. Defaults to next roundNo. 409 SELECTION_NOT_READY if now() < rankingBasisAt. Computes and freezes the RankSnapshotEntry set, then auto-preselects if enabled. Idempotent: re-calling returns the existing round (200 instead of 201).",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId",
+      "description": "Round detail: status, capacitySnapshot, remainingSeats, cutoffAmount, hasCutoffTie, rankingSnapshotHash, version, overrideCount, policy. The hash+version must be echoed back on every mutation.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/ranking",
+      "description": "Paginated ranked list — the '누가 얼마에 신청했는지' table. Query: cursor, size(<=100), status[], q(name), minAmount, maxAmount, includeExcluded, sort(rank|amount|lastBidAt|appliedAt|position). Returns rankNo, displayName, maskedContact, amount, lastBidAt, appliedAt, rebidCount, depositStatus, tieGroupKey, tieOrdinal, withinCapacity, selection{status, isOverride, overrideReason, position}. Keyset pagination on (rankNo, id).",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/auto-preselect",
+      "description": "Re-run top-N preselection. Body: { mode: 'RESET' | 'FILL_ONLY', expectedVersion }. RESET discards all partner edits (requires confirm=true and logs a single AUTO_PRESELECT entry with the discarded diff). FILL_ONLY only tops up empty seats from the highest-ranked CANDIDATEs without touching existing PRESELECTED rows.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/selections/:applicationId",
+      "description": "Single add/remove/edit. Body: { action: 'ADD'|'REMOVE', reason?, expectedVersion }. Requires header Idempotency-Key. 409 on version mismatch with the current server state so the client can re-render.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/selections/batch",
+      "description": "Batch edit — the primary write path from the UI (checkbox multi-select). Body: { ops: [{applicationId, action, reason?}], expectedVersion, expectedSnapshotHash }. All-or-nothing in one transaction; writes one summary + N detail SelectionChangeLog rows sharing correlationId. Max 500 ops.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/reorder",
+      "description": "Body: { orderedApplicationIds: string[], expectedVersion }. Rewrites Selection.position in sparse increments of 10. Affects display/entry order only, never who is selected.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/finalize",
+      "description": "Confirm the list (명단 확정하기). Body: { expectedVersion, expectedSnapshotHash, notifySelected: boolean, notifyNotSelected: boolean, acknowledgeOverCapacity?: boolean }. Validates capacity/override rules, transitions statuses, enqueues SelectionNotificationDispatch + SelectionOutcomeEvent rows, sets Event.selectionState=FINALIZED. Returns a diff summary of what changed and who will be notified.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/reopen",
+      "description": "Reopen a finalized round for editing (명단 다시 수정하기). Body: { reason }. Partner allowed only within editAfterFinalizeWindowHours and while reopenCount < maxReopenCount; Admin unrestricted. Does not retract already-sent notifications.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/selections/:selectionId/revoke",
+      "description": "Revoke a confirmed seat after finalize (선정 취소). Body: { reason: SelectionRevokeReason, memo?, refundDeposit: boolean }. Emits SELECTION_REVOKED notification + REVOKED_REFUNDABLE/REVOKED_FORFEIT outcome. Increases remainingSeats for the next round.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/promote",
+      "description": "Manual backfill (추가 선정). Body: { applicationIds: string[], replacesSelectionIds?: string[], reason, expectedVersion }. Only valid on a FINALIZED round with remainingSeats > 0 (or with acknowledgeOverCapacity). Immediately SELECTED + SELECTION_PROMOTED notification — no separate finalize step, because the user needs to know now.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/backfill-candidates",
+      "description": "Ranked list of promotion candidates: WAITING first, then NOT_SELECTED by original rank, excluding users who canceled their application or whose deposit expired. Returns a 'staleness' flag when the application was created more than N days ago so the partner knows to message first.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/exports",
+      "description": "Create a CSV export. Body: { scope, filter?, maskingLevel? }. Generates the file in-request (streaming, <=10k rows) to Vercel Blob, logs a SelectionExport row, returns a signed URL valid 24h. FULL masking requires ADMIN. Rate limit 10/hour/partner.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/exports",
+      "description": "List past exports of this round (who exported what, when) — visible to the partner and to Admin for PII audit.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/partner/events/:eventId/selection/rounds/:roundId/audit",
+      "description": "Paginated SelectionChangeLog for the round, with actor, action, before/after and reason. Rendered as the '변경 이력' timeline.",
+      "roles": [
+        "PARTNER(owner)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/me/selections",
+      "description": "The user's own results across events. Query: status[], cursor. Returns ONLY { eventSummary, myAmount, status(확정/미선정/취소됨/발표 전), selectedAt, serviceDate }. Never rankNo, never cutoffAmount, never other applicants' data. Rows whose round is not FINALIZED (or whose notifiedAt is null) are collapsed to status='발표 전'.",
+      "roles": [
+        "USER",
+        "PARTNER(as applicant)",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/events/:eventId/selection/my-result",
+      "description": "Single-event result for the logged-in applicant, used by the event detail page after the deadline. Returns { state: 'BEFORE_ANNOUNCE'|'SELECTED'|'NOT_SELECTED'|'REVOKED', myAmount, announcedAt }. Returns BEFORE_ANNOUNCE until the round is FINALIZED AND this user's dispatch row exists.",
+      "roles": [
+        "USER",
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/events/:eventId/selection/summary",
+      "description": "Public post-deadline summary: { capacity, applicantCount, ratio, announced: boolean, announcedAt }. Deliberately excludes amounts, cutoff and names. Cached 30s.",
+      "roles": [
+        "PUBLIC"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/selection/rounds",
+      "description": "Cross-event operational view: rounds stuck in RANKING_READY/DRAFT past their rankingBasisAt, rounds with high overrideCount, rounds with failed notification dispatches. Query: status[], overdueOnly, partnerId, cursor.",
+      "roles": [
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/admin/selection/rounds/:roundId/force-finalize",
+      "description": "Admin finalizes a round a partner has abandoned (e.g. 72h past deadline with no action). Body: { reason, useAutoRanking: boolean }. Fully audited as ADMIN_OVERRIDE.",
+      "roles": [
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/admin/selection/rounds/:roundId/recompute-ranking",
+      "description": "Destructive repair tool for data-integrity incidents only. Requires the round to be non-FINALIZED or an explicit force flag; archives the previous snapshot into SelectionChangeLog.diff before rewriting.",
+      "roles": [
+        "ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/cron/selection-open",
+      "description": "Vercel Cron (every minute). Finds events whose rankingBasisAt has passed with no round yet, opens the round and runs auto-preselect. Batched (<=50 events/run) to stay inside the serverless time budget. Protected by CRON_SECRET header.",
+      "roles": [
+        "SYSTEM"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/cron/selection-outbox",
+      "description": "Vercel Cron (every minute). Drains SelectionOutcomeEvent to the Deposit context and SelectionNotificationDispatch(QUEUED) to Resend/쪽지. At-least-once with dedupeKey making it effectively exactly-once.",
+      "roles": [
+        "SYSTEM"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/cron/selection-export-gc",
+      "description": "Vercel Cron (hourly). Deletes expired export blobs and nulls blobUrl.",
+      "roles": [
+        "SYSTEM"
+      ]
+    }
+  ],
+  "businessRules": [
+    "BR-01 Ranking basis time: rankingBasisAt = effectiveDeadlineAt + depositWindowMinutes, where effectiveDeadlineAt already includes every soft-close extension. No round may be opened before this instant; the API returns 409 SELECTION_NOT_READY with the remaining seconds so the UI can show a countdown.",
+    "BR-02 BID ordering (canonical SQL): ORDER BY amount DESC, lastBidAt ASC, appliedAt ASC, applicationId ASC. The 3rd and 4th keys exist purely to make the order total and deterministic — lastBidAt collisions at millisecond precision are possible on batched writes.",
+    "BR-03 INSTANT ordering: ORDER BY COALESCE(depositConfirmedAt, claimedAt) ASC, applicationId ASC. When DEPOSIT_HOLD_ENABLED=false this degenerates to pure 선착순 by claimedAt. Amount is identical for everyone, so amount is not a sort key.",
+    "BR-04 Tie semantics are strictly 'who named that amount first': lastBidAt is the raise time, NOT appliedAt. A user who applied at 10:00 for 50,000 and raised to 80,000 at 14:00 loses a tie at 80,000 to a user who applied at 12:00 directly for 80,000.",
+    "BR-05 Eligibility filter for the snapshot: application.status must be VALID (or PENDING_DEPOSIT with a still-open window at rankingBasisAt — impossible by construction since the window closes at exactly that instant). Excluded rows are still WRITTEN to RankSnapshotEntry with isEligible=false and an excludedReason, so the partner can see 'why isn't X in the list' without a support ticket.",
+    "BR-06 With DEPOSIT_HOLD_ENABLED=false, depositStatus is NOT_REQUIRED for everyone and no application is excluded for deposit reasons. Flipping the flag on must not require a schema change.",
+    "BR-07 A raised-then-rolled-back bid (deposit shortfall unpaid) enters the snapshot at the ROLLED-BACK amount with the lastBidAt of the last fully-deposited amount. The Application context is responsible for having already rolled it back before rankingBasisAt; this context reads whatever the row says and never re-derives it.",
+    "BR-08 The snapshot is immutable. Any correction after the fact is a partner override or an Admin recompute, both fully audited. RankSnapshotEntry rows are never UPDATEd.",
+    "BR-09 Auto-preselect marks exactly min(remainingSeats, eligibleCount) rows PRESELECTED, strictly by rankNo. It never breaks a tie by 'fairness' — the deterministic order in BR-02 always produces a winner, and the partner is warned via hasCutoffTie.",
+    "BR-10 isOverride is computed server-side as (finalStatus is selected-ish) XOR (snapshot.withinCapacity). The client never sets it. overrideReason is mandatory when SelectionPolicy.requireReasonOnOverride and isOverride.",
+    "BR-11 Capacity guard at finalize: count(SELECTED) must be <= capacitySnapshot + overCapacityTolerance, unless allowSelectOverCapacity=true and the partner passes acknowledgeOverCapacity:true (which is logged in the audit trail). Under-filling is always allowed — a partner may confirm fewer than 정원.",
+    "BR-12 Finalize is the ONLY transition that sets NOT_SELECTED. Before finalize, non-preselected users are CANDIDATE and are told nothing.",
+    "BR-13 Finalize is transactional and idempotent: the whole status flip + dispatch-row insert + outcome-event insert happen in one Prisma $transaction. A retried finalize with the same Idempotency-Key returns the original result; a retried finalize without one is rejected by the version check.",
+    "BR-14 Notification exactly-once is enforced by SelectionNotificationDispatch.dedupeKey = `sel:${selectionId}:${trigger}`. Insert conflicts are swallowed. Re-finalize after reopen therefore cannot re-send SELECTED to someone who already got it.",
+    "BR-15 Re-finalize delta rules: newly added → SELECTED notification; newly removed (was SELECTED) → REVOKED status + SELECTION_REVOKED notification with a mandatory partner reason; unchanged → silent by default, SELECTION_LIST_UPDATED only if the partner explicitly opts in.",
+    "BR-16 Editing after finalize is time-boxed: partner may reopen within editAfterFinalizeWindowHours (default 72) and at most maxReopenCount (default 3) times. Beyond that, only Admin can reopen. Rationale: a confirmed 예약 is a promise to the user.",
+    "BR-17 Backfill is MANUAL ONLY. No automatic waitlist succession, no cron promotion. Revoking a seat only increments remainingSeats and surfaces a '결원 1자리' banner with a 추가 선정 CTA on the partner screen.",
+    "BR-18 Promotion candidate ordering is the ORIGINAL round-1 snapshot order (WAITING pool first, then NOT_SELECTED by rankNo), never a re-ranked list — a user cannot improve their backfill position after the deadline.",
+    "BR-19 A user may hold at most one non-REVOKED Selection per event across all rounds. Round N+1 snapshots exclude already-SELECTED users with reason ALREADY_SELECTED_PRIOR_ROUND.",
+    "BR-20 Promotion is immediate (no draft/finalize cycle) because the user needs to act on a real reservation date. It still writes a full audit row and a PROMOTED outcome event.",
+    "BR-21 Sealed results: /api/me/selections and /my-result return BEFORE_ANNOUNCE (발표 전) unless round.status=FINALIZED AND that user's SELECTED/NOT_SELECTED dispatch row exists. This prevents a fast poller from learning the outcome before the notification, and prevents a partially-dispatched batch from leaking.",
+    "BR-22 No user-facing surface in this context ever returns rankNo, cutoffAmount, tieGroupKey, another applicant's amount, or the total selected list. The DTO in packages/shared for user scope physically lacks those fields (separate MySelectionDto vs PartnerSelectionRowDto) so it cannot leak by accident.",
+    "BR-23 Cutoff/rank disclosure is gated behind Event.visibility.showCutoffAmount / showMyRank (modeled in the Event context, read here). Both default false in MVP; when enabled they only take effect AFTER finalize, never during the application period.",
+    "BR-24 Every mutating endpoint requires an Idempotency-Key header and an expectedVersion; batch and finalize additionally require expectedSnapshotHash. Version mismatch → 409 with the current server state payload so the UI can diff rather than silently clobber.",
+    "BR-25 Authorization: a partner may only touch rounds of events belonging to a venue they own, and only while their partner account is APPROVED. A suspended partner's rounds fall back to Admin force-finalize.",
+    "BR-26 All datetimes are stored as UTC timestamptz and rendered in Asia/Seoul. Deadlines and rankingBasisAt are compared server-side in UTC only; no server code ever constructs a local date. CSV exports render KST with an explicit '+09:00' suffix.",
+    "BR-27 CSV format is UTF-8 with BOM (Excel on Windows is the partner's reality), CRLF line endings, columns: 순번,순위,신청자,연락처,신청금액,신청일시,최종금액변경일시,보증금상태,상태,비고. Amounts are plain integers without separators; a leading apostrophe guards any value Excel might coerce.",
+    "BR-28 Export PII: MASKED replaces email as `ab***@domain.com` and phone as `010-****-1234`. FULL is Admin-only, logged, and requires the event to carry a PII-consent flag. Blobs expire in 24h and are private.",
+    "BR-29 Event cancellation cascades: round → CANCELED, all non-REVOKED Selections → REVOKED(EVENT_CANCELED), full deposit refund outcome for everyone, EVENT_CANCELED notification. Overrides the edit window.",
+    "BR-30 The audit log is the source of truth for disputes. Selection rows may be mutated; SelectionChangeLog rows may not. Admin dispute tooling reconstructs the timeline from it.",
+    "BR-31 Round-2+ remainingSeats is recomputed at open time as capacity − count(SELECTED AND revokedAt IS NULL across all rounds), never stored stale.",
+    "BR-32 Partner-visible amounts are always the applied amount (신청 금액). The deposit paid is displayed as a separate eligibility column and is never a ranking input."
+  ],
+  "edgeCases": [
+    "Double-submit finalize: partner double-clicks 확정하기. Two serverless instances race. Mitigation: Idempotency-Key unique on (selectionRoundId, requestId) + optimistic version check; the loser gets 409 and the client replays the idempotent response. Notifications are additionally protected by dedupeKey.",
+    "Cron vs. lazy-open race: the minute-cron and the partner's page load both try to open round 1. Mitigation: @@unique([eventId, roundNo]) — the loser catches P2002 and re-reads. Snapshot writing is inside the same transaction so a partial snapshot can never be observed.",
+    "Soft-close extension lands in the same second as the cron run: cron reads effectiveDeadlineAt before the extension commits and opens the round early. Mitigation: the open transaction re-reads Event FOR UPDATE (row-level, cheap, single row) and re-asserts now() >= deadline + window; if the deadline moved, it aborts and lets the next run handle it. Also, the Application context refuses extensions once a round exists for the event.",
+    "Bid raise arrives after rankingBasisAt (clock skew / long request): the Application context must reject writes past the deadline; defensively, the snapshot query filters lastBidAt <= rankingBasisAt so a late write cannot alter ranking. The stray raise is reported in the round-open response as `lateWriteCount` for Admin visibility.",
+    "Millisecond-identical lastBidAt for two applicants (batch job, or two requests hitting the same DB clock tick): resolved deterministically by appliedAt then applicationId, so ranking is stable across re-reads. Never resolved randomly.",
+    "Cutoff tie: rank 10 and rank 11 have the same amount and 정원 is 10. The system picks by lastBidAt (correct per spec) but sets hasCutoffTie=true and shows the partner a banner: '10위와 11위의 신청 금액이 같아요. 먼저 그 금액을 제시한 분이 앞선 순위입니다.' Partner may override to take both (over-capacity acknowledgement) or neither.",
+    "Everyone's deposit expired (flag on, aggressive window): eligibleCount=0. Round still opens with an empty draft, status DRAFT, and the partner gets '유효한 신청이 없어요' with the option to cancel the event or extend. Finalize with zero selections is permitted but requires confirmation.",
+    "Applicant cancels their application between rankingBasisAt and round open (a few seconds of cron lag): the cancel is excluded from the snapshot if it committed before the snapshot query, included as eligible otherwise. If the latter, the partner sees a 'canceled after deadline' badge on the row and removing them is not counted as an override.",
+    "User cancels AFTER being preselected but BEFORE finalize: the Application context flips status to CANCELED; this context does not watch for it live. Guard: finalize re-validates every PRESELECTED application's current status and refuses (409 STALE_APPLICATIONS) with the offending list, forcing the partner to re-review rather than confirming a ghost.",
+    "User cancels after finalize: partner revokes the seat (USER_CANCELED). Deposit forfeit vs. refund is a policy question (open question) — the API takes an explicit refundDeposit boolean rather than guessing.",
+    "Partner finalizes, user gets 선정 쪽지, partner reopens and removes them: the user has already acted on a confirmed reservation. Mitigation: reopen is time-boxed and rate-limited, removal after finalize requires a reason, the user receives an explicit SELECTION_REVOKED message (not silence), and the audit records the partner as the actor for dispute resolution. Product may later require Admin approval for post-finalize removals.",
+    "Notification partially dispatched when the serverless function times out mid-finalize: the transaction commits statuses + QUEUED dispatch rows only; actual sending is the outbox cron's job. So a timeout after commit still results in complete delivery, and a timeout before commit rolls everything back. Never a half-notified round.",
+    "Resend outage: dispatch rows stay QUEUED/FAILED with attemptCount; exponential backoff, max 5 attempts, then Admin alert. In-app 쪽지 is written synchronously in the same transaction as a fallback, so the user always has an in-app record even if email never lands.",
+    "Information leak via response timing / SSE: the live competition-ratio SSE stream must stop emitting at the deadline and must never include selection state. The post-deadline public endpoint returns only { announced: boolean }.",
+    "Information leak via /me/selections polling: a user polls every second hoping to see their status flip before the announcement and infer they were near the cutoff. Mitigation: BR-21 sealing (result hidden until that user's own dispatch row exists) plus a 60s rate limit on the endpoint. Response shape is identical for BEFORE_ANNOUNCE regardless of internal status.",
+    "Information leak via CSV export shared by a partner: unavoidable at the platform level, but exports are logged with actor/scope/rowCount, blobs expire in 24h, and FULL PII requires Admin. Partner ToS covers redistribution.",
+    "Enumeration of other applicants: partner endpoints are strictly scoped by venue ownership; :roundId is validated to belong to :eventId which is validated to belong to the caller's venue. cuid ids, no sequential ids anywhere.",
+    "Deadline sniping meets deposit expiry: a user bids the top amount 30 seconds before the deadline. Because rankingBasisAt = deadline + window, they still have the full 10 minutes to pay, and the whole ranking waits. Partners must be told the announcement time is deadline+window, not deadline (UI copy: '마감 후 10분 뒤 순위가 확정돼요').",
+    "Re-bid gaming via cancel-and-reapply to reset lastBidAt: blocked upstream (raise-only, no cancel-then-reapply), but this context defends too — if a user has multiple applications for the same event in the snapshot, all but the earliest are excluded with DUPLICATE_ACCOUNT and an Admin alert is raised.",
+    "Multi-account sybil to occupy several seats: out of scope for automated detection in MVP, but the snapshot flags entries sharing an email domain+name+phone hash and the partner can remove them as an override with reason. Admin has ADMIN_DISQUALIFIED.",
+    "Partner never finalizes: the event stays in limbo and users are stuck. Mitigation: Admin dashboard surfaces rounds older than 72h past rankingBasisAt; POST /admin/.../force-finalize applies pure auto-ranking. Also a reminder 쪽지 to the partner at 24h and 48h.",
+    "Partner finalizes zero selections to spite applicants: allowed but logged; Admin dashboard flags rounds with selectedCount=0 and eligibleCount>0.",
+    "Over-capacity from INSTANT expiry-reclaim races: claimedCount overshot by 2 on a 10-seat event. Round 1 for INSTANT opens with 12 eligible rows, withinCapacity=true for the first 10 by claim time, and the partner explicitly removes 2 (or accepts 12 via acknowledgeOverCapacity). This is the designed resolution path for the accepted overbooking.",
+    "Capacity edited by the partner after the deadline but before round open: capacitySnapshot freezes at open time. Editing capacity after a round exists is rejected by the Event context; if it must change, the partner reopens and Admin recomputes, both audited.",
+    "Reorder with a stale ordered list (another tab): expectedVersion mismatch → 409. Positions are sparse ints so a legitimate reorder is one statement and never renumbers the whole table.",
+    "KST midnight / DST-free but day-boundary bugs: '마감일 23:59' entered by a partner in KST becomes 14:59Z; a naive server-local comparison on a Vercel UTC runtime would open the round 9 hours early. Enforced by storing timestamptz, comparing in UTC, and a lint rule banning `new Date(y,m,d)` and `toLocaleDateString` without an explicit Asia/Seoul timeZone in apps/api.",
+    "Leap-second / clock skew between serverless instances: never compare client-supplied times; all timestamps come from the DB (`now()` inside the transaction), so ordering is consistent even across instances.",
+    "Huge event (50,000 applications): snapshot insert must not exceed the serverless budget. Mitigation: snapshot creation uses a single `INSERT INTO RankSnapshotEntry ... SELECT ... FROM Application ... ORDER BY ... ` with `row_number() OVER (...)` — one round trip, no N+1, no application-side sorting. Ranking pagination is keyset-based. CSV export streams and caps at 10,000 rows, offering a paged export beyond that.",
+    "Export of a non-finalized round: allowed for FULL_RANKING (partners legitimately want to study the list before deciding) but the CSV is watermarked '확정 전 임시 명단' in a header row and the export is audited.",
+    "Promoting someone whose application was canceled or whose deposit was refunded: backfill-candidates excludes them; promote re-validates and returns 409 with the reason. A refunded deposit means promotion may require re-collection — flagged in the response as requiresDepositRecollection so the UI can warn.",
+    "Two partner staff accounts on the same venue editing simultaneously: version-based optimistic locking + the audit log attributing each change to a specific actorUserId. The UI shows '다른 담당자가 방금 수정했어요. 새로고침해 주세요.'",
+    "Event canceled while a round is mid-edit: the cancel transaction sets round.status=CANCELED and bumps version, so any in-flight partner mutation fails the version check and the UI redirects.",
+    "Selection row missing for an eligible applicant due to a partial historical bug: finalize runs a consistency assertion (count(Selection where eligible) == eligibleCount) and refuses with 500 SELECTION_INTEGRITY rather than silently under-notifying."
+  ],
+  "terms": [
+    {
+      "technical": "Selection & Finalization",
+      "userFriendlyKo": "선정 및 명단 확정"
+    },
+    {
+      "technical": "SelectionRound",
+      "userFriendlyKo": "선정 회차 (1회차 확정 / 2회차 추가 선정)"
+    },
+    {
+      "technical": "rankingBasisAt",
+      "userFriendlyKo": "순위 확정 시각 (마감 후 예약금 입금 시간이 끝나는 때)"
+    },
+    {
+      "technical": "RankSnapshotEntry",
+      "userFriendlyKo": "신청 현황 (누가 얼마에 신청했는지)"
+    },
+    {
+      "technical": "rankNo",
+      "userFriendlyKo": "순위 (파트너·운영자에게만 표시)"
+    },
+    {
+      "technical": "cutoffAmount",
+      "userFriendlyKo": "커트라인 금액 (기본 비공개)"
+    },
+    {
+      "technical": "capacity / capacitySnapshot",
+      "userFriendlyKo": "정원 (최대 인원)"
+    },
+    {
+      "technical": "remainingSeats",
+      "userFriendlyKo": "남은 자리"
+    },
+    {
+      "technical": "amount (applied amount)",
+      "userFriendlyKo": "신청 금액"
+    },
+    {
+      "technical": "lastBidAt",
+      "userFriendlyKo": "해당 금액을 제시한 시각"
+    },
+    {
+      "technical": "deposit",
+      "userFriendlyKo": "예약금"
+    },
+    {
+      "technical": "auto-preselect",
+      "userFriendlyKo": "순위대로 자동 선정"
+    },
+    {
+      "technical": "PRESELECTED",
+      "userFriendlyKo": "선정 예정 (확정 전)"
+    },
+    {
+      "technical": "SELECTED",
+      "userFriendlyKo": "확정되었어요"
+    },
+    {
+      "technical": "NOT_SELECTED",
+      "userFriendlyKo": "이번에는 선정되지 않았어요"
+    },
+    {
+      "technical": "WAITING",
+      "userFriendlyKo": "예비 명단 (자리가 나면 연락드려요)"
+    },
+    {
+      "technical": "REVOKED",
+      "userFriendlyKo": "선정이 취소되었어요"
+    },
+    {
+      "technical": "BEFORE_ANNOUNCE",
+      "userFriendlyKo": "결과 발표 전이에요"
+    },
+    {
+      "technical": "finalize",
+      "userFriendlyKo": "명단 확정하기"
+    },
+    {
+      "technical": "reopen",
+      "userFriendlyKo": "확정 명단 다시 수정하기"
+    },
+    {
+      "technical": "override",
+      "userFriendlyKo": "직접 조정"
+    },
+    {
+      "technical": "overrideReason",
+      "userFriendlyKo": "조정 사유"
+    },
+    {
+      "technical": "promote / backfill",
+      "userFriendlyKo": "추가 선정 (결원 채우기)"
+    },
+    {
+      "technical": "revoke",
+      "userFriendlyKo": "선정 취소하기"
+    },
+    {
+      "technical": "export CSV",
+      "userFriendlyKo": "명단 내려받기 (엑셀)"
+    },
+    {
+      "technical": "audit log",
+      "userFriendlyKo": "변경 이력"
+    },
+    {
+      "technical": "tie (same amount)",
+      "userFriendlyKo": "같은 금액 (먼저 제시한 분이 앞선 순위예요)"
+    },
+    {
+      "technical": "over capacity",
+      "userFriendlyKo": "정원을 넘겨 확정하기"
+    },
+    {
+      "technical": "SELECTED notification title",
+      "userFriendlyKo": "축하해요! 예약이 확정되었어요"
+    },
+    {
+      "technical": "NOT_SELECTED notification title",
+      "userFriendlyKo": "아쉽게도 이번에는 선정되지 않았어요"
+    },
+    {
+      "technical": "SELECTION_PROMOTED notification title",
+      "userFriendlyKo": "자리가 생겼어요! 추가 선정되셨어요"
+    },
+    {
+      "technical": "SELECTION_REVOKED notification title",
+      "userFriendlyKo": "확정이 취소되었어요"
+    },
+    {
+      "technical": "refund of deposit",
+      "userFriendlyKo": "예약금은 영업일 기준 3~5일 내에 돌려드려요"
+    }
+  ],
+  "openQuestions": [
+    "Deposit on user-initiated cancellation AFTER being selected: refund in full, partial forfeit, or full forfeit? This changes the revoke API default and the Korean copy users see before they cancel. Currently modeled as an explicit refundDeposit boolean with no default.",
+    "Should post-finalize REMOVAL of an already-notified user require Admin approval rather than being a partner self-service action? It is the single most user-hostile operation in the product. Current design allows it with a mandatory reason inside a 72h window.",
+    "Is the 예비 명단 (WAITING) visible to the user at all? Current design keeps it fully hidden (they see 미선정) to avoid rank leakage, but telling someone '예비 3번' materially improves their experience. If we show it, we leak partial rank information.",
+    "Announcement timing: should the result be announced immediately at finalize (partner controls the moment), or should there be a scheduled 발표 시각 the partner sets at event creation so users know when to check? Current design is 'whenever the partner presses the button', which is unpredictable for users.",
+    "Force-finalize SLA: after how many hours of partner inaction should Admin auto-finalize, and should it be truly automatic (cron) rather than a manual Admin action? Currently 72h manual with reminders at 24h/48h.",
+    "For INSTANT events, is a SelectionRound created for EVERY event, or only when overbooking/reconciliation is actually needed? Always creating one gives a uniform data model and a uniform CSV/명단 screen (recommended), at the cost of rows for events that need no reconciliation.",
+    "Does the partner need per-selection notes/tags visible on the confirmed list (e.g. 알러지, 동반 인원, 좌석)? If yes, is that a field here or an Application-context field that this context merely displays?",
+    "Should the confirmed list be exportable in a partner-defined column order / template (POS or 예약대장 import)? MVP ships one fixed column set.",
+    "Amount editing after finalize (Admin dispute correction) — is this ever legitimate, or should disputes always be resolved off-platform? Modeled as Admin-only + audited, but it is a footgun.",
+    "Tie policy beyond lastBidAt: some partners may want a lottery among tied applicants for fairness optics. TieBreakPolicy.RANDOM_SEEDED is in the enum but unimplemented — do we need it in v1?",
+    "Retention: how long do RankSnapshotEntry rows (which contain amounts and identity) live? Proposal is 3 years for dispute resolution, then anonymize userId/displayName. Needs a legal/개인정보 decision.",
+    "Multi-seat applications (한 명이 2인 예약): does one application consume one slot or N slots of 정원? This context assumes 1:1. If N:1 is possible, capacity math, auto-preselect and backfill all need a partySize field.",
+    "Should partners be able to message the 미선정 group as a segment directly from the selection screen (e.g. '다음 이벤트 알림 받기' upsell), and is that covered by the applicant-messaging permission in the Notification context?",
+    "Round-2 candidate staleness: if a backfill happens 5 days after the announcement, is it acceptable to simply confirm a NOT_SELECTED user, or must we ask them to re-confirm interest first (a 'still interested?' acceptance step with a deadline)? Current design promotes immediately, which risks no-shows."
+  ]
+}
