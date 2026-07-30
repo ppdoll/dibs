@@ -43,6 +43,14 @@ export const metadata: Metadata = {
     statusBarStyle: 'default',
   },
 
+  other: {
+    // ★ Next 15 는 `appleWebApp.capable` 을 표준 이름인 `mobile-web-app-capable` 로만 내보낸다.
+    //   그런데 iOS 사파리는 아직 **레거시 이름만** 인식한다. 이게 없으면 홈 화면에 추가해도
+    //   독립 실행이 아니라 사파리 UI 를 단 채로 열린다 — "PWA 가 안 된다" 로 보이는 전형적인 증상.
+    //   두 이름을 같이 내보내는 게 현재로선 유일한 방법이다.
+    'apple-mobile-web-app-capable': 'yes',
+  },
+
   formatDetection: {
     // 사파리가 "10명", "2026-07-27" 같은 문자열을 전화번호·날짜 링크로
     // 바꿔버리면 파란 밑줄이 생기고 탭 영역까지 뺏긴다.

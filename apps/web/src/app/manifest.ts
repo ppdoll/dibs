@@ -11,6 +11,10 @@ import { BRAND_COPY } from '@/lib/brand';
  */
 export default function manifest(): MetadataRoute.Manifest {
   return {
+    // 설치된 앱의 고유 식별자. 없으면 브라우저가 start_url 로 대신 잡는데, 나중에
+    // start_url 을 바꾸면 **다른 앱으로 인식돼** 사용자 홈 화면에 아이콘이 하나 더 생긴다.
+    id: '/',
+
     name: `${BRAND_COPY.wordmark} — ${BRAND_COPY.headline}`,
     short_name: BRAND_COPY.wordmark,
     description: BRAND_COPY.sub,

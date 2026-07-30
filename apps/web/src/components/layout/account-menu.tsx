@@ -1,8 +1,9 @@
 'use client';
 
-import { ClipboardList, LogOut, Shield, Store, UserRound } from 'lucide-react';
+import { ClipboardList, Download, LogOut, Shield, Store, UserRound } from 'lucide-react';
 import { useState } from 'react';
 
+import { useInstallPrompt } from '@/components/pwa/use-install-prompt';
 import { Avatar } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import {
@@ -45,6 +46,10 @@ export function AccountMenu({ compact = false }: { compact?: boolean }) {
   } = useAuth();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [pending, setPending] = useState(false);
+
+  // 크롬은 설치 조건을 만족해도 주소창 구석의 작은 아이콘만 띄운다 — 모르면 못 찾는다.
+  // 붙잡아 둔 프롬프트를 여기서 띄운다. 설치할 수 없는 상태면 항목 자체를 그리지 않는다.
+  const { state: installState, install } = useInstallPrompt();
 
   // 로그인 여부를 알기 전에 "로그인"을 그렸다가 아바타로 바꾸면 깜빡인다.
   // 자리만 잡아 두고 판정이 끝나면 그린다.
@@ -153,6 +158,21 @@ export function AccountMenu({ compact = false }: { compact?: boolean }) {
               >
                 내 정보
               </DropdownItem>
+
+              {installState === 'ready' && (
+                <>
+                  <DropdownSeparator />
+                  <DropdownItem
+                    icon={<Download className="h-4 w-4" aria-hidden="true" />}
+                    onClick={() => {
+                      close();
+                      void install();
+                    }}
+                  >
+                    앱 설치
+                  </DropdownItem>
+                </>
+              )}
 
               <DropdownSeparator />
 
