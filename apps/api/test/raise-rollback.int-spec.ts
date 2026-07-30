@@ -131,9 +131,16 @@ describeIntegration('상향 차액 미납 롤백 (D-06 / IC-23)', () => {
     expect(shortfallHold.amountDue).toBe(5_000);
 
     // ── 차액 창을 넘긴다 ──────────────────────────────────────────────────
-    // 실제로 10분을 기다릴 수는 없으므로 만기를 과거로 민다. 스위퍼는 Deposit.dueAt 만 본다.
+    // 실제로 10분을 기다릴 수는 없으므로 시계를 과거로 민다. 스위퍼는 Deposit.dueAt 만 본다.
+    //
+    // ★ dueAt 만 밀면 안 된다. deposit_window_chk 가 `"dueAt" > "openedAt"` 을 요구하므로
+    //   만기만 과거로 보내면 23514 로 거절당한다. openedAt 도 같이 밀어서 "창이 열렸고
+    //   그 창이 이미 닫혔다"는, 실제로 일어날 수 있는 배치를 만든다.
     await prisma.$executeRaw`
-      UPDATE "Deposit" SET "dueAt" = now() - interval '1 minute' WHERE id = ${shortfallHold.id}
+      UPDATE "Deposit"
+         SET "openedAt" = now() - interval '11 minutes',
+             "dueAt"    = now() - interval '1 minute'
+       WHERE id = ${shortfallHold.id}
     `;
     await prisma.$executeRaw`
       UPDATE "Application" SET "depositDueAt" = now() - interval '1 minute' WHERE id = ${applicationId}

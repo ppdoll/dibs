@@ -10,14 +10,5 @@
     }
   },
   "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
-  "crons": [
-    { "path": "/api/cron/events/lifecycle", "schedule": "* * * * *" },
-    { "path": "/api/cron/events/stats-refresh", "schedule": "* * * * *" },
-    { "path": "/api/cron/expire-holds", "schedule": "* * * * *" },
-    { "path": "/api/cron/deposit-reminders", "schedule": "* * * * *" },
-    { "path": "/api/cron/finalize-rankings", "schedule": "* * * * *" },
-    { "path": "/api/cron/notifications/expand-broadcasts", "schedule": "* * * * *" },
-    { "path": "/api/cron/notifications/dispatch", "schedule": "* * * * *" },
-    { "path": "/api/cron/notifications/sweep-expired", "schedule": "17 * * * *" }
-  ]
+  "crons": [{ "path": "/api/cron/tick", "schedule": "0 3 * * *" }]
 }

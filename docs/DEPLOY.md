@@ -121,72 +121,100 @@ Prisma 는 자기가 만들지 않은 객체를 다음 migrate 에서 DROP 하�
 
 ---
 
-## 4. Vercel Cron
+## 4. 스케줄러 — 크론 1개 + 요청 구동 틱
 
-`apps/api/vercel.json` 에 8개가 선언돼 있다.
+### 왜 크론만으로는 안 되는가 ★
 
-| 라우트 | 주기 | 하는 일 |
+스케줄 잡은 8개고 원래는 전부 **매분** 돌았다.
+그런데 **Hobby 플랜은 크론을 하루 1회, 최대 2개까지만** 허용한다.
+개수는 하나로 합치면 되지만 **주기는 합쳐지지 않는다** — 하루 한 번 도는 스케줄러로
+10분짜리 예약금 창을 굴릴 수는 없다.
+
+그래서 스케줄의 **주 동력을 시간에서 트래픽으로 옮겼다.**
+
+| | 무엇이 굴리나 | 언제 |
 |---|---|---|
-| `/api/cron/events/lifecycle` | 매분 | `SCHEDULED→OPEN`, `OPEN→CLOSED` |
-| `/api/cron/events/stats-refresh` | 매분 | 경쟁률 집계 + INSTANT `claimedCount` 실측 대사 |
-| `/api/cron/expire-holds` | 매분 | 예약금 홀드 만료 — 자리 반환 / 금액 롤백 |
-| `/api/cron/deposit-reminders` | 매분 | 만기 임박 리마인더 (홀드당 1회) |
-| `/api/cron/finalize-rankings` | 매분 | `rankingLockAt` 대사 + 선정 라운드 개시 |
-| `/api/cron/notifications/expand-broadcasts` | 매분 | 공지 수신자 페이지 확장 |
-| `/api/cron/notifications/dispatch` | 매분 | 이메일 아웃박스 → Resend |
-| `/api/cron/notifications/sweep-expired` | 매시 17분 | 만료 알림 소프트 삭제 |
+| **주 동력** | `TickInterceptor` — 들어오는 모든 요청에 얹힌다 | 마지막 틱에서 `TICK_INTERVAL_SECONDS`(기본 60초)가 지났으면 |
+| **안전망** | Vercel Cron → `/api/cron/tick` | 하루 1회 (03:00 UTC) |
 
-**경쟁률이 크론에 달려 있다는 점을 기억한다.** `liveApplicantCount` 는 신청 트랜잭션이 아니라
-`stats-refresh` 가 갱신한다. 이 크론이 안 돌면 화면의 경쟁률이 영원히 멈춘다.
+동작은 이렇다.
 
-### `CRON_SECRET` — 안 넣으면 스위퍼가 조용히 꺼진다 ★
+1. 요청이 들어온다 → 인터셉터가 "틱이 밀렸나?" 를 묻는다.
+2. 대부분은 람다 인스턴스 로컬 타이머(10초)에서 걸러져 **DB 도 안 간다.**
+3. 통과하면 `CronTick` 게이트 행에 `INSERT … ON CONFLICT DO UPDATE … WHERE "nextRunAt" <= now()`
+   한 방을 날린다. 영향 행이 1이면 그 요청이 이번 틱의 주인이다.
+   동시에 열 개가 들어와도 UPDATE 가 성립하는 쪽은 정확히 하나다.
+4. 주인이 된 요청이 잡 8개를 순서대로 돌린다. **유휴 상태 실측 16~26ms** (조건부 UPDATE 여덟 방).
+   콜드스타트가 겹친 첫 요청만 2초대다 — 이건 틱이 아니라 Prisma 엔진 웜업 비용이다.
+5. 5초를 넘기면 응답을 먼저 내보낸다(틱은 그대로 진행하되 완주는 보장하지 않는다).
 
-Vercel 은 `CRON_SECRET` 환경변수가 설정돼 있으면 크론 요청에
+### 트래픽이 없으면 아무것도 안 돈다 — 괜찮은 이유
+
+만료 판정 자체가 **조회 시점 지연 만료(lazy expiry)** 라 데이터 정합성이 깨지지 않는다.
+아무도 안 보는 동안 밀리는 것은 **알림 발송과 자리 반환 타이밍**뿐이고,
+누군가 들어오는 순간 그 요청이 밀린 것을 전부 따라잡는다.
+
+**분 단위를 확실히 보장하고 싶다면** 무료 업타임 모니터(UptimeRobot 등)로
+`https://<api-도메인>/health` 를 1분마다 찌르면 된다. 헬스체크에도 인터셉터가 얹히므로
+그 핑 자체가 스케줄러의 시계가 된다. 크론 플랜과 무관하고 비용도 0이다.
+
+> 경로에 `/api` 가 없다. `/health` 는 전역 프리픽스 **밖**에 있다 —
+> 플랫폼 헬스체크가 앱 라우팅 규칙을 몰라도 되게 하려는 것이다.
+
+### 잡 목록
+
+`/api/cron/tick` 이 아래를 **이 순서대로** 전부 돌린다.
+각 잡은 예전 경로로도 여전히 따로 호출할 수 있다 — 디버깅·수동 복구용이다.
+
+| order | 잡 이름 (= 개별 경로) | 하는 일 |
+|---|---|---|
+| 10 | `events/lifecycle` | `SCHEDULED→OPEN`, `OPEN→CLOSED` |
+| 20 | `expire-holds` | 예약금 홀드 만료 — 자리 반환 / 금액 롤백 |
+| 30 | `finalize-rankings` | `rankingLockAt` 대사 + 선정 라운드 개시 |
+| 40 | `deposit-reminders` | 만기 임박 리마인더 (홀드당 1회) |
+| 50 | `notifications/expand-broadcasts` | 공지 수신자 페이지 확장 |
+| 60 | `notifications/dispatch` | 이메일 아웃박스 → Resend |
+| 70 | `notifications/sweep-expired` | 만료 알림 소프트 삭제 |
+| 80 | `events/stats-refresh` | 경쟁률 집계 + INSTANT `claimedCount` 실측 대사 |
+
+**순서가 의미를 갖는 유일한 쌍은 20 → 30 이다.** 열린 홀드가 하나라도 남아 있으면
+확정 게이트가 그 이벤트를 통째로 건너뛴다(IC-26). 뒤집히면 확정이 계속 한 주기씩 밀린다.
+나머지는 뒤집혀도 한 주기 밀릴 뿐 결과가 달라지지 않는다 — 전부 현재 상태를 `WHERE` 에
+적은 조건부 UPDATE 라 at-least-once 를 전제로 안전하다.
+
+**경쟁률이 스케줄러에 달려 있다는 점을 기억한다.** `liveApplicantCount` 는 신청 트랜잭션이
+아니라 `events/stats-refresh` 가 갱신한다. 틱이 안 돌면 화면의 경쟁률이 멈춘다.
+
+### 잡 하나가 죽어도 나머지는 돈다
+
+`TickRegistry` 가 잡마다 try/catch 를 두르고 실패를 리포트에 모은다.
+중간에서 throw 하면 뒤의 잡이 통째로 굶기 때문이다. 실패한 잡은 다음 틱이 다시 집는다.
+
+틱 결과는 `/api/cron/tick` 응답으로 그대로 나온다:
+
+```json
+{ "trigger": "cron", "ran": 8, "failed": 0, "ms": 143, "results": [ … ] }
+```
+
+### `CRON_SECRET` — 안 넣으면 안전망이 조용히 꺼진다 ★
+
+Vercel 은 `CRON_SECRET` 이 설정돼 있으면 크론 요청에
 `Authorization: Bearer $CRON_SECRET` 헤더를 붙여 보낸다.
 
 `CronGuard` 는 **`CRON_SECRET` 이 비어 있으면 모든 크론 요청을 401 로 거절한다.**
-"시크릿이 없으니 그냥 통과"가 아니라 **fail closed** 다 — 시크릿 없이 열어두면
-아무나 만료 스위퍼와 순위 확정을 때릴 수 있기 때문이다.
+"시크릿이 없으니 그냥 통과"가 아니라 **fail closed** 다 — 열어두면 아무나 만료 스위퍼와
+순위 확정을 때릴 수 있기 때문이다.
 
-그 결과 **`CRON_SECRET` 을 안 넣는 것 = 스위퍼·순위 확정·메일 발송을 전부 끈 것**이 된다.
-배포는 성공하고, 크론도 "실행"되고, 화면도 멀쩡해 보인다. 다만 아무것도 만료되지 않고
-아무 이벤트도 확정되지 않는다. Vercel → 프로젝트 → **Cron Jobs** 탭에서 응답 코드가
-401 로 찍히는지 **첫 배포 직후 반드시 한 번 확인한다.**
+> 요청 구동 틱은 `CRON_SECRET` 과 무관하게 돈다(가드를 타지 않는 인터셉터다).
+> 즉 시크릿을 빼먹어도 **트래픽이 있는 동안은 정상 동작한다.** 대신 안전망이 사라지므로
+> 트래픽이 끊긴 밤사이에 아무것도 처리되지 않는다. 첫 배포 직후 Vercel →
+> **Cron Jobs** 탭에서 응답이 401 이 아닌지 한 번 확인한다.
 
-### 크론 핸들러의 HTTP 메서드 — 배포 후 첫 확인 항목 ★
+### 플랜을 Pro 로 올린다면
 
-**Vercel Cron 은 크론 경로를 `GET` 으로 호출한다.**
-현재 크론 컨트롤러(`events-cron` / `selection-cron` / `notifications-cron`)는 전부 `@Post()` 로만 열려 있다.
-Cron Jobs 탭에서 응답이 **404** 로 찍힌다면 원인은 이것이다.
-
-두 가지 중 하나로 해결한다.
-
-1. **핸들러에 `@Get()` 을 함께 붙인다.** Nest 는 같은 메서드에 라우트 데코레이터를 여러 개 붙일 수 있다.
-   ```ts
-   @Get('expire-holds')
-   @Post('expire-holds')
-   @HttpCode(HttpStatus.OK)
-   expireHolds() { return this.sweeper.expireHolds(); }
-   ```
-   손으로 때리는 방식(RUNNING.md §7 의 `POST`)도 그대로 유지된다.
-2. 또는 Vercel Cron 대신 외부 스케줄러(GitHub Actions 등)에서 `POST` 로 호출한다.
-   그 경우 `apps/api/vercel.json` 의 `crons` 는 지운다.
-
-### 플랜 제한
-
-- **Hobby**: 크론은 **하루 1회**, **최대 2개**까지다. 위 8개 설정은 Hobby 에서 배포 자체가 거부된다.
-  Hobby 로 시연만 할 거라면 `crons` 를 비우고 RUNNING.md §7 처럼 손으로 때리거나 외부 스케줄러를 쓴다.
-- **Pro**: 분 단위 주기, 크론 개수 여유 있음. 10분짜리 예약금 창을 제대로 굴리려면 Pro 가 필요하다.
-- 만료 판정 자체는 **조회 시점 지연 만료(lazy expiry)** 로도 처리되므로, 크론이 늦어도
-  **데이터 정합성은 깨지지 않는다.** 늦어지는 것은 "만료됐습니다" 알림과 자리 반환 타이밍뿐이다.
-
-### 실행 순서는 보장되지 않는다
-
-같은 분에 여러 크론이 잡혀 있어도 Vercel 이 순서를 보장하지 않는다. 괜찮다 —
-모든 크론이 **at-least-once 전제**로, 현재 상태를 `WHERE` 절에 적은 조건부 UPDATE 만 쓴다.
-순서가 뒤집히면 한 주기 밀릴 뿐 잘못된 결과가 나오지 않는다.
-(`expire-holds` 가 `finalize-rankings` 보다 늦게 돌면, 열린 홀드가 남아 있으므로 확정 게이트가
-그 이벤트를 그냥 건너뛴다 — IC-26. 다음 분에 확정된다.)
+`apps/api/vercel.json` 의 `crons` 를 예전처럼 되돌리면 된다 — 개별 경로 8개가 그대로 살아 있다.
+요청 구동 틱을 끄고 싶으면 `TICK_INTERVAL_SECONDS` 를 아주 크게(예: `86400`) 두면
+사실상 크론만 남는다. 둘을 같이 굴려도 무해하다(게이트가 중복을 막는다).
 
 ---
 

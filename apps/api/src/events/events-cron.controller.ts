@@ -1,8 +1,9 @@
-import { All, Controller, HttpCode, HttpStatus, UseGuards } from '@nestjs/common';
+import { All, Controller, HttpCode, HttpStatus, OnModuleInit, UseGuards } from '@nestjs/common';
 import { ApiExcludeController, ApiOperation, ApiTags } from '@nestjs/swagger';
 
 import { Public } from '../common/decorators/public.decorator';
 import { CronGuard } from '../common/guards/cron.guard';
+import { TickRegistry } from '../tick/tick-registry.service';
 import { EventLifecycleService } from './event-lifecycle.service';
 import { EventStatsService } from './event-stats.service';
 
@@ -28,11 +29,26 @@ import { EventStatsService } from './event-stats.service';
 @Public()
 @UseGuards(CronGuard)
 @Controller('cron/events')
-export class EventsCronController {
+export class EventsCronController implements OnModuleInit {
   constructor(
     private readonly lifecycle: EventLifecycleService,
     private readonly stats: EventStatsService,
+    private readonly tick: TickRegistry,
   ) {}
+
+  /**
+   * 이 도메인의 잡을 틱 레지스트리에 등록한다.
+   *
+   * 레지스트리가 서비스를 주입해 가는 게 아니라 **각자 자기 잡을 밀어 넣는** 방향이다.
+   * 그래야 도메인 모듈들을 exports 로 열지 않아도 되고, 스케줄러가 모든 도메인을
+   * 아는 허브가 되지 않는다. 경로 이름을 잡 이름으로 그대로 쓰는 이유는
+   * 로그에서 크론 시절과 같은 검색어가 통하게 하기 위해서다.
+   */
+  onModuleInit(): void {
+    this.tick.register({ name: 'events/lifecycle', order: 10, run: () => this.runLifecycle() });
+    // 집계 갱신은 맨 뒤다 — 앞선 잡들이 만든 변화까지 반영한 숫자가 나온다.
+    this.tick.register({ name: 'events/stats-refresh', order: 80, run: () => this.runStatsRefresh() });
+  }
 
   @All('lifecycle')
   @HttpCode(HttpStatus.OK)

@@ -1,6 +1,6 @@
 # Dibs — API 라우트 목록
 
-> 컨트롤러에서 자동 추출했다. 총 **161개** 엔드포인트, 컨트롤러 35개.
+> 컨트롤러에서 자동 추출했다. 총 **167개** 엔드포인트, 컨트롤러 37개.
 > 전역 prefix는 `api` (health 제외). 인증은 기본 필수이고 `public`만 열려 있다.
 
 ## `admin/admin-audit.controller.ts`
@@ -43,6 +43,16 @@
 | POST | `/api/admin/businesses/:businessId/verify` | ADMIN | 사업자 확인 큐 (기본 PENDING · 제출 순) |
 | POST | `/api/admin/businesses/:businessId/reject` | ADMIN | 확인 완료 (PENDING → VERIFIED) |
 | POST | `/api/admin/businesses/:businessId/revoke` | ADMIN | 확인 반려 (PENDING → REJECTED) |
+
+## `admin/admin-categories.controller.ts`
+
+| Method | Path | Auth | 설명 |
+|---|---|---|---|
+| GET | `/api/admin/categories` | ADMIN | 업종 트리 |
+| POST | `/api/admin/categories` | ADMIN | 업종 트리 |
+| PATCH | `/api/admin/categories/:categoryId` | ADMIN | 업종 추가 |
+| POST | `/api/admin/categories/reorder` | ADMIN | 업종 수정 |
+| DELETE | `/api/admin/categories/:categoryId` | ADMIN | 순서 재배치 |
 
 ## `admin/admin-dashboard.controller.ts`
 
@@ -159,7 +169,7 @@
 
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
-| ALL | `/api/cron/events/lifecycle` | public+cron | SCHEDULED→OPEN, OPEN→CLOSED 상태 따라잡기 |
+| ALL | `/api/cron/events/lifecycle` | public | SCHEDULED→OPEN, OPEN→CLOSED 상태 따라잡기 |
 | ALL | `/api/cron/events/stats-refresh` | public | SCHEDULED→OPEN, OPEN→CLOSED 상태 따라잡기 |
 
 ## `events/events-public.controller.ts`
@@ -211,7 +221,7 @@
 
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
-| ALL | `/api/cron/notifications/dispatch` | public+cron | 대기 중인 이메일 아웃박스를 집어 Resend 로 발송 |
+| ALL | `/api/cron/notifications/dispatch` | public | 대기 중인 이메일 아웃박스를 집어 Resend 로 발송 |
 | ALL | `/api/cron/notifications/expand-broadcasts` | public | 대기 중인 이메일 아웃박스를 집어 Resend 로 발송 |
 | ALL | `/api/cron/notifications/sweep-expired` | public | 예약·확장 중인 공지의 다음 수신자 페이지를 펼친다 |
 
@@ -319,7 +329,7 @@
 
 | Method | Path | Auth | 설명 |
 |---|---|---|---|
-| ALL | `/api/cron/expire-holds` | public+cron | 만료된 예약금 홀드 스윕 (자리 반환 / 금액 롤백) |
+| ALL | `/api/cron/expire-holds` | public | 만료된 예약금 홀드 스윕 (자리 반환 / 금액 롤백) |
 | ALL | `/api/cron/deposit-reminders` | public | 만료된 예약금 홀드 스윕 (자리 반환 / 금액 롤백) |
 | ALL | `/api/cron/finalize-rankings` | public | 확정 시각이 지난 이벤트의 선정 라운드 개시 |
 
@@ -338,4 +348,10 @@
 | POST | `/api/partner/selections/:selectionId/entries/:entryId/remove` | PARTNER | 수동 제외 |
 | POST | `/api/partner/selections/:selectionId/entries/:entryId/promote` | PARTNER | 결원 승계 |
 | POST | `/api/partner/selections/:selectionId/finalize` | PARTNER | 명단 확정 (되돌릴 수 없음) |
+
+## `tick/tick.controller.ts`
+
+| Method | Path | Auth | 설명 |
+|---|---|---|---|
+| ALL | `/api/cron/tick` | public+cron | 등록된 스케줄 잡을 순서대로 전부 실행 |
 

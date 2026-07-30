@@ -2066,3 +2066,27 @@ model UserIdentityLink {
   @@unique([userId, linkedUserId, signal], map: "user_identity_link_uq")
   @@index([linkedUserId], map: "user_identity_link_reverse_idx")
 }
+
+/// 스케줄 틱의 게이트. 행이 딱 하나(`name = 'global'`) 있는 테이블이다.
+///
+/// 왜 이런 게 필요한가 — Vercel Hobby 는 크론을 하루 1회까지만 돌려준다. 그래서 스케줄의
+/// 주 동력을 크론이 아니라 **들어오는 요청**으로 옮겼다(TickRegistry 참고). 요청은 여러
+/// 람다에서 동시에 들어오므로 "지금 돌 차례인가"를 어딘가에 원자적으로 적어둬야 한다.
+/// 그 어딘가가 이 행이다.
+///
+/// 판정과 예약을 한 문장(INSERT … ON CONFLICT DO UPDATE … WHERE "nextRunAt" <= now())으로
+/// 처리한다. 읽고 나서 쓰는 구조였다면 같은 순간의 요청 열 개가 전부 통과했을 것이다.
+model CronTick {
+  /// 지금은 'global' 하나뿐이다. PK 를 name 으로 둔 것은 나중에 무거운 잡을 별도 주기로
+  /// 떼어낼 때 행만 추가하면 되게 하려는 것이다.
+  name String @id @db.VarChar(64)
+
+  /// 이 시각을 지나야 다음 틱이 열린다.
+  nextRunAt DateTime @db.Timestamptz(6)
+  lastRunAt DateTime? @db.Timestamptz(6)
+
+  /// 진단용. "스케줄러가 실제로 돌고 있나"를 이 값의 증가로 확인한다.
+  runCount Int @default(0)
+
+  @@map("CronTick")
+}

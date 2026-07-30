@@ -1,8 +1,9 @@
-import { All, Controller, HttpCode, HttpStatus, Query, UseGuards } from '@nestjs/common';
+import { All, Controller, HttpCode, HttpStatus, OnModuleInit, Query, UseGuards } from '@nestjs/common';
 import { ApiExcludeController, ApiOperation, ApiTags } from '@nestjs/swagger';
 
 import { Public } from '../common/decorators/public.decorator';
 import { CronGuard } from '../common/guards/cron.guard';
+import { TickRegistry } from '../tick/tick-registry.service';
 import { BroadcastExpanderService } from './broadcast-expander.service';
 import { NotificationDispatchService } from './notification-dispatch.service';
 
@@ -27,11 +28,28 @@ import { NotificationDispatchService } from './notification-dispatch.service';
 @Public()
 @UseGuards(CronGuard)
 @Controller('cron/notifications')
-export class NotificationsCronController {
+export class NotificationsCronController implements OnModuleInit {
   constructor(
     private readonly dispatch: NotificationDispatchService,
     private readonly expander: BroadcastExpanderService,
+    private readonly tick: TickRegistry,
   ) {}
+
+  /**
+   * 이 도메인의 잡을 틱 레지스트리에 등록한다. (배경은 TickRegistry 주석 참고)
+   *
+   * 확장(50) 이 발송(60) 보다 먼저다. 순서가 뒤집혀도 결과는 같지만 — 방금 펼친 쪽지가
+   * 같은 틱에 바로 나가느냐, 다음 틱까지 기다리느냐의 차이라 앞이 낫다.
+   *
+   * 만료 스윕은 매분 돌 일이 아니지만(원래 크론도 시간당 1회였다) 별도 주기를 두지 않았다.
+   * 대상이 없으면 0행짜리 조건부 UPDATE 한 방으로 끝나서, 주기를 나누는 복잡도가
+   * 아끼는 비용보다 비싸다.
+   */
+  onModuleInit(): void {
+    this.tick.register({ name: 'notifications/expand-broadcasts', order: 50, run: () => this.expandBroadcasts() });
+    this.tick.register({ name: 'notifications/dispatch', order: 60, run: () => this.dispatchPending() });
+    this.tick.register({ name: 'notifications/sweep-expired', order: 70, run: () => this.sweepExpired() });
+  }
 
   @All('dispatch')
   @HttpCode(HttpStatus.OK)

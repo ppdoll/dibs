@@ -1,8 +1,9 @@
-import { All, Controller, HttpCode, HttpStatus, UseGuards } from '@nestjs/common';
+import { All, Controller, HttpCode, HttpStatus, OnModuleInit, UseGuards } from '@nestjs/common';
 import { ApiExcludeController, ApiOperation, ApiTags } from '@nestjs/swagger';
 
 import { Public } from '../common/decorators/public.decorator';
 import { CronGuard } from '../common/guards/cron.guard';
+import { TickRegistry } from '../tick/tick-registry.service';
 import { DepositSweeperService } from './deposit-sweeper.service';
 import { RankingService } from './ranking.service';
 
@@ -33,11 +34,25 @@ import { RankingService } from './ranking.service';
 @Public()
 @UseGuards(CronGuard)
 @Controller('cron')
-export class SelectionCronController {
+export class SelectionCronController implements OnModuleInit {
   constructor(
     private readonly sweeper: DepositSweeperService,
     private readonly ranking: RankingService,
+    private readonly tick: TickRegistry,
   ) {}
+
+  /**
+   * 이 도메인의 잡을 틱 레지스트리에 등록한다. (배경은 TickRegistry 주석 참고)
+   *
+   * ★ order 가 **의미를 갖는 유일한 자리**다. expire-holds(20) 가 finalize-rankings(30) 보다
+   *   반드시 먼저 돌아야 한다 — 열린 홀드가 하나라도 남아 있으면 확정 게이트가 그 이벤트를
+   *   통째로 건너뛴다(IC-26). 순서가 뒤집히면 확정이 한 주기씩 계속 밀린다.
+   */
+  onModuleInit(): void {
+    this.tick.register({ name: 'expire-holds', order: 20, run: () => this.expireHolds() });
+    this.tick.register({ name: 'finalize-rankings', order: 30, run: () => this.finalizeRankings() });
+    this.tick.register({ name: 'deposit-reminders', order: 40, run: () => this.depositReminders() });
+  }
 
   @All('expire-holds')
   @HttpCode(HttpStatus.OK)
