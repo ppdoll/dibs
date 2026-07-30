@@ -2,6 +2,52 @@
 
 > 로컬 구동은 [RUNNING.md](RUNNING.md). 이 문서는 **배포 구성과 그렇게 정한 이유**다.
 
+## 지금 배포된 것 (2026-07-30)
+
+| | URL | Vercel 프로젝트 |
+|---|---|---|
+| 웹 | https://dibs-web-xi.vercel.app | `dibs-web` |
+| API | https://dibs-api.vercel.app | `dibs-api` |
+| DB | Neon `dibs-db` (Free, `iad1`) | `dibs-api` 에 연결 |
+
+스코프는 개인 계정 `ppdoll-7834s-projects` 다(회사 팀 아님). 플랜은 **Hobby** —
+그래서 스케줄러가 §4 처럼 생겼다.
+
+**DB 리전을 함수와 같은 `iad1` 로 맞춘 이유**: 서울(`icn1`)에 두면 요청당 여러 번인
+쿼리가 매번 태평양을 왕복한다. 사용자→함수 왕복 한 번이 느린 편이 낫다.
+(Hobby 는 함수 리전을 고를 수 없어 `iad1` 고정이다.)
+
+### GitHub 자동 배포
+
+두 프로젝트 모두 https://github.com/ppdoll/dibs 에 연결돼 있다. `main` 에 push 하면 자동 배포된다.
+
+**바뀐 앱만 빌드된다.** 두 프로젝트가 같은 저장소를 보므로 그대로 두면 프론트 한 줄만 고쳐도
+API 까지 재빌드된다. Ignored Build Step 에 `turbo-ignore` 를 걸어 두었다:
+
+| 프로젝트 | Ignored Build Step |
+|---|---|
+| `dibs-api` | `npx turbo-ignore @dibs/api` |
+| `dibs-web` | `npx turbo-ignore @dibs/web` |
+
+`packages/shared` 를 고치면 **둘 다** 빌드된다 — 의존 그래프를 보고 판단하기 때문이다. 의도한 동작이다.
+
+CLI 배포도 그대로 된다(저장소 루트에서, Root Directory 설정이 적용되도록):
+
+```bash
+VERCEL_ORG_ID=team_HQ2l4HIka2EwxiFpWtffFJiE \
+VERCEL_PROJECT_ID=<프로젝트 ID> npx vercel deploy --prod --yes
+```
+
+### ⚠ 프리뷰 배포는 운영 DB 를 본다
+
+Neon 통합이 `DATABASE_URL` 을 **Production 과 Preview 양쪽에** 심는다. 반면 `JWT_SECRET`·
+`CRON_SECRET` 등 나머지는 Production 에만 넣어 두었다. 그래서 지금 브랜치 프리뷰는
+**부팅 단계에서 실패한다** — 의도한 상태다(fail closed).
+
+프리뷰를 쓰려면 나머지 변수를 Preview 에도 넣어야 하는데, **그 순간 프리뷰가 운영 데이터에
+쓰기 시작한다.** 먼저 Neon 에 별도 브랜치/DB 를 만들어 Preview 의 `DATABASE_URL` 을
+그쪽으로 돌린 다음에 열 것.
+
 ---
 
 ## 1. Vercel 프로젝트를 **2개** 만든다
