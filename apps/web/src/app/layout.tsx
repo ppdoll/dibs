@@ -1,15 +1,48 @@
 import type { Metadata, Viewport } from 'next';
 
+import { ServiceWorkerRegistrar } from '@/components/pwa/service-worker';
+import { BRAND_COPY } from '@/lib/brand';
+import { SITE_URL } from '@/lib/site';
 import { AppProviders } from '@/providers/app-providers';
 import './globals.css';
 
+const TITLE = `${BRAND_COPY.wordmark} — ${BRAND_COPY.headline}`;
+
 export const metadata: Metadata = {
+  // OG 이미지 주소를 절대 경로로 만들기 위해 반드시 필요하다. 없으면 Next 가 경고만 남기고
+  // 상대 경로를 내보내는데, 카카오톡·슬랙 크롤러는 그걸 해석하지 못해 미리보기가 빈다.
+  metadataBase: new URL(SITE_URL),
   title: {
-    default: 'Dibs — 먼저 찜하는 예약',
+    default: TITLE,
     template: '%s | Dibs',
   },
-  description: '가고 싶던 그곳, 열리는 순간 먼저 찜하세요.',
+  description: BRAND_COPY.sub,
   applicationName: 'Dibs',
+
+  openGraph: {
+    type: 'website',
+    siteName: 'Dibs',
+    locale: 'ko_KR',
+    url: '/',
+    title: TITLE,
+    description: BRAND_COPY.sub,
+    // images 는 적지 않는다 — app/opengraph-image.tsx 를 Next 가 알아서 붙인다.
+    // 여기에 손으로 적으면 규약 파일과 둘 다 나가서 크롤러마다 다른 그림을 고른다.
+  },
+  twitter: {
+    card: 'summary_large_image',
+    title: TITLE,
+    description: BRAND_COPY.sub,
+  },
+
+  // 홈 화면에서 띄웠을 때 사파리 UI 없이 뜬다. 매니페스트의 standalone 과 짝이다
+  // (iOS 는 매니페스트의 display 를 오래 무시했고, 지금도 이 메타를 함께 본다).
+  appleWebApp: {
+    capable: true,
+    title: 'Dibs',
+    statusBarStyle: 'default',
+  },
+
   formatDetection: {
     // 사파리가 "10명", "2026-07-27" 같은 문자열을 전화번호·날짜 링크로
     // 바꿔버리면 파란 밑줄이 생기고 탭 영역까지 뺏긴다.
@@ -45,6 +78,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <AppProviders>
           <div id="main-content">{children}</div>
         </AppProviders>
+        <ServiceWorkerRegistrar />
       </body>
     </html>
   );

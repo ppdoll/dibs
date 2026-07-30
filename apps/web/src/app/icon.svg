@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!--
+    파비콘. 도형 정의의 출처는 src/lib/brand.ts 의 MARK_PATH 다 — 마크를 바꾸면 둘 다 고칠 것.
+    (여기만 정적 파일인 이유: 파비콘은 모든 페이지에서 가장 먼저 요청된다.
+     ImageResponse 로 그리면 그 첫 요청이 매번 렌더링을 태운다. SVG 는 1KB 도 안 되고
+     어떤 배율에서도 선명하다.)
+  -->
+  <title>Dibs</title>
+  <rect width="64" height="64" rx="14" fill="#F2264C"/>
+  <path
+    d="M19 17C19 14.2386 21.2386 12 24 12H40C42.7614 12 45 14.2386 45 17V49.6C45 51.6 42.8 52.7 41.2 51.6L32 45.2L22.8 51.6C21.2 52.7 19 51.6 19 49.6Z"
+    fill="#ffffff"
+  />
+</svg>

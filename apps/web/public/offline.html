@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>연결 없음 | Dibs</title>
+    <!--
+      서비스 워커가 설치 시점에 통째로 캐시해 두는 오프라인 안내다.
+
+      Next 페이지가 아니라 정적 HTML 인 이유: Next 가 렌더한 HTML 은 해시가 박힌
+      _next/static 청크를 참조한다. 배포가 몇 번 지나가면 캐시된 오프라인 HTML 이
+      이미 사라진 청크를 가리켜 스타일이 깨진 화면이 뜬다.
+      폴백 화면만큼은 무엇에도 의존하지 않아야 한다 — 그래서 CSS 도 인라인이다.
+    -->
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --fg: #09090b;
+        --muted: #71717a;
+        --brand: #f2264c;
+        --border: #e4e4e7;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #09090b;
+          --fg: #fafafa;
+          --muted: #a1a1aa;
+          --border: #27272a;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Pretendard',
+          'Malgun Gothic', system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      main {
+        width: 100%;
+        max-width: 360px;
+        text-align: center;
+      }
+      .mark {
+        width: 56px;
+        height: 56px;
+        margin: 0 auto 24px;
+        display: block;
+      }
+      h1 {
+        margin: 0 0 10px;
+        font-size: 20px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+      p {
+        margin: 0;
+        font-size: 15px;
+        line-height: 1.6;
+        color: var(--muted);
+      }
+      button {
+        margin-top: 28px;
+        width: 100%;
+        padding: 13px 20px;
+        font: inherit;
+        font-weight: 600;
+        color: #fff;
+        background: var(--brand);
+        border: 0;
+        border-radius: 12px;
+        cursor: pointer;
+      }
+      button:active {
+        opacity: 0.85;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <svg class="mark" viewBox="0 0 64 64" aria-hidden="true">
+        <rect width="64" height="64" rx="14" fill="#F2264C" />
+        <path
+          d="M19 17C19 14.2386 21.2386 12 24 12H40C42.7614 12 45 14.2386 45 17V49.6C45 51.6 42.8 52.7 41.2 51.6L32 45.2L22.8 51.6C21.2 52.7 19 51.6 19 49.6Z"
+          fill="#ffffff"
+        />
+      </svg>
+      <h1>연결이 끊겼습니다</h1>
+      <p>
+        신청 현황과 경쟁률은 실시간이라 오프라인에서는 보여드릴 수 없습니다.<br />
+        네트워크를 확인한 뒤 다시 시도해 주세요.
+      </p>
+      <button type="button" onclick="location.reload()">다시 시도</button>
+    </main>
+  </body>
+</html>
