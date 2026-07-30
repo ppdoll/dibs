@@ -22,14 +22,18 @@
 두 프로젝트 모두 https://github.com/ppdoll/dibs 에 연결돼 있다. `main` 에 push 하면 자동 배포된다.
 
 **바뀐 앱만 빌드된다.** 두 프로젝트가 같은 저장소를 보므로 그대로 두면 프론트 한 줄만 고쳐도
-API 까지 재빌드된다. Ignored Build Step 에 `turbo-ignore` 를 걸어 두었다:
+API 까지 재빌드된다. 두 프로젝트의 **Ignored Build Step 을 `Automatic`** 으로 두었다
+(= `commandForIgnoringBuildStep` 이 `null`). Vercel 이 Turborepo 의존 그래프를 읽고
+Root Directory 와 무관한 커밋을 스스로 건너뛴다.
 
-| 프로젝트 | Ignored Build Step |
-|---|---|
-| `dibs-api` | `npx turbo-ignore @dibs/api` |
-| `dibs-web` | `npx turbo-ignore @dibs/web` |
+`packages/shared` 를 고치면 **둘 다** 빌드된다 — 그래프를 보고 판단하기 때문이다. 의도한 동작이다.
 
-`packages/shared` 를 고치면 **둘 다** 빌드된다 — 의존 그래프를 보고 판단하기 때문이다. 의도한 동작이다.
+> 한때 `npx turbo-ignore <패키지>` 를 걸어 뒀었는데, 실행하면
+> `"turbo-ignore" is deprecated. Use Vercel's built-in project skipping instead.` 를 찍는다.
+> 지금은 내장 기능을 쓴다.
+>
+> **Git 연결 직후 첫 배포는 무조건 빌드된다** — 비교할 이전 배포가 그 브랜치에 없기 때문이다
+> (`No previous deployments found ... on branch "main"`). 두 번째 push 부터 스킵이 동작한다.
 
 CLI 배포도 그대로 된다(저장소 루트에서, Root Directory 설정이 적용되도록):
 
