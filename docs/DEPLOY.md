@@ -323,3 +323,5 @@ dependency at index [0] is available in the XxxModule context.
    SELECT tgname FROM pg_trigger WHERE NOT tgisinternal;
    ```
    0건이면 마이그레이션이 끝까지 적용되지 않은 것이다.
+
+<!-- 빌드 스킵 동작 확인용 (문서만 변경) -->
