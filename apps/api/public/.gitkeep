@@ -1,0 +1,8 @@
+# 일부러 비워 둔 디렉터리다.
+#
+# 이 프로젝트는 정적 산출물이 없다 — 모든 요청이 rewrite 로 api/index 서버리스 함수에 간다.
+# 그런데 Vercel 은 buildCommand 가 있으면 빌드가 끝난 뒤 **출력 디렉터리가 실재하는지**
+# 확인하고, 없으면 "No Output Directory named public found" 로 배포를 실패시킨다.
+#
+# 그래서 빈 디렉터리를 둔다. 여기 파일을 넣으면 rewrite 보다 먼저 정적 파일로 매칭되므로
+# 아무것도 넣지 않는다.

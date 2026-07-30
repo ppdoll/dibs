@@ -3,6 +3,7 @@
   "framework": null,
   "installCommand": "pnpm install",
   "buildCommand": "pnpm --filter @dibs/shared build && pnpm --filter @dibs/api db:generate && pnpm --filter @dibs/api build",
+  "outputDirectory": "public",
   "functions": {
     "api/index.ts": {
       "memory": 1024,
