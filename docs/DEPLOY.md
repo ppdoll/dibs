@@ -22,15 +22,24 @@
 두 프로젝트 모두 https://github.com/ppdoll/dibs 에 연결돼 있다. `main` 에 push 하면 자동 배포된다.
 
 **바뀐 앱만 빌드된다.** 두 프로젝트가 같은 저장소를 보므로 그대로 두면 프론트 한 줄만 고쳐도
-API 까지 재빌드된다. 두 프로젝트의 **Ignored Build Step 을 `Automatic`** 으로 두었다
-(= `commandForIgnoringBuildStep` 이 `null`). Vercel 이 Turborepo 의존 그래프를 읽고
-Root Directory 와 무관한 커밋을 스스로 건너뛴다.
+API 까지 재빌드된다. Ignored Build Step 에 `turbo-ignore` 를 걸어 두었다:
 
-`packages/shared` 를 고치면 **둘 다** 빌드된다 — 그래프를 보고 판단하기 때문이다. 의도한 동작이다.
+| 프로젝트 | Ignored Build Step |
+|---|---|
+| `dibs-api` | `npx turbo-ignore @dibs/api` |
+| `dibs-web` | `npx turbo-ignore @dibs/web` |
 
-> 한때 `npx turbo-ignore <패키지>` 를 걸어 뒀었는데, 실행하면
-> `"turbo-ignore" is deprecated. Use Vercel's built-in project skipping instead.` 를 찍는다.
-> 지금은 내장 기능을 쓴다.
+`packages/shared` 를 고치면 **둘 다** 빌드된다 — 의존 그래프를 보고 판단하기 때문이다. 의도한 동작이다.
+스킵된 배포는 `Canceled` 로 남고 10초쯤 걸린다(풀 빌드는 1분).
+
+> **Ignored Build Step 을 비워 두면(`Automatic`) 스킵이 전혀 안 된다.**
+> 이름 때문에 "Vercel 이 알아서 판단" 처럼 읽히지만, 실제로는 판단 단계 자체가 없다 —
+> 빌드 로그에 Ignored Build Step 줄이 아예 안 찍히고 곧장 clone → build 로 간다.
+> 문서만 바꾼 커밋으로 확인했다(두 프로젝트 모두 풀 빌드).
+>
+> `turbo-ignore` 는 실행할 때
+> `"turbo-ignore" is deprecated. Use Vercel's built-in project skipping instead.` 를 찍지만
+> **동작은 한다.** 내장 대체재를 확인하기 전까지는 이쪽을 쓴다.
 >
 > **Git 연결 직후 첫 배포는 무조건 빌드된다** — 비교할 이전 배포가 그 브랜치에 없기 때문이다
 > (`No previous deployments found ... on branch "main"`). 두 번째 push 부터 스킵이 동작한다.
@@ -74,8 +83,9 @@ Neon 통합이 `DATABASE_URL` 을 **Production 과 Preview 양쪽에** 심는다
 
 - **빌드가 하나로 묶인다.** 프론트 문구 한 줄만 고쳐도 Prisma Client 재생성과 Nest 빌드가 함께 돈다.
   반대로 API 를 롤백하려면 프론트도 같이 롤백된다. 두 앱의 배포 수명이 다른데 하나로 묶이는 셈이다.
-- **함수 설정이 충돌한다.** API 는 `memory: 1024`, `maxDuration: 60` 이 필요하고(스위퍼가 200건씩 돈다),
+- **함수 설정이 충돌한다.** API 는 `maxDuration: 60` 이 필요하고(스위퍼가 200건씩 돈다),
   Next.js 라우트는 그럴 필요가 없다. 한 프로젝트에서는 이 둘을 깔끔히 나누기 어렵다.
+  (`memory` 도 넣었었는데 Active CPU 과금에서는 무시된다고 빌드가 경고해서 뺐다.)
 - **크론이 애매해진다.** 크론은 프로젝트 단위 설정이다. 프론트 프로젝트가 백엔드 크론을 들고 있게 된다.
 - **CORS 를 없애려고 합치는 것**이 보통의 동기인데, 여기서는 이미 `NEXT_PUBLIC_API_URL` 로
   API 주소를 명시하고 `CORS_ORIGINS` 로 출처를 화이트리스트하는 구조라 얻는 게 없다.
@@ -323,5 +333,3 @@ dependency at index [0] is available in the XxxModule context.
    SELECT tgname FROM pg_trigger WHERE NOT tgisinternal;
    ```
    0건이면 마이그레이션이 끝까지 적용되지 않은 것이다.
-
-<!-- 빌드 스킵 동작 확인용 (문서만 변경) -->
